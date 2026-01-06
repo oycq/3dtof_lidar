@@ -1,0 +1,11 @@
+# Python bytecode / caches
+__pycache__/
+
+# OpenPyLivox demo outputs / captured data
+*.bin
+*_IMU.bin
+*_IMU.bin.csv
+*.las
+*.pcd
+
+
