@@ -31,7 +31,7 @@ py -m pip install open3d
 
 ```bash
 # 先运行 demo 生成 test.bin.las，然后执行：
-py .\visualize_las.py test.bin.las
+py .\visual_3d.py
 ```
 
 ## 常见问题
