@@ -14,10 +14,10 @@ py -m pip install -e .
 ## 运行 demo
 
 ```bash
-py .\livox_controller_demo.py
+py .\run.py
 ```
 
-- demo 会生成点云/IMU 文件（例如 `*.bin` / `*.las` / `*_IMU.bin.csv`），仓库内已用 `.gitignore` 忽略这些生成数据。
+- demo 会生成 `output.las`（通用格式，仓库内已用 `.gitignore` 忽略生成数据）。
 
 ## 可视化点云（LAS）
 
@@ -30,8 +30,15 @@ py -m pip install open3d
 用法：
 
 ```bash
-# 先运行 demo 生成 test.bin.las，然后执行：
+# 先运行 demo 生成 output.las，然后执行：
 py .\visual_3d.py
+```
+
+2D（需要 matplotlib）：
+
+```bash
+py -m pip install matplotlib
+py .\visual_2d.py
 ```
 
 ## 常见问题

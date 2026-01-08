@@ -5,7 +5,8 @@ from pathlib import Path
 import numpy as np
 
 
-LAS_FILE = Path("test.bin.las")
+_HERE = Path(__file__).resolve().parent
+LAS_FILE = _HERE / "output.las"
 IMG_W = 800
 IMG_H = 800
 
@@ -19,26 +20,22 @@ HALF_FOV_XZ_DEG = FOV_XZ_DEG / 2.0
 
 def main() -> None:
     if not LAS_FILE.exists():
-        raise FileNotFoundError(f"找不到点云文件：{LAS_FILE.resolve()}\n请先运行：py .\\livox_controller_demo.py")
-
-    try:
-        import laspy  # type: ignore
-    except Exception as e:
-        raise RuntimeError("缺少依赖 laspy，请先执行：py -m pip install laspy") from e
+        raise FileNotFoundError(f"找不到点云文件：{LAS_FILE}\n请先运行：py .\\run.py")
 
     try:
         import matplotlib.pyplot as plt  # type: ignore
     except Exception as e:
         raise RuntimeError("缺少依赖 matplotlib，请先执行：py -m pip install matplotlib") from e
 
-    las = laspy.read(str(LAS_FILE))
+    try:
+        import laspy  # type: ignore
+    except Exception as e:
+        raise RuntimeError("缺少依赖 laspy，请先执行：py -m pip install laspy") from e
 
+    las = laspy.read(str(LAS_FILE))
     x = np.asarray(las.x, dtype=np.float64)
     y = np.asarray(las.y, dtype=np.float64)
     z = np.asarray(las.z, dtype=np.float64)
-
-    if x.size == 0:
-        raise ValueError(f"LAS 文件没有点：{LAS_FILE}")
 
     if MAX_POINTS is not None and x.size > MAX_POINTS:
         idx = np.random.choice(x.size, size=MAX_POINTS, replace=False)

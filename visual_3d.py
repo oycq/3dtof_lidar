@@ -6,10 +6,14 @@ from typing import Optional
 import numpy as np
 
 
-LAS_FILE = Path("test.bin.las")
+_HERE = Path(__file__).resolve().parent
+LAS_FILE = _HERE / "output.las"
 
 # 为了避免超大点云导致显示卡顿，可以做一个上限抽样（None 表示不抽样）
 MAX_POINTS = 2_000_000
+
+# 初始视角（相机 FOV，单位：度）
+INIT_FOV_DEG = 70.0
 
 
 def visualize_las_fixed(
@@ -18,7 +22,7 @@ def visualize_las_fixed(
     color_by_intensity: bool = True,
 ) -> None:
     """
-    3d 可视化（固定读取仓库根目录 test.bin.las）
+    3d 可视化（固定读取仓库根目录 output.las）
 
     坐标系/视角约定：
       - x 为深度（纵深，朝里）
@@ -26,7 +30,7 @@ def visualize_las_fixed(
       - z 轴朝上
     """
     if not LAS_FILE.exists():
-        raise FileNotFoundError(f"找不到点云文件：{LAS_FILE.resolve()}\n请先运行：py .\\livox_controller_demo.py")
+        raise FileNotFoundError(f"找不到点云文件：{LAS_FILE}\n请先运行：py .\\run.py")
 
     try:
         import laspy  # type: ignore
@@ -81,6 +85,16 @@ def visualize_las_fixed(
     ctr.set_front([-1.0, 0.0, 0.0])
     ctr.set_up([0.0, 0.0, 1.0])
     ctr.set_zoom(0.7)
+    # 设置初始 FOV=70°（不同 open3d 版本 API 略有差异，这里做兼容处理）
+    try:
+        if hasattr(ctr, "set_field_of_view"):
+            ctr.set_field_of_view(float(INIT_FOV_DEG))  # type: ignore[attr-defined]
+        elif hasattr(ctr, "get_field_of_view") and hasattr(ctr, "change_field_of_view"):
+            cur = float(ctr.get_field_of_view())  # type: ignore[attr-defined]
+            ctr.change_field_of_view(float(INIT_FOV_DEG - cur))  # type: ignore[attr-defined]
+    except Exception:
+        # 不影响运行：至少保留 front/up/zoom
+        pass
 
     vis.run()
     vis.destroy_window()
