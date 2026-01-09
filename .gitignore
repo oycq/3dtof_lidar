@@ -8,5 +8,11 @@ __pycache__/
 *.las
 *.pcd
 
+# Real-time server/client outputs
+*.npz
+*.pid
+*.lock
+tmp
+
 
 

@@ -1088,7 +1088,9 @@ class _dataCaptureThread(object):
                                                 binFile.write(data_pc[bytePos:bytePos + 13])
                                                 binFile.write(struct.pack('<d', timestamp_sec))
                                             else:
-                                                if coord2:
+                                                coord1 = struct.unpack('<i', data_pc[bytePos:bytePos + 4])[0]
+                                                coord3 = struct.unpack('<i', data_pc[bytePos + 8:bytePos + 12])[0]
+                                                if coord1 or coord2 or coord3:
                                                     numPts += 1
                                                     binFile.write(data_pc[bytePos:bytePos + 13])
                                                     binFile.write(struct.pack('<d', timestamp_sec))
@@ -1131,7 +1133,9 @@ class _dataCaptureThread(object):
                                             # timestamp
                                             timestamp_sec += 0.000004167
 
-                                            if coord2:
+                                            coord1 = struct.unpack('<i', data_pc[bytePos:bytePos + 4])[0]
+                                            coord3 = struct.unpack('<i', data_pc[bytePos + 8:bytePos + 12])[0]
+                                            if coord1 or coord2 or coord3:
                                                 numPts += 1
                                                 binFile.write(data_pc[bytePos:bytePos + 14])
                                                 binFile.write(struct.pack('<d', timestamp_sec))
@@ -1173,7 +1177,12 @@ class _dataCaptureThread(object):
                                             # timestamp
                                             timestamp_sec += 0.000002083
 
-                                            if coord2:
+                                            x1 = struct.unpack('<i', data_pc[bytePos:bytePos + 4])[0]
+                                            z1 = struct.unpack('<i', data_pc[bytePos + 8:bytePos + 12])[0]
+                                            x2 = struct.unpack('<i', data_pc[bytePos + 14:bytePos + 18])[0]
+                                            y2 = struct.unpack('<i', data_pc[bytePos + 18:bytePos + 22])[0]
+                                            z2 = struct.unpack('<i', data_pc[bytePos + 22:bytePos + 26])[0]
+                                            if x1 or coord2 or z1 or x2 or y2 or z2:
                                                 numPts += 1
                                                 binFile.write(data_pc[bytePos:bytePos + 28])
                                                 binFile.write(struct.pack('<d', timestamp_sec))
@@ -1230,7 +1239,9 @@ class _dataCaptureThread(object):
                                                 binFile.write(struct.pack('<d', timestamp_sec))
                                                 binFile.write(str.encode(str(returnNum)))
                                             else:
-                                                if coord2:
+                                                coord1 = struct.unpack('<i', data_pc[bytePos:bytePos + 4])[0]
+                                                coord3 = struct.unpack('<i', data_pc[bytePos + 8:bytePos + 12])[0]
+                                                if coord1 or coord2 or coord3:
                                                     numPts += 1
                                                     binFile.write(data_pc[bytePos:bytePos + 13])
                                                     binFile.write(struct.pack('<d', timestamp_sec))
@@ -1293,7 +1304,9 @@ class _dataCaptureThread(object):
                                                 binFile.write(struct.pack('<d', timestamp_sec))
                                                 binFile.write(str.encode(str(returnNum)))
                                             else:
-                                                if coord2:
+                                                coord1 = struct.unpack('<i', data_pc[bytePos:bytePos + 4])[0]
+                                                coord3 = struct.unpack('<i', data_pc[bytePos + 8:bytePos + 12])[0]
+                                                if coord1 or coord2 or coord3:
                                                     numPts += 1
                                                     binFile.write(data_pc[bytePos:bytePos + 13])
                                                     binFile.write(struct.pack('<d', timestamp_sec))
@@ -3785,7 +3798,7 @@ def _convertBin2LAS(filePathAndName, deleteBin):
                                     coord2s.append(float(struct.unpack('<i', binFile.read(4))[0]) / 1000.0)
                                     coord3s.append(float(struct.unpack('<i', binFile.read(4))[0]) / 1000.0)
                                     intensity.append(struct.unpack('<B', binFile.read(1))[0])
-                                    tag_bits = str(bin(int.from_bytes(binFile.read(1), byteorder='little')))[2:].zfill(8)
+                                    _ = int.from_bytes(binFile.read(1), byteorder='little')  # tag (ignore)
                                     times.append(float(struct.unpack('<d', binFile.read(8))[0]))
                                     returnNums.append(1)
 
@@ -3795,14 +3808,14 @@ def _convertBin2LAS(filePathAndName, deleteBin):
                                     coord2s.append(float(struct.unpack('<i', binFile.read(4))[0]) / 1000.0)
                                     coord3s.append(float(struct.unpack('<i', binFile.read(4))[0]) / 1000.0)
                                     intensity.append(struct.unpack('<B', binFile.read(1))[0])
-                                    tag_bits = str(bin(int.from_bytes(binFile.read(1), byteorder='little')))[2:].zfill(8)
+                                    _ = int.from_bytes(binFile.read(1), byteorder='little')  # tag (ignore)
                                     returnNums.append(1)
 
                                     coord1s.append(float(struct.unpack('<i', binFile.read(4))[0]) / 1000.0)
                                     coord2s.append(float(struct.unpack('<i', binFile.read(4))[0]) / 1000.0)
                                     coord3s.append(float(struct.unpack('<i', binFile.read(4))[0]) / 1000.0)
                                     intensity.append(struct.unpack('<B', binFile.read(1))[0])
-                                    tag_bits = str(bin(int.from_bytes(binFile.read(1), byteorder='little')))[2:].zfill(8)
+                                    _ = int.from_bytes(binFile.read(1), byteorder='little')  # tag (ignore)
                                     returnNums.append(2)
 
                                     timestamp_sec = float(struct.unpack('<d', binFile.read(8))[0])

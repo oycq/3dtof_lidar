@@ -19,6 +19,23 @@ py .\run.py
 
 - demo 会生成 `output.las`（通用格式，仓库内已用 `.gitignore` 忽略生成数据）。
 
+## 实时 2D（推荐：只运行 client.py）
+
+安装依赖（2D 显示需要 OpenCV）：
+
+```bash
+py -m pip install opencv-python
+```
+
+运行（client 会自动 import 并启动 server，同进程后台线程采集；雷达在运行期间一直转）：
+
+```bash
+py .\client.py
+```
+
+- client 会实时刷新显示“最近 1 秒”点云的 2D 投影（800x800）
+- ESC：退出（会停止采集并断开连接）
+
 ## 可视化点云（LAS）
 
 安装可视化依赖（可选）：

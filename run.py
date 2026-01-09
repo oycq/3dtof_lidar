@@ -18,7 +18,7 @@ _HERE = Path(__file__).resolve().parent
 OUTPUT_BASE = str(_HERE / "output")      # 临时 OPL BIN（无后缀），最终会被删除
 OUTPUT_LAS = str(_HERE / "output.las")   # 最终输出（通用格式）
 SECS_TO_WAIT = 0.1
-DURATION_SEC = 3.0
+DURATION_SEC = 1.0
 
 
 def main() -> None:
