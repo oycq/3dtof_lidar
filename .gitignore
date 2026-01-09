@@ -14,5 +14,7 @@ __pycache__/
 *.lock
 tmp
 
+data
+
 
 

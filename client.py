@@ -21,6 +21,10 @@ client.py
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime
+from pathlib import Path
+import subprocess
+import threading
 import time
 
 import numpy as np
@@ -28,6 +32,7 @@ import numpy as np
 from server import LivoxRealtimeServer
 
 CAPTURE_SECONDS = 2.0  # 显示/渲染“最近多少秒”的点云（采集滑窗长度）
+DATA_DIR = Path(__file__).resolve().parent / "data"
 
 IMG_W = 700
 IMG_H = 700
@@ -118,6 +123,62 @@ def _auto_expose_u8(img: np.ndarray, st: _AutoExposeState, now_ts: float) -> np.
     return out
 
 
+def _try_save_tof_raw(dest_raw: Path) -> bool:
+    """
+    按 get_tof.py 的方式尝试获取 tof.raw：
+    - adb shell 触发生成 /tmp/tof.raw（通过 /tmp/sv 机制）
+    - adb pull /tmp/tof.raw 到本地
+    """
+    try:
+        dest_raw.parent.mkdir(parents=True, exist_ok=True)
+        # 触发设备侧生成 tof.raw
+        trigger_cmd = "if [ -e /tmp/sv ]; then rm /tmp/sv && rm /tmp/tof.raw; fi && touch /tmp/sv"
+        subprocess.run(["adb", "shell", trigger_cmd], check=False, capture_output=True, text=True)
+
+        # 等待设备写文件（给一点时间，避免 pull 到空文件）
+        time.sleep(0.08)
+
+        pull = subprocess.run(
+            ["adb", "pull", "/tmp/tof.raw", str(dest_raw)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return pull.returncode == 0 and dest_raw.exists() and dest_raw.stat().st_size > 0
+    except Exception:
+        return False
+
+
+def _save_snapshot_async(*, x: np.ndarray, y: np.ndarray, z: np.ndarray, view_img: np.ndarray) -> None:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = DATA_DIR / ts
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) 点云：保存最近 CAPTURE_SECONDS 的快照（npz 通用、读写快）
+    npz_path = out_dir / f"points_last{CAPTURE_SECONDS:.1f}s.npz"
+    np.savez_compressed(
+        npz_path,
+        x=x.astype(np.float32, copy=False),
+        y=y.astype(np.float32, copy=False),
+        z=z.astype(np.float32, copy=False),
+        capture_seconds=float(CAPTURE_SECONDS),
+        saved_unix_ts=float(time.time()),
+    )
+
+    # 2) 当前 imshow 画面（png，无损）
+    try:
+        import cv2  # type: ignore
+
+        cv2.imwrite(str(out_dir / "view.png"), view_img)
+    except Exception:
+        pass
+
+    # 3) tof.raw（尽力而为：没有 adb/设备侧不支持则跳过）
+    _try_save_tof_raw(out_dir / "tof.raw")
+
+    print(f"[SAVE] -> {out_dir} (pts={int(x.size)})")
+
+
 def main() -> int:
     try:
         import cv2  # type: ignore
@@ -158,6 +219,14 @@ def main() -> int:
 
             cv2.imshow("OpenPyLivox - 2D (ESC=quit)", last_img)
             key = int(cv2.waitKey(1) & 0xFF)
+            if key == 32:  # SPACE：保存当前“最近 N 秒”点云 + tof.raw + jpg
+                # 后台保存，避免卡顿
+                t = threading.Thread(
+                    target=_save_snapshot_async,
+                    kwargs={"x": x, "y": y, "z": z, "view_img": last_img.copy()},
+                    daemon=True,
+                )
+                t.start()
             if key == 27:  # ESC
                 break
     finally:
