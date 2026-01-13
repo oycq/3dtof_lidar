@@ -47,6 +47,12 @@ TOF_SHOW_H = 300
 TOF_MIN_PEAK = 100  # 峰值低于该值认为置信度不足（标黑/深度置 0）
 TOF_VALID_BINS = 62  # 峰值/质心只看前 62 个 bin（与 get_tof.py/tof3d.py 对齐）
 
+# TOF 距离补偿（标定公式）
+# 约定：x/y 为毫米（mm），最终显示仍用米（m）
+TOF_COMP_ENABLE = True
+TOF_COMP_A = 1
+TOF_COMP_B_MM = -1447
+
 
 def _make_hist_image(hist: np.ndarray, x: int, y: int, depth_m: float, *, low_conf: bool) -> np.ndarray:
     """
@@ -311,7 +317,12 @@ def main() -> int:
         tof_view = np.zeros((TOF_SHOW_H, TOF_SHOW_W, 3), dtype=np.uint8)
         hist_view = np.zeros((260, 520, 3), dtype=np.uint8)
         if tof_path.exists():
-            params = ToF3DParams(min_peak_count=float(TOF_MIN_PEAK))
+            params = ToF3DParams(
+                min_peak_count=float(TOF_MIN_PEAK),
+                enable_distance_compensation=bool(TOF_COMP_ENABLE),
+                distance_comp_a=float(TOF_COMP_A),
+                distance_comp_b_mm=float(TOF_COMP_B_MM),
+            )
             depth, hists = tof_distance_and_histograms(tof_path, params=params)  # depth:(30,40), hists:(30,40,64)
             peak = hists[:, :, :62].max(axis=2)  # (30,40) uint16
             low_conf_mask = peak < int(TOF_MIN_PEAK)

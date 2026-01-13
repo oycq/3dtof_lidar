@@ -44,6 +44,13 @@ class ToF3DParams:
     # 置信度：峰值太小认为无效（0 表示不启用）
     min_peak_count: float = 0.0
 
+    # 距离线性补偿（标定）：y = a*x + b
+    # - x/y 单位：毫米（mm）
+    # - 仅对有效深度（>0）生效
+    enable_distance_compensation: bool = False
+    distance_comp_a: float = 1.0
+    distance_comp_b_mm: float = 0.0
+
     # 物理参数
     c: float = 3e8
     time_resolution_s: float = 1e-9
@@ -161,6 +168,15 @@ def tof_distance_matrix_from_u16(raw_u16: np.ndarray, params: ToF3DParams = DEFA
 
     depth = (params.c * params.time_resolution_s / 2.0) * centroid_map * np.cos(theta_x_grid) * np.cos(theta_y_grid)
     depth = depth.astype(np.float32, copy=False)
+
+    # 距离补偿：先补偿，再做最小深度阈值
+    if bool(params.enable_distance_compensation):
+        m = depth > 0
+        if np.any(m):
+            depth_mm = depth[m].astype(np.float32, copy=False) * 1000.0
+            depth_mm = float(params.distance_comp_a) * depth_mm + float(params.distance_comp_b_mm)
+            depth[m] = depth_mm / 1000.0
+
     depth[depth < float(params.min_depth_m)] = 0.0
     return depth
 
