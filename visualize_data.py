@@ -22,7 +22,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from tof3d import tof_distance_matrix
+from tof3d import tof_distance_matrix, tof_histograms
 import cv2
 
 # ========= 配置 =========
@@ -53,6 +53,75 @@ class _AEState:
     ts: list[float]
     lo: list[float]
     hi: list[float]
+
+
+def _make_hist_image(hist: np.ndarray, x: int, y: int, depth_m: float) -> np.ndarray:
+    """
+    画一个简单的直方图窗口（OpenCV BGR）。
+    hist: (64,) uint16/float
+    """
+    w, h = 520, 260
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    img[:] = (18, 18, 18)
+
+    # 坐标轴
+    left, right = 45, w - 15
+    top, bottom = 25, h - 35
+    cv2.rectangle(img, (left, top), (right, bottom), (70, 70, 70), 1)
+
+    hist = np.asarray(hist, dtype=np.float32).reshape(-1)
+    n = int(hist.size)
+    if n <= 1:
+        return img
+
+    # 需求：直方图上限固定为 1024（便于不同像素对比）
+    y_max = 1024.0
+    hist_clip = np.clip(hist, 0.0, y_max)
+
+    xs = np.linspace(left, right, n).astype(np.int32)
+    ys = bottom - (hist_clip / y_max * (bottom - top)).astype(np.int32)
+    pts = np.stack([xs, ys], axis=1).reshape((-1, 1, 2))
+    cv2.polylines(img, [pts], isClosed=False, color=(80, 220, 255), thickness=2, lineType=cv2.LINE_AA)
+
+    # 信息文本
+    dtxt = f"{depth_m:.3f} m" if depth_m > 0 else "invalid"
+    cv2.putText(img, f"TOF Pixel (x={x}, y={y})   depth={dtxt}", (12, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 1, cv2.LINE_AA)
+    cv2.putText(
+        img,
+        f"max={hist.max():.0f}  sum={hist.sum():.0f}  y_max=1024",
+        (12, h - 12),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (180, 180, 180),
+        1,
+        cv2.LINE_AA,
+    )
+    return img
+
+
+def _tof_disp_xy_to_pixel(dx: int, dy: int) -> tuple[int, int]:
+    """
+    把 TOF 窗口上的坐标（已放大显示后的像素）映射回 30x40 的像素坐标。
+    注意：当前显示做了 flipV（上下翻转），这里会映射回“未翻转”的原始 (x,y)。
+    """
+    px = int(dx * TOF_W / max(TOF_SHOW_W, 1))
+    py_disp = int(dy * TOF_H / max(TOF_SHOW_H, 1))  # 显示坐标中的行
+    px = int(np.clip(px, 0, TOF_W - 1))
+    py_disp = int(np.clip(py_disp, 0, TOF_H - 1))
+    py = (TOF_H - 1) - py_disp  # 还原 flipV
+    return px, py
+
+
+def _tof_pixel_to_disp_xy(px: int, py: int) -> tuple[int, int]:
+    """
+    把原始 30x40 像素坐标映射到显示窗口坐标中心点（用于画十字/圆点）。
+    """
+    px = int(np.clip(px, 0, TOF_W - 1))
+    py = int(np.clip(py, 0, TOF_H - 1))
+    py_disp = (TOF_H - 1) - py
+    dx = int((px + 0.5) * TOF_SHOW_W / TOF_W)
+    dy = int((py_disp + 0.5) * TOF_SHOW_H / TOF_H)
+    return dx, dy
 
 
 def _list_env_dirs() -> list[Path]:
@@ -171,6 +240,16 @@ def main() -> int:
 
     cv2.namedWindow("LiDAR", cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow("TOF", cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow("TOF_HIST", cv2.WINDOW_AUTOSIZE)
+
+    hover = {"x": TOF_W // 2, "y": TOF_H // 2}
+
+    def _on_tof_mouse(event, x, y, flags, param):
+        if event == cv2.EVENT_MOUSEMOVE:
+            px, py = _tof_disp_xy_to_pixel(x, y)
+            hover["x"], hover["y"] = px, py
+
+    cv2.setMouseCallback("TOF", _on_tof_mouse)
 
     while True:
         env = envs[idx]
@@ -188,13 +267,27 @@ def main() -> int:
         # ---- TOF ----
         tof_path = env / "tof.raw"
         tof_view = np.zeros((TOF_SHOW_H, TOF_SHOW_W, 3), dtype=np.uint8)
+        hist_view = np.zeros((260, 520, 3), dtype=np.uint8)
         if tof_path.exists():
             depth = tof_distance_matrix(tof_path)
+            hists = tof_histograms(tof_path)  # (30,40,64)
             u8 = _depth_to_u8(depth)
             u8_big = cv2.resize(u8, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
             # “旋转 180° + 左右镜像”等价于“只做上下镜像”
             u8_big = cv2.flip(u8_big, 0)
             tof_view = cv2.applyColorMap(u8_big, cv2.COLORMAP_TURBO)
+
+            # hover 直方图 + 距离
+            hx = int(np.clip(hover["x"], 0, TOF_W - 1))
+            hy = int(np.clip(hover["y"], 0, TOF_H - 1))
+            hist = hists[hy, hx, :]
+            d = float(depth[hy, hx]) if depth is not None else 0.0
+            hist_view = _make_hist_image(hist, hx, hy, d)
+
+            # 在 TOF 图上标出 hover 点（显示坐标）
+            dx, dy = _tof_pixel_to_disp_xy(hx, hy)
+            cv2.circle(tof_view, (dx, dy), 6, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.circle(tof_view, (dx, dy), 2, (0, 0, 0), -1, cv2.LINE_AA)
 
         # overlay
         cv2.putText(
@@ -210,6 +303,7 @@ def main() -> int:
 
         cv2.imshow("LiDAR", lidar_view)
         cv2.imshow("TOF", tof_view)
+        cv2.imshow("TOF_HIST", hist_view)
 
         k = int(cv2.waitKey(30) & 0xFF)
         if k == 27:  # ESC

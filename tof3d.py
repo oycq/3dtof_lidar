@@ -66,6 +66,38 @@ def tof_distance_matrix(tof_raw_path: str | Path, params: ToF3DParams = DEFAULT_
     return tof_distance_matrix_from_u16(raw_u16, params=params)
 
 
+def tof_histograms(tof_raw_path: str | Path, params: ToF3DParams = DEFAULT_PARAMS) -> np.ndarray:
+    """
+    从 tof.raw 解析每个像素的原始直方图（未做滤波）。
+
+    返回:
+        hist: (H, W, bin_num) uint16
+    """
+    p = Path(tof_raw_path)
+    raw_u16 = np.fromfile(str(p), dtype=np.uint16)
+    return tof_histograms_from_u16(raw_u16, params=params)
+
+
+def tof_histograms_from_u16(raw_u16: np.ndarray, params: ToF3DParams = DEFAULT_PARAMS) -> np.ndarray:
+    """
+    直接从 uint16 数组（包含头部）解析 (H, W, bin_num) 的直方图。
+    """
+    h, w = int(params.height), int(params.width)
+    b = int(params.bin_num)
+
+    header_words = int(params.header_bytes) // 2
+    if raw_u16.size <= header_words:
+        return np.zeros((h, w, b), dtype=np.uint16)
+
+    data = raw_u16[header_words:]
+    expected = h * w * b
+    if data.size < expected:
+        return np.zeros((h, w, b), dtype=np.uint16)
+
+    data = data[:expected]
+    return data.reshape((h, w, b)).astype(np.uint16, copy=False)
+
+
 def tof_distance_matrix_from_u16(raw_u16: np.ndarray, params: ToF3DParams = DEFAULT_PARAMS) -> np.ndarray:
     """
     直接从 uint16 数组（包含头部）计算距离矩阵。
