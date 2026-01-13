@@ -41,6 +41,8 @@ class ToF3DParams:
     pde_min_ratio: float = 80.0
     std_ratio: float = 2.2
     min_depth_m: float = 0.4
+    # 置信度：峰值太小认为无效（0 表示不启用）
+    min_peak_count: float = 0.0
 
     # 物理参数
     c: float = 3e8
@@ -54,6 +56,12 @@ class ToF3DParams:
 DEFAULT_PARAMS = ToF3DParams()
 
 
+def tof_read_u16(tof_raw_path: str | Path) -> np.ndarray:
+    """读取 tof.raw 为 uint16 一维数组（包含头部）。"""
+    p = Path(tof_raw_path)
+    return np.fromfile(str(p), dtype=np.uint16)
+
+
 def tof_distance_matrix(tof_raw_path: str | Path, params: ToF3DParams = DEFAULT_PARAMS) -> np.ndarray:
     """
     从 tof.raw 计算距离（深度）矩阵。
@@ -61,8 +69,7 @@ def tof_distance_matrix(tof_raw_path: str | Path, params: ToF3DParams = DEFAULT_
     返回:
         depth: (H, W) float32，单位米；无效为 0
     """
-    p = Path(tof_raw_path)
-    raw_u16 = np.fromfile(str(p), dtype=np.uint16)
+    raw_u16 = tof_read_u16(tof_raw_path)
     return tof_distance_matrix_from_u16(raw_u16, params=params)
 
 
@@ -73,8 +80,7 @@ def tof_histograms(tof_raw_path: str | Path, params: ToF3DParams = DEFAULT_PARAM
     返回:
         hist: (H, W, bin_num) uint16
     """
-    p = Path(tof_raw_path)
-    raw_u16 = np.fromfile(str(p), dtype=np.uint16)
+    raw_u16 = tof_read_u16(tof_raw_path)
     return tof_histograms_from_u16(raw_u16, params=params)
 
 
@@ -115,7 +121,14 @@ def tof_distance_matrix_from_u16(raw_u16: np.ndarray, params: ToF3DParams = DEFA
         return np.zeros((h, w), dtype=np.float32)
     data = data[:expected]
 
-    hist = data.reshape((h * w, int(params.bin_num)))[:, : int(params.valid_bin_num)].astype(np.float32, copy=True)
+    hist_u16 = data.reshape((h * w, int(params.bin_num)))[:, : int(params.valid_bin_num)]
+    hist = hist_u16.astype(np.float32, copy=True)
+
+    # 峰值置信度过滤（基于原始直方图的峰值）
+    if float(params.min_peak_count) > 0.0:
+        peak_raw = hist_u16.max(axis=1).astype(np.float32, copy=False)
+        low_conf = peak_raw < float(params.min_peak_count)
+        hist[low_conf] = 0.0
 
     # total photons
     shots = np.sum(hist, axis=1)  # (H*W,)
@@ -150,6 +163,20 @@ def tof_distance_matrix_from_u16(raw_u16: np.ndarray, params: ToF3DParams = DEFA
     depth = depth.astype(np.float32, copy=False)
     depth[depth < float(params.min_depth_m)] = 0.0
     return depth
+
+
+def tof_distance_and_histograms(
+    tof_raw_path: str | Path, params: ToF3DParams = DEFAULT_PARAMS
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    一次读取 tof.raw，同时返回:
+    - depth: (H,W) float32 米
+    - hist:  (H,W,bin_num) uint16 原始直方图
+    """
+    raw_u16 = tof_read_u16(tof_raw_path)
+    depth = tof_distance_matrix_from_u16(raw_u16, params=params)
+    hist = tof_histograms_from_u16(raw_u16, params=params)
+    return depth, hist
 
 
 def _centroid_bins(hist: np.ndarray, max_pos_1based: np.ndarray, params: ToF3DParams) -> np.ndarray:

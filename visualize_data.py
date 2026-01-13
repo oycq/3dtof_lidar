@@ -22,7 +22,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from tof3d import tof_distance_matrix, tof_histograms
+from tof3d import ToF3DParams, tof_distance_and_histograms
 import cv2
 
 # ========= 配置 =========
@@ -46,6 +46,7 @@ TOF_W = 40
 TOF_H = 30
 TOF_SHOW_W = 400
 TOF_SHOW_H = 300
+TOF_MIN_PEAK = 100  # 峰值低于该值认为置信度不足（标黑/深度置 0）
 
 
 @dataclass
@@ -55,7 +56,7 @@ class _AEState:
     hi: list[float]
 
 
-def _make_hist_image(hist: np.ndarray, x: int, y: int, depth_m: float) -> np.ndarray:
+def _make_hist_image(hist: np.ndarray, x: int, y: int, depth_m: float, *, low_conf: bool) -> np.ndarray:
     """
     画一个简单的直方图窗口（OpenCV BGR）。
     hist: (64,) uint16/float
@@ -85,7 +86,17 @@ def _make_hist_image(hist: np.ndarray, x: int, y: int, depth_m: float) -> np.nda
 
     # 信息文本
     dtxt = f"{depth_m:.3f} m" if depth_m > 0 else "invalid"
-    cv2.putText(img, f"TOF Pixel (x={x}, y={y})   depth={dtxt}", (12, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 1, cv2.LINE_AA)
+    extra = "  low_conf" if low_conf else ""
+    cv2.putText(
+        img,
+        f"TOF Pixel (x={x}, y={y})   depth={dtxt}{extra}",
+        (12, 18),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (230, 230, 230),
+        1,
+        cv2.LINE_AA,
+    )
     cv2.putText(
         img,
         f"max={hist.max():.0f}  sum={hist.sum():.0f}  y_max=1024",
@@ -269,20 +280,27 @@ def main() -> int:
         tof_view = np.zeros((TOF_SHOW_H, TOF_SHOW_W, 3), dtype=np.uint8)
         hist_view = np.zeros((260, 520, 3), dtype=np.uint8)
         if tof_path.exists():
-            depth = tof_distance_matrix(tof_path)
-            hists = tof_histograms(tof_path)  # (30,40,64)
+            params = ToF3DParams(min_peak_count=float(TOF_MIN_PEAK))
+            depth, hists = tof_distance_and_histograms(tof_path, params=params)  # depth:(30,40), hists:(30,40,64)
+            peak = hists[:, :, :62].max(axis=2)  # (30,40) uint16
+            low_conf_mask = peak < int(TOF_MIN_PEAK)
             u8 = _depth_to_u8(depth)
             u8_big = cv2.resize(u8, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
             # “旋转 180° + 左右镜像”等价于“只做上下镜像”
             u8_big = cv2.flip(u8_big, 0)
             tof_view = cv2.applyColorMap(u8_big, cv2.COLORMAP_TURBO)
 
+            # 低置信度点标黑（按同样的 resize + flipV 映射到显示坐标）
+            low_big = cv2.resize(low_conf_mask.astype(np.uint8) * 255, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
+            low_big = cv2.flip(low_big, 0)
+            tof_view[low_big > 0] = (0, 0, 0)
+
             # hover 直方图 + 距离
             hx = int(np.clip(hover["x"], 0, TOF_W - 1))
             hy = int(np.clip(hover["y"], 0, TOF_H - 1))
             hist = hists[hy, hx, :]
             d = float(depth[hy, hx]) if depth is not None else 0.0
-            hist_view = _make_hist_image(hist, hx, hy, d)
+            hist_view = _make_hist_image(hist, hx, hy, d, low_conf=bool(low_conf_mask[hy, hx]))
 
             # 在 TOF 图上标出 hover 点（显示坐标）
             dx, dy = _tof_pixel_to_disp_xy(hx, hy)
