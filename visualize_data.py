@@ -22,6 +22,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from tof3d import tof_distance_matrix
+import cv2
 
 # ========= 配置 =========
 HERE = Path(__file__).resolve().parent
@@ -44,19 +46,6 @@ TOF_W = 40
 TOF_H = 30
 TOF_SHOW_W = 400
 TOF_SHOW_H = 300
-
-# get_tof.py 同款核心参数（尽量保持一致）
-_OFFSET_BIN = 0
-_BASE_TH_RATIO = 10
-_CLOP_BIN_NUM = 4
-_VALID_BIN_NUM = 62
-_C = 3e8
-_TIME_RESOLUTION = 1e-9
-_FOV_X = 60.0
-_FOV_Y = 45.0
-_MIN_DEPTH_THR = 0.4
-_PDE_MIN_RATIO = 80
-_STD_RATIO = 2.2
 
 
 @dataclass
@@ -153,83 +142,6 @@ def _auto_expose_u8(img: np.ndarray, st: _AEState, now_ts: float) -> np.ndarray:
     return out
 
 
-def _process_tof_raw_to_depth(raw_path: Path) -> np.ndarray:
-    """
-    参考 get_tof.py 的 process_hist_data 思路：
-    - 去 5120 字节头（2560 个 uint16）
-    - reshape 成 (1200, 64) => 30*40 像素，每像素 64 bin
-    - 只取 valid bins（前 62）
-    - 去底噪、弱信号、噪声筛选
-    - 在峰值附近计算质心
-    - depth = c * time_resolution / 2 * centroid * cos(theta_x)*cos(theta_y)
-    """
-    raw = np.fromfile(str(raw_path), dtype=np.uint16)
-    header_words = 5120 // 2
-    if raw.size <= header_words:
-        return np.zeros((TOF_H, TOF_W), dtype=np.float32)
-    data = raw[header_words:]
-
-    expected = TOF_H * TOF_W * 64
-    if data.size < expected:
-        return np.zeros((TOF_H, TOF_W), dtype=np.float32)
-    data = data[:expected]
-
-    reshaped = data.reshape((TOF_H * TOF_W, 64))
-    hist = reshaped[:, :_VALID_BIN_NUM].astype(np.float32, copy=True)  # (1200,62)
-    orig = hist.copy()
-
-    # total photons
-    shots = np.sum(hist, axis=1)  # (1200,)
-
-    # base threshold
-    hist[hist <= float(_BASE_TH_RATIO)] = 0.0
-    # weak pixels
-    hist[shots < float(_PDE_MIN_RATIO)] = 0.0
-
-    max_vals = hist.max(axis=1)
-    mean_vals = hist.mean(axis=1)
-    std_vals = hist.std(axis=1)
-    thresholds = mean_vals + float(_STD_RATIO) * std_vals
-    noise_mask = max_vals < thresholds
-    hist[noise_mask] = 0.0
-    max_vals[noise_mask] = 0.0
-
-    max_pos = hist.argmax(axis=1) + 1
-    max_pos[max_vals == 0] = 0
-
-    centroid = np.zeros((TOF_H * TOF_W,), dtype=np.float32)
-
-    for i in range(TOF_H * TOF_W):
-        mp = int(max_pos[i])
-        if mp == 0:
-            continue
-        mp_clamped = max(_CLOP_BIN_NUM, min(mp, _VALID_BIN_NUM - _CLOP_BIN_NUM))
-        s = mp_clamped - _CLOP_BIN_NUM
-        e = mp_clamped + _CLOP_BIN_NUM
-        counts = hist[i, s:e]
-        denom = float(np.sum(counts))
-        if denom <= 0:
-            continue
-        bins = np.arange(s, e, dtype=np.float32)
-        ctd = float(np.dot(bins, counts) / denom)
-        centroid[i] = float(ctd - _OFFSET_BIN)
-
-        # 强度图/其它暂不需要，这里只要深度
-        _ = orig[i]
-
-    centroid_map = centroid.reshape((TOF_H, TOF_W))
-
-    # FOV 修正
-    theta_x = np.linspace(-_FOV_X / 2.0, _FOV_X / 2.0, TOF_W)
-    theta_y = np.linspace(-_FOV_Y / 2.0, _FOV_Y / 2.0, TOF_H)
-    theta_x_grid, theta_y_grid = np.deg2rad(np.meshgrid(theta_x, theta_y))
-    depth = (_C * _TIME_RESOLUTION / 2.0) * centroid_map * np.cos(theta_x_grid) * np.cos(theta_y_grid)
-
-    depth = depth.astype(np.float32, copy=False)
-    depth[depth < float(_MIN_DEPTH_THR)] = 0.0
-    return depth
-
-
 def _depth_to_u8(depth_m: np.ndarray) -> np.ndarray:
     """
     把 TOF 深度图转为 u8：
@@ -249,10 +161,6 @@ def _depth_to_u8(depth_m: np.ndarray) -> np.ndarray:
 
 
 def main() -> int:
-    try:
-        import cv2  # type: ignore
-    except Exception as e:
-        raise RuntimeError("缺少依赖 opencv-python，请先执行：py -m pip install opencv-python") from e
 
     envs = _list_env_dirs()
     if not envs:
@@ -281,7 +189,7 @@ def main() -> int:
         tof_path = env / "tof.raw"
         tof_view = np.zeros((TOF_SHOW_H, TOF_SHOW_W, 3), dtype=np.uint8)
         if tof_path.exists():
-            depth = _process_tof_raw_to_depth(tof_path)
+            depth = tof_distance_matrix(tof_path)
             u8 = _depth_to_u8(depth)
             u8_big = cv2.resize(u8, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
             # “旋转 180° + 左右镜像”等价于“只做上下镜像”
@@ -291,17 +199,7 @@ def main() -> int:
         # overlay
         cv2.putText(
             lidar_view,
-            f"{env.name}  ({idx+1}/{len(envs)})  pts={lidar_pts}  [4 prev | 6 next | ESC quit]",
-            (10, 24),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            tof_view,
-            f"{env.name}  TOF 30x40 -> 300x400  (flipV, range=1~{MAX_RANGE_M:.0f}m)",
+            f"{env.name}  ({idx+1}/{len(envs)})",
             (10, 24),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
