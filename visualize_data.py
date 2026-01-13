@@ -45,6 +45,7 @@ TOF_H = 30
 TOF_SHOW_W = 400
 TOF_SHOW_H = 300
 TOF_MIN_PEAK = 100  # 峰值低于该值认为置信度不足（标黑/深度置 0）
+TOF_VALID_BINS = 62  # 峰值/质心只看前 62 个 bin（与 get_tof.py/tof3d.py 对齐）
 
 
 def _make_hist_image(hist: np.ndarray, x: int, y: int, depth_m: float, *, low_conf: bool) -> np.ndarray:
@@ -75,6 +76,35 @@ def _make_hist_image(hist: np.ndarray, x: int, y: int, depth_m: float, *, low_co
     pts = np.stack([xs, ys], axis=1).reshape((-1, 1, 2))
     cv2.polylines(img, [pts], isClosed=False, color=(80, 220, 255), thickness=2, lineType=cv2.LINE_AA)
 
+    # ---- 寻峰结果可视化：在“横坐标(bin)”位置画竖线 ----
+    valid_n = int(min(n, TOF_VALID_BINS))
+    peak_bin0 = -1
+    peak_v = 0.0
+    centroid_bin0 = 0.0
+    if valid_n > 0:
+        peak_bin0 = int(np.argmax(hist[:valid_n]))
+        peak_v = float(hist[peak_bin0])
+        if peak_v > 0.0:
+            # 峰位（argmax）竖线：红色（低置信度则偏灰）
+            peak_x = int(xs[peak_bin0])
+            peak_color = (90, 90, 255) if low_conf else (0, 0, 255)
+            #cv2.line(img, (peak_x, top), (peak_x, bottom), peak_color, 1, cv2.LINE_AA)
+
+            # 可选：峰附近质心（更稳）竖线：绿色（与 tof3d/get_tof 的“clopBinNum=4”一致）
+            r = 4
+            s = max(0, min(peak_bin0, valid_n - 1) - r)
+            e = min(valid_n, min(peak_bin0, valid_n - 1) + r)
+            if e > s + 1:
+                wts = hist[s:e].astype(np.float32, copy=False)
+                denom = float(np.sum(wts))
+                if denom > 0.0:
+                    bins = np.arange(s, e, dtype=np.float32)
+                    centroid_bin0 = float(np.dot(bins, wts) / denom)
+                    # 把 centroid 的 bin(float) 映射到像素横坐标
+                    cx = int(np.interp(centroid_bin0, np.arange(n, dtype=np.float32), xs.astype(np.float32)))
+                    centroid_color = (90, 255, 90) if low_conf else (0, 255, 0)
+                    cv2.line(img, (cx, top), (cx, bottom), centroid_color, 1, cv2.LINE_AA)
+
     # 信息文本
     dtxt = f"{depth_m:.3f} m" if depth_m > 0 else "invalid"
     extra = "  low_conf" if low_conf else ""
@@ -90,7 +120,7 @@ def _make_hist_image(hist: np.ndarray, x: int, y: int, depth_m: float, *, low_co
     )
     cv2.putText(
         img,
-        f"max={hist.max():.0f}  sum={hist.sum():.0f}  y_max=1024",
+        f"max={hist.max():.0f}  sum={hist.sum():.0f}  peak={peak_bin0 + 1 if peak_bin0 >= 0 else 0}  centroid={centroid_bin0 + 1:.2f}",
         (12, h - 12),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.5,
