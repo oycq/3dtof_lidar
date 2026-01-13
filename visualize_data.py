@@ -148,20 +148,24 @@ def _load_points(npz_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     return x, y, z
 
 
-def _render_lidar_gray(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
+def _render_lidar_gray_and_depth(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    渲染 LiDAR 2D 投影：
+    - gray_u8: (H,W) uint8（反比例亮度）
+    - depth_m_map: (H,W) float32（米；无效为 0；每像素取最近点）
+    """
     if x.size == 0:
-        return np.zeros((LIDAR_IMG_H, LIDAR_IMG_W), dtype=np.uint8)
+        return np.zeros((LIDAR_IMG_H, LIDAR_IMG_W), dtype=np.uint8), np.zeros((LIDAR_IMG_H, LIDAR_IMG_W), dtype=np.float32)
 
     yaw = np.arctan2(y, x)
     pitch = np.arctan2(z, x)
     m = (x > 0) & (np.abs(yaw) <= HALF_FOV) & (np.abs(pitch) <= HALF_FOV)
     x, y, z = x[m], y[m], z[m]
     if x.size == 0:
-        return np.zeros((LIDAR_IMG_H, LIDAR_IMG_W), dtype=np.uint8)
+        return np.zeros((LIDAR_IMG_H, LIDAR_IMG_W), dtype=np.uint8), np.zeros((LIDAR_IMG_H, LIDAR_IMG_W), dtype=np.float32)
 
-    # 反比例亮度（和 client.py 一致）
-    depth_m = np.clip(x, NEAR_SAT_M, MAX_RANGE_M)
-    depth_u8 = np.clip(np.rint(255.0 / depth_m), 0.0, 255.0).astype(np.uint8)
+    # 以 x 作为距离（与原显示逻辑一致），并做量程裁剪
+    depth_m = np.clip(x.astype(np.float32, copy=False), NEAR_SAT_M, MAX_RANGE_M)
 
     yaw = np.arctan2(y, x)
     pitch = np.arctan2(z, x)
@@ -170,9 +174,18 @@ def _render_lidar_gray(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarra
     col = np.clip(col, 0, LIDAR_IMG_W - 1)
     row = np.clip(row, 0, LIDAR_IMG_H - 1)
 
-    img = np.zeros((LIDAR_IMG_H, LIDAR_IMG_W), dtype=np.uint8)
-    np.maximum.at(img, (row, col), depth_u8)
-    return img
+    # 每个像素取最近点距离
+    depth_map = np.full((LIDAR_IMG_H, LIDAR_IMG_W), np.inf, dtype=np.float32)
+    np.minimum.at(depth_map, (row, col), depth_m)
+
+    valid = np.isfinite(depth_map)
+    depth_m_map = np.zeros_like(depth_map, dtype=np.float32)
+    depth_m_map[valid] = depth_map[valid]
+
+    gray = np.zeros((LIDAR_IMG_H, LIDAR_IMG_W), dtype=np.uint8)
+    if np.any(valid):
+        gray[valid] = np.clip(np.rint(255.0 / depth_m_map[valid]), 0.0, 255.0).astype(np.uint8)
+    return gray, depth_m_map
 
 
 def _auto_expose_u8(img: np.ndarray) -> np.ndarray:
@@ -230,6 +243,7 @@ def main() -> int:
     cv2.namedWindow("TOF_HIST", cv2.WINDOW_AUTOSIZE)
 
     hover = {"x": TOF_W // 2, "y": TOF_H // 2}
+    lidar_hover = {"x": LIDAR_IMG_W // 2, "y": LIDAR_IMG_H // 2}
 
     def _on_tof_mouse(event, x, y, flags, param):
         if event == cv2.EVENT_MOUSEMOVE:
@@ -238,6 +252,15 @@ def main() -> int:
 
     cv2.setMouseCallback("TOF", _on_tof_mouse)
 
+    def _on_lidar_mouse(event, x, y, flags, param):
+        # “像 TOF 一样”：鼠标移动/点击都更新
+        if event in (cv2.EVENT_MOUSEMOVE, cv2.EVENT_LBUTTONDOWN):
+            lx = int(np.clip(x, 0, LIDAR_IMG_W - 1))
+            ly = int(np.clip(y, 0, LIDAR_IMG_H - 1))
+            lidar_hover["x"], lidar_hover["y"] = lx, ly
+
+    cv2.setMouseCallback("LiDAR", _on_lidar_mouse)
+
     while True:
         env = envs[idx]
 
@@ -245,10 +268,12 @@ def main() -> int:
         npz_path = _find_points_npz(env)
         lidar_view = np.zeros((LIDAR_IMG_H, LIDAR_IMG_W, 3), dtype=np.uint8)
         lidar_pts = 0
+        lidar_depth_map = np.zeros((LIDAR_IMG_H, LIDAR_IMG_W), dtype=np.float32)
         if npz_path is not None and npz_path.exists():
             x, y, z = _load_points(npz_path)
             lidar_pts = int(x.size)
-            g = _auto_expose_u8(_render_lidar_gray(x, y, z))
+            g0, lidar_depth_map = _render_lidar_gray_and_depth(x, y, z)
+            g = _auto_expose_u8(g0)
             lidar_view = cv2.applyColorMap(g, cv2.COLORMAP_TURBO)
 
         # ---- TOF ----
@@ -284,9 +309,16 @@ def main() -> int:
             cv2.circle(tof_view, (dx, dy), 2, (0, 0, 0), -1, cv2.LINE_AA)
 
         # overlay
+        # LiDAR hover 距离（像 TOF 一样显示数值）
+        lhx = int(np.clip(lidar_hover["x"], 0, LIDAR_IMG_W - 1))
+        lhy = int(np.clip(lidar_hover["y"], 0, LIDAR_IMG_H - 1))
+        ld = float(lidar_depth_map[lhy, lhx]) if lidar_depth_map is not None else 0.0
+        ld_txt = f"{ld:.3f} m" if ld > 0 else "invalid"
+        cv2.circle(lidar_view, (lhx, lhy), 6, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.circle(lidar_view, (lhx, lhy), 2, (0, 0, 0), -1, cv2.LINE_AA)
         cv2.putText(
             lidar_view,
-            f"{env.name}  ({idx+1}/{len(envs)})",
+            f"{env.name}  ({idx+1}/{len(envs)})  pts={lidar_pts}  hover={ld_txt}",
             (10, 24),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
