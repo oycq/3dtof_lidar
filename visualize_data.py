@@ -16,7 +16,6 @@ visualize_data.py
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -40,20 +39,12 @@ AUTO_EXPOSURE = True
 AE_LOW_PCT = 2.0
 AE_HIGH_PCT = 98.0
 AE_GAMMA = 0.8
-AE_MEAN_SECONDS = 2.0
 
 TOF_W = 40
 TOF_H = 30
 TOF_SHOW_W = 400
 TOF_SHOW_H = 300
 TOF_MIN_PEAK = 100  # 峰值低于该值认为置信度不足（标黑/深度置 0）
-
-
-@dataclass
-class _AEState:
-    ts: list[float]
-    lo: list[float]
-    hi: list[float]
 
 
 def _make_hist_image(hist: np.ndarray, x: int, y: int, depth_m: float, *, low_conf: bool) -> np.ndarray:
@@ -184,32 +175,18 @@ def _render_lidar_gray(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarra
     return img
 
 
-def _auto_expose_u8(img: np.ndarray, st: _AEState, now_ts: float) -> np.ndarray:
+def _auto_expose_u8(img: np.ndarray) -> np.ndarray:
+    """
+    每帧独立 AE：只用当前帧非零像素的分位数做拉伸，不做跨帧平滑。
+    """
     if (not AUTO_EXPOSURE) or img.size == 0:
         return img
     nz = img[img > 0]
     if nz.size < 500:
         return img
 
-    lo_now = float(np.percentile(nz, AE_LOW_PCT))
-    hi_now = float(np.percentile(nz, AE_HIGH_PCT))
-    if hi_now <= lo_now + 1.0:
-        return img
-
-    st.ts.append(now_ts)
-    st.lo.append(lo_now)
-    st.hi.append(hi_now)
-
-    cutoff = now_ts - float(max(AE_MEAN_SECONDS, 0.05))
-    while st.ts and st.ts[0] < cutoff:
-        st.ts.pop(0)
-        st.lo.pop(0)
-        st.hi.pop(0)
-
-    if not st.ts:
-        return img
-    lo = float(np.mean(st.lo))
-    hi = float(np.mean(st.hi))
+    lo = float(np.percentile(nz, AE_LOW_PCT))
+    hi = float(np.percentile(nz, AE_HIGH_PCT))
     if hi <= lo + 1.0:
         return img
 
@@ -247,7 +224,6 @@ def main() -> int:
         raise FileNotFoundError(f"data 目录下没有环境数据：{DATA_DIR}")
 
     idx = 0
-    ae_state = _AEState(ts=[], lo=[], hi=[])
 
     cv2.namedWindow("LiDAR", cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow("TOF", cv2.WINDOW_AUTOSIZE)
@@ -272,7 +248,7 @@ def main() -> int:
         if npz_path is not None and npz_path.exists():
             x, y, z = _load_points(npz_path)
             lidar_pts = int(x.size)
-            g = _auto_expose_u8(_render_lidar_gray(x, y, z), ae_state, now_ts=float(__import__("time").time()))
+            g = _auto_expose_u8(_render_lidar_gray(x, y, z))
             lidar_view = cv2.applyColorMap(g, cv2.COLORMAP_TURBO)
 
         # ---- TOF ----
