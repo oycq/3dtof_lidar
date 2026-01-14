@@ -53,6 +53,11 @@ TOF_COMP_ENABLE = True
 TOF_COMP_A = 1
 TOF_COMP_B_MM = -1447
 
+# TOF 反射率强度图：强度=直方图各 bin 求和，显示时映射到 0~1023 并做 gamma=2.2
+TOF_INTEN_GAMMA = 2.2
+TOF_INTEN_USE_COLORMAP = False  # 需求：黑白图即可（无需伪彩）
+TOF_INTEN_TARGET_MEAN = 0.18  # 通过除以系数 k，让整张图的平均反射率变为 0.18（之后再做 gamma 显示）
+
 
 def _make_hist_image(hist: np.ndarray, x: int, y: int, depth_m: float, *, low_conf: bool) -> np.ndarray:
     """
@@ -266,6 +271,30 @@ def _depth_to_u8(depth_m: np.ndarray) -> np.ndarray:
     return out
 
 
+def _tof_intensity_to_u8(intensity_sum: np.ndarray) -> np.ndarray:
+    """
+    把 TOF 反射率强度（直方图求和）转为 u8：
+    - 输入：任意数值类型 (H,W)，强度=∑hist[bin]
+    - 显示策略（按需求）：通过除以系数 k，让整张图平均反射率变为 0.18，然后 gamma=2.2（显示用 1/gamma），最后映射到 0~255
+    """
+    if intensity_sum.size == 0:
+        return np.zeros((TOF_H, TOF_W), dtype=np.uint8)
+    v = np.asarray(intensity_sum, dtype=np.float32)
+
+    mean = float(np.mean(v)) if v.size else 0.0
+    if mean <= 0.0:
+        return np.zeros(v.shape, dtype=np.uint8)
+
+    # v / k，使得 mean(v/k) = target_mean  =>  k = mean / target_mean
+    k = mean / float(TOF_INTEN_TARGET_MEAN)
+    k = max(k, 1e-6)
+    n = v / k  # 反射率（0..1+）
+    n = np.clip(n, 0.0, 1.0)
+    if float(TOF_INTEN_GAMMA) > 0:
+        n = np.power(n, 1.0 / float(TOF_INTEN_GAMMA))
+    return np.clip(np.rint(n * 255.0), 0.0, 255.0).astype(np.uint8)
+
+
 def main() -> int:
 
     envs = _list_env_dirs()
@@ -276,6 +305,7 @@ def main() -> int:
 
     cv2.namedWindow("LiDAR", cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow("TOF", cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow("TOF_INTEN", cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow("TOF_HIST", cv2.WINDOW_AUTOSIZE)
 
     hover = {"x": TOF_W // 2, "y": TOF_H // 2}
@@ -287,6 +317,7 @@ def main() -> int:
             hover["x"], hover["y"] = px, py
 
     cv2.setMouseCallback("TOF", _on_tof_mouse)
+    cv2.setMouseCallback("TOF_INTEN", _on_tof_mouse)
 
     def _on_lidar_mouse(event, x, y, flags, param):
         # “像 TOF 一样”：鼠标移动/点击都更新
@@ -315,6 +346,7 @@ def main() -> int:
         # ---- TOF ----
         tof_path = env / "tof.raw"
         tof_view = np.zeros((TOF_SHOW_H, TOF_SHOW_W, 3), dtype=np.uint8)
+        tof_inten_view = np.zeros((TOF_SHOW_H, TOF_SHOW_W, 3), dtype=np.uint8)
         hist_view = np.zeros((260, 520, 3), dtype=np.uint8)
         if tof_path.exists():
             params = ToF3DParams(
@@ -326,6 +358,17 @@ def main() -> int:
             depth, hists = tof_distance_and_histograms(tof_path, params=params)  # depth:(30,40), hists:(30,40,64)
             peak = hists[:, :, :62].max(axis=2)  # (30,40) uint16
             low_conf_mask = peak < int(TOF_MIN_PEAK)
+
+            # 反射率强度：直方图所有 bin 求和（按需求 0~1023 值域 + gamma=2.2）
+            inten_sum = hists.sum(axis=2).astype(np.float32, copy=False)  # (30,40)
+            inten_u8 = _tof_intensity_to_u8(inten_sum)
+            inten_u8_big = cv2.resize(inten_u8, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
+            inten_u8_big = cv2.flip(inten_u8_big, 0)
+            if TOF_INTEN_USE_COLORMAP:
+                tof_inten_view = cv2.applyColorMap(inten_u8_big, cv2.COLORMAP_TURBO)
+            else:
+                tof_inten_view = cv2.cvtColor(inten_u8_big, cv2.COLOR_GRAY2BGR)
+
             u8 = _depth_to_u8(depth)
             u8_big = cv2.resize(u8, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
             # “旋转 180° + 左右镜像”等价于“只做上下镜像”
@@ -348,6 +391,8 @@ def main() -> int:
             dx, dy = _tof_pixel_to_disp_xy(hx, hy)
             cv2.circle(tof_view, (dx, dy), 6, (255, 255, 255), 2, cv2.LINE_AA)
             cv2.circle(tof_view, (dx, dy), 2, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(tof_inten_view, (dx, dy), 6, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.circle(tof_inten_view, (dx, dy), 2, (0, 0, 0), -1, cv2.LINE_AA)
 
         # overlay
         # LiDAR hover 距离（像 TOF 一样显示数值）
@@ -370,6 +415,7 @@ def main() -> int:
 
         cv2.imshow("LiDAR", lidar_view)
         cv2.imshow("TOF", tof_view)
+        cv2.imshow("TOF_INTEN", tof_inten_view)
         cv2.imshow("TOF_HIST", hist_view)
 
         k = int(cv2.waitKey(30) & 0xFF)
