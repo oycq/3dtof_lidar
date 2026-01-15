@@ -24,7 +24,7 @@ SPHERE_R_MIN_M = 0.05
 SPHERE_R_MAX_M = 0.10
 
 # RANSAC
-SPHERE_RANSAC_ITERS = 50  # 每个格子各自做 1000 次
+SPHERE_RANSAC_ITERS = 100  # 每个格子各自做 100 次
 SPHERE_INLIER_THRESH_M = 0.02 # | ||p-c|| - r | < thresh
 SPHERE_MIN_INLIERS_GLOBAL = 250  # 全局（在整帧点云上重新算 inliers 后）最低内点数
 SPHERE_MIN_INLIERS_CELL = 80     # 单个格子内做 RANSAC 时的最低内点数（允许只看到部分球面）
@@ -43,14 +43,6 @@ VERT_NEAREST_KEEP_DELTA_M = 0.2
 
 # 视场角（用于筛选参与RANSAC的点；竖直窗口也只在这个 FOV 内滑动）
 LIDAR_FOV_DEG = 70.0
-
-# “球的圆周可见/不遮挡” 质量判定（过滤一小片弧面被误拟合成球的情况）
-SPHERE_EDGE_ANGLE_DEG = 18.0          # 轮廓带宽：极角 > 90°-edge_angle
-SPHERE_EDGE_BINS = 36                # 方位角分桶数（越大越严格）
-SPHERE_EDGE_MIN_POINTS = 80          # 轮廓点最少数量
-SPHERE_EDGE_MIN_BIN_FRACTION = 0.65  # 被占用的方位桶比例（0~1）
-SPHERE_EDGE_MAX_GAP_BINS = 2         # 最大连续空桶数（环形）
-
 
 @dataclass(frozen=True)
 class SphereFit:
@@ -181,79 +173,6 @@ def _sphere_refine_least_squares(pts: np.ndarray) -> Optional[tuple[np.ndarray, 
     return c, r
 
 
-def _sphere_edge_coverage_ok(*, pts: np.ndarray, center: np.ndarray, inliers: np.ndarray) -> bool:
-    """轮廓覆盖质量检查（过滤残缺弧面误拟合）。"""
-    if pts.shape[0] == 0:
-        return False
-    if inliers.shape[0] != pts.shape[0]:
-        return False
-
-    c = center.astype(np.float64, copy=False).reshape(3)
-    cn = float(np.linalg.norm(c))
-    if cn <= 1e-6 or (not np.isfinite(cn)):
-        return False
-
-    # v：从球心指向传感器（原点）
-    v = (-c / cn).astype(np.float64, copy=False)
-
-    # 构造正交基 u,w,v
-    tmp = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    if abs(float(np.dot(tmp, v))) > 0.90:
-        tmp = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-    u = np.cross(tmp, v)
-    un = float(np.linalg.norm(u))
-    if un <= 1e-9:
-        return False
-    u /= un
-    w = np.cross(v, u)
-
-    pin = pts[inliers].astype(np.float64, copy=False)
-    if pin.shape[0] < int(SPHERE_MIN_INLIERS_GLOBAL):
-        return False
-
-    s = pin - c.reshape(1, 3)
-    sn = np.linalg.norm(s, axis=1)
-    m = sn > 1e-6
-    if not np.any(m):
-        return False
-    s = s[m] / sn[m].reshape(-1, 1)
-
-    cos_a = np.clip((s @ v.reshape(3, 1)).reshape(-1), -1.0, 1.0)
-    a = np.arccos(cos_a)
-    edge_thr = (np.pi / 2.0) - np.deg2rad(float(SPHERE_EDGE_ANGLE_DEG))
-    edge = a > float(edge_thr)
-    if int(np.count_nonzero(edge)) < int(SPHERE_EDGE_MIN_POINTS):
-        return False
-
-    se = s[edge]
-    az = np.arctan2((se @ w.reshape(3, 1)).reshape(-1), (se @ u.reshape(3, 1)).reshape(-1))
-
-    bins = int(SPHERE_EDGE_BINS)
-    bidx = np.floor((az + np.pi) / (2.0 * np.pi) * bins).astype(np.int32)
-    bidx = np.clip(bidx, 0, bins - 1)
-    occ = np.zeros((bins,), dtype=np.uint8)
-    occ[bidx] = 1
-
-    occ_cnt = int(np.count_nonzero(occ))
-    if occ_cnt < int(np.ceil(bins * float(SPHERE_EDGE_MIN_BIN_FRACTION))):
-        return False
-
-    z = np.concatenate([occ, occ], axis=0)
-    best_gap = 0
-    cur = 0
-    for val in z.tolist():
-        if val == 0:
-            cur += 1
-            best_gap = max(best_gap, cur)
-        else:
-            cur = 0
-    best_gap = min(best_gap, bins)
-    if best_gap > int(SPHERE_EDGE_MAX_GAP_BINS):
-        return False
-
-    return True
-
-
 def _ransac_sphere(
     pts: np.ndarray,
     *,
@@ -289,8 +208,6 @@ def _ransac_sphere(
         inliers = np.abs(d - float(r)) < float(inlier_thresh)
         cnt = int(np.count_nonzero(inliers))
         if cnt > best_cnt and cnt >= int(min_inliers):
-            if not _sphere_edge_coverage_ok(pts=p, center=c, inliers=inliers):
-                continue
             best_cnt = cnt
             best_center = c
             best_radius = float(r)
@@ -306,8 +223,7 @@ def _ransac_sphere(
             d2 = np.linalg.norm(p - c2.reshape(1, 3), axis=1)
             in2 = np.abs(d2 - float(r2)) < float(inlier_thresh)
             if int(np.count_nonzero(in2)) >= best_cnt:
-                if _sphere_edge_coverage_ok(pts=p, center=c2, inliers=in2):
-                    best_center, best_radius, best_inliers = c2, float(r2), in2
+                best_center, best_radius, best_inliers = c2, float(r2), in2
 
     return SphereFit(center=best_center, radius=float(best_radius), inliers=best_inliers)
 
@@ -352,8 +268,7 @@ def find_ball_from_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> BallFindRe
 
     best_c = None
     best_r = 0.0
-    best_in = None  # 对齐 p_render 的 bool mask
-    best_cnt = 0
+    best_cnt = 0  # 先用“窗口内内点数”挑候选；最后只对最佳候选做一次全局重算
 
     # 用于显示：第一轮过滤（4m裁剪 + 竖直窗口内“最近距离+0.2m”）后的点的并集
     stage1_keep = np.zeros((p_render.shape[0],), dtype=bool)
@@ -423,40 +338,43 @@ def find_ball_from_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> BallFindRe
         if fit is None:
             continue
 
-        # 在整帧 p_render 上重新算 inliers（不让“窗口切分”影响最终内点统计）
+        # 窗口内快速评估：只在 p_win（过滤后的窗口点）里算一次内点数，用来选“最可能的候选”
         c = fit.center.astype(np.float64, copy=False).reshape(3)
         r = float(fit.radius)
-        d0 = np.linalg.norm(p64 - c.reshape(1, 3), axis=1)
-        in0 = np.abs(d0 - r) < float(SPHERE_INLIER_THRESH_M)
-        cnt0 = int(np.count_nonzero(in0))
-        if cnt0 < int(SPHERE_MIN_INLIERS_GLOBAL):
-            continue
-
-        refined = _sphere_refine_least_squares(p64[in0])
-        if refined is not None:
-            c2, r2 = refined
-            if float(SPHERE_R_MIN_M) <= float(r2) <= float(SPHERE_R_MAX_M):
-                d2 = np.linalg.norm(p64 - c2.reshape(1, 3), axis=1)
-                in2 = np.abs(d2 - float(r2)) < float(SPHERE_INLIER_THRESH_M)
-                if int(np.count_nonzero(in2)) >= cnt0:
-                    c, r, in0 = c2, float(r2), in2
-                    cnt0 = int(np.count_nonzero(in0))
-
-        if not _sphere_edge_coverage_ok(pts=p64, center=c, inliers=in0):
-            continue
-
-        if cnt0 > best_cnt:
-            best_cnt = cnt0
+        pwin64 = p_win.astype(np.float64, copy=False)
+        dwin = np.linalg.norm(pwin64 - c.reshape(1, 3), axis=1)
+        inw = np.abs(dwin - r) < float(SPHERE_INLIER_THRESH_M)
+        cntw = int(np.count_nonzero(inw))
+        if cntw > best_cnt and cntw >= int(SPHERE_MIN_INLIERS_CELL):
+            best_cnt = cntw
             best_c = c
             best_r = float(r)
-            best_in = in0
 
-    if best_c is None or best_in is None:
+    if best_c is None:
         return BallFindResult(center_xyz=None, sphere=None, render_points=p_render, filtered_points=p_render, inlier_points=p_render[:0])
 
-    cx0, cy0, cz0 = best_c.tolist()
-    inlier_pts = p_render[best_in].astype(np.float32, copy=False)
-    sphere = SphereFit(center=best_c, radius=float(best_r), inliers=best_in)
+    # 只对最佳候选做一次全局重算 inliers + refine（用于稳定的最终球心/高亮内点）
+    c = best_c.astype(np.float64, copy=False).reshape(3)
+    r = float(best_r)
+    d0 = np.linalg.norm(p64 - c.reshape(1, 3), axis=1)
+    in0 = np.abs(d0 - r) < float(SPHERE_INLIER_THRESH_M)
+    cnt0 = int(np.count_nonzero(in0))
+    if cnt0 < int(SPHERE_MIN_INLIERS_GLOBAL):
+        return BallFindResult(center_xyz=None, sphere=None, render_points=p_render, filtered_points=p_render, inlier_points=p_render[:0])
+
+    refined = _sphere_refine_least_squares(p64[in0])
+    if refined is not None:
+        c2, r2 = refined
+        if float(SPHERE_R_MIN_M) <= float(r2) <= float(SPHERE_R_MAX_M):
+            d2 = np.linalg.norm(p64 - c2.reshape(1, 3), axis=1)
+            in2 = np.abs(d2 - float(r2)) < float(SPHERE_INLIER_THRESH_M)
+            if int(np.count_nonzero(in2)) >= cnt0:
+                c, r, in0 = c2, float(r2), in2
+                cnt0 = int(np.count_nonzero(in0))
+
+    cx0, cy0, cz0 = c.tolist()
+    inlier_pts = p_render[in0].astype(np.float32, copy=False)
+    sphere = SphereFit(center=c, radius=float(r), inliers=in0)
     filt_pts = p_render[stage1_keep].astype(np.float32, copy=False) if np.any(stage1_keep) else p_render.astype(np.float32, copy=False)
     return BallFindResult(
         center_xyz=(float(cx0), float(cy0), float(cz0)),
