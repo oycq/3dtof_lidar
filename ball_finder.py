@@ -24,8 +24,8 @@ SPHERE_R_MIN_M = 0.05
 SPHERE_R_MAX_M = 0.10
 
 # RANSAC
-SPHERE_RANSAC_ITERS = 1000  # 每个格子各自做 1000 次
-SPHERE_INLIER_THRESH_M = 0.012  # | ||p-c|| - r | < thresh
+SPHERE_RANSAC_ITERS = 50  # 每个格子各自做 1000 次
+SPHERE_INLIER_THRESH_M = 0.02 # | ||p-c|| - r | < thresh
 SPHERE_MIN_INLIERS_GLOBAL = 250  # 全局（在整帧点云上重新算 inliers 后）最低内点数
 SPHERE_MIN_INLIERS_CELL = 80     # 单个格子内做 RANSAC 时的最低内点数（允许只看到部分球面）
 SPHERE_MAX_FIT_POINTS = 60_000  # RANSAC 前最多参与拟合的点数（加速）
@@ -33,17 +33,16 @@ SPHERE_MAX_FIT_POINTS = 60_000  # RANSAC 前最多参与拟合的点数（加速
 # 基础预过滤（仅用于降低离群点/加速，不依赖外部引导）
 # 1) 距离裁剪：先去掉距离 > 4m 的点（用户需求）
 MAX_RANGE_M = 4.0
-# 2) 竖直方向（elevation）分组：每 5° 一组
-VERT_BIN_DEG = 5.0
-# 2.1) 每组计算“参考最近距离”时，为了抗噪，使用排序后的第 N 个距离（1-based）
+# 2) 竖直重叠窗口：0-14°，7-21°...（窗口 14°，步长 7°）
+VERT_WIN_DEG = 14.0
+VERT_STEP_DEG = 7.0
+# 2.1) 窗口内计算“参考最近距离”时，为了抗噪，使用距离排序后的第 N 个（1-based）
 VERT_NEAREST_RANK = 100
-# 3) 每组只保留距离在“该组最小距离 + 0.2m”窗口内的点
+# 2.2) 窗口内只保留距离 <= (参考最近距离 + 0.2m) 的点
 VERT_NEAREST_KEEP_DELTA_M = 0.2
 
-# 3x3 网格划分（按 yaw/pitch）
-GRID_ROWS = 3
-GRID_COLS = 3
-GRID_FOV_DEG = 70.0
+# 视场角（用于筛选参与RANSAC的点；竖直窗口也只在这个 FOV 内滑动）
+LIDAR_FOV_DEG = 70.0
 
 # “球的圆周可见/不遮挡” 质量判定（过滤一小片弧面被误拟合成球的情况）
 SPHERE_EDGE_ANGLE_DEG = 18.0          # 轮廓带宽：极角 > 90°-edge_angle
@@ -65,6 +64,7 @@ class BallFindResult:
     center_xyz: Optional[Tuple[float, float, float]]
     sphere: Optional[SphereFit]
     render_points: np.ndarray  # (M,3) float32，用于显示（基础预过滤后的点云）
+    filtered_points: np.ndarray  # (M2,3) float32，用于显示（最终用于窗口过滤后的点云）
     inlier_points: np.ndarray  # (K,3) float32，球面内点，用于高亮
 
 
@@ -73,7 +73,6 @@ def _prefilter_lidar_points(pts: np.ndarray) -> np.ndarray:
     预过滤（降低离群点/加速）：
     - 只保留前方（x > 0）
     - 距离裁剪：||p|| <= MAX_RANGE_M
-    - 竖直角（elevation）每 VERT_BIN_DEG 分一组；组内只保留距离 <= (该组最小距离 + VERT_NEAREST_KEEP_DELTA_M)
     """
     if pts.shape[0] == 0:
         return pts
@@ -90,45 +89,33 @@ def _prefilter_lidar_points(pts: np.ndarray) -> np.ndarray:
     m0 = (x > 0.0) & np.isfinite(rng) & (rng <= float(MAX_RANGE_M))
     if not np.any(m0):
         return p[:0]
-    p0 = p[m0]
+    return p[m0]
 
-    # 竖直角 elevation：atan2(z, hypot(x,y))（比 atan2(z,x) 更稳健）
-    x0 = p0[:, 0].astype(np.float64, copy=False)
-    y0 = p0[:, 1].astype(np.float64, copy=False)
-    z0 = p0[:, 2].astype(np.float64, copy=False)
-    horiz = np.hypot(x0, y0)
-    elev = np.arctan2(z0, horiz)  # rad
-    elev_deg = np.rad2deg(elev)
 
-    bin_deg = float(VERT_BIN_DEG)
-    if (not np.isfinite(bin_deg)) or bin_deg <= 0.0:
-        bin_deg = 5.0
+def _window_near_filter(pts: np.ndarray) -> np.ndarray:
+    """
+    在“一个竖直窗口(14°范围)”内做距离窗口过滤：
+    - 先取该窗口内距离排序后的第 VERT_NEAREST_RANK 个作为参考最近距离（抗噪）
+    - 保留距离 <= 参考距离 + VERT_NEAREST_KEEP_DELTA_M 的点
+    """
+    if pts.shape[0] == 0:
+        return pts
+    p = pts.astype(np.float64, copy=False)
+    r = np.linalg.norm(p, axis=1)
+    if r.size == 0:
+        return pts[:0]
 
-    # 每 5° 一组：用 floor 量化（负角度也自然分桶）
-    b = np.floor(elev_deg / bin_deg).astype(np.int32, copy=False)
-    r0 = np.sqrt(x0 * x0 + y0 * y0 + z0 * z0)
-
-    # 按组求最小距离，然后保留距离 <= min + 0.2m 的点
-    uniq, inv = np.unique(b, return_inverse=True)
-
-    # 参考距离：每组排序后取第 VERT_NEAREST_RANK 个（1-based），更抗“极近噪声点”
     rank = int(VERT_NEAREST_RANK)
     if rank <= 0:
-        rank = 30
-    ref = np.full((uniq.shape[0],), np.inf, dtype=np.float64)
-    for gi in range(int(uniq.shape[0])):
-        rg = r0[inv == gi]
-        if rg.size == 0:
-            continue
-        # 第 N 个（1-based）=> index N-1；不足 N 个则取该组最小值兜底
-        k = min(rank, int(rg.size)) - 1
-        # 用 partition 取第 k 小值（不必全排序）
-        ref[gi] = float(np.partition(rg, k)[k])
+        rank = 1
+    k = min(rank, int(r.size)) - 1
+    ref = float(np.partition(r, k)[k])
+
     keep_delta = float(VERT_NEAREST_KEEP_DELTA_M)
     if (not np.isfinite(keep_delta)) or keep_delta < 0.0:
         keep_delta = 0.2
-    m1 = r0 <= (ref[inv] + keep_delta)
-    return p0[m1]
+    m = r <= (ref + keep_delta)
+    return pts[m]
 
 
 def _maybe_subsample(pts: np.ndarray, n_max: int, rng: np.random.Generator) -> np.ndarray:
@@ -336,20 +323,21 @@ def find_ball_from_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> BallFindRe
 
     if pts.shape[0] == 0:
         z = pts.astype(np.float32, copy=False)
-        return BallFindResult(center_xyz=None, sphere=None, render_points=z, inlier_points=z[:0])
+        return BallFindResult(center_xyz=None, sphere=None, render_points=z, filtered_points=z, inlier_points=z[:0])
 
     p_render = _prefilter_lidar_points(pts.astype(np.float32, copy=False))
     if p_render.shape[0] == 0:
-        return BallFindResult(center_xyz=None, sphere=None, render_points=p_render, inlier_points=p_render[:0])
+        return BallFindResult(center_xyz=None, sphere=None, render_points=p_render, filtered_points=p_render, inlier_points=p_render[:0])
 
-    # -------- 3x3 网格：每格 600 次 RANSAC，最后选全局 inliers 最多的一个 --------
+    # -------- 竖直重叠窗口：每个窗口(14°)先过滤，再做 RANSAC，最后选全局 inliers 最多的一个 --------
     rng = np.random.default_rng(int(seed))
 
-    # 视场角筛选（用于划格），并计算每个点所属格子
-    fov = float(GRID_FOV_DEG)
+    # 视场角筛选（竖直窗口也只在该 FOV 内滑动）
+    fov = float(LIDAR_FOV_DEG)
     if (not np.isfinite(fov)) or fov <= 0.0:
         fov = 70.0
     half = float(np.deg2rad(fov / 2.0))
+    half_deg = float(np.rad2deg(half))
 
     x = p_render[:, 0].astype(np.float64, copy=False)
     y = p_render[:, 1].astype(np.float64, copy=False)
@@ -360,87 +348,121 @@ def find_ball_from_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> BallFindRe
     m_fov = (x > 0.0) & (np.abs(yaw) <= half) & (np.abs(pitch) <= half)
     idx_fov = np.nonzero(m_fov)[0].astype(np.int32, copy=False)
     if idx_fov.size == 0:
-        return BallFindResult(center_xyz=None, sphere=None, render_points=p_render, inlier_points=p_render[:0])
-
-    # 归一化到 [0,1]，再映射到 (rows, cols)
-    cols = int(GRID_COLS)
-    rows = int(GRID_ROWS)
-    cols = 3 if cols <= 0 else cols
-    rows = 3 if rows <= 0 else rows
-    yaw_n = (yaw[idx_fov] + half) / (2.0 * half)
-    pit_n = (pitch[idx_fov] + half) / (2.0 * half)
-    cx_idx = np.clip(np.floor(yaw_n * cols).astype(np.int32), 0, cols - 1)
-    cy_idx = np.clip(np.floor(pit_n * rows).astype(np.int32), 0, rows - 1)
+        return BallFindResult(center_xyz=None, sphere=None, render_points=p_render, filtered_points=p_render, inlier_points=p_render[:0])
 
     best_c = None
     best_r = 0.0
     best_in = None  # 对齐 p_render 的 bool mask
     best_cnt = 0
 
+    # 用于显示：第一轮过滤（4m裁剪 + 竖直窗口内“最近距离+0.2m”）后的点的并集
+    stage1_keep = np.zeros((p_render.shape[0],), dtype=bool)
+
     p64 = p_render.astype(np.float64, copy=False)
 
-    for rr in range(rows):
-        for cc in range(cols):
-            sel = (cy_idx == rr) & (cx_idx == cc)
-            if not np.any(sel):
-                continue
-            idx_cell = idx_fov[sel]
-            if int(idx_cell.size) < 50:
-                continue
+    pitch_deg = np.rad2deg(pitch[idx_fov]).astype(np.float64, copy=False)
 
-            p_cell = p_render[idx_cell]
-            p_fit = _maybe_subsample(p_cell, int(SPHERE_MAX_FIT_POINTS), rng)
+    win = float(VERT_WIN_DEG)
+    step = float(VERT_STEP_DEG)
+    if (not np.isfinite(win)) or win <= 0.0:
+        win = 14.0
+    if (not np.isfinite(step)) or step <= 0.0:
+        step = 7.0
 
-            fit = _ransac_sphere(
-                p_fit,
-                r_min=float(SPHERE_R_MIN_M),
-                r_max=float(SPHERE_R_MAX_M),
-                iters=int(SPHERE_RANSAC_ITERS),
-                inlier_thresh=float(SPHERE_INLIER_THRESH_M),
-                min_inliers=int(SPHERE_MIN_INLIERS_CELL),
-                seed=int(seed) + rr * 101 + cc * 313,
-            )
-            if fit is None:
-                continue
+    # 按你的例子从 0° 开始：0-14, 7-21...
+    start_deg = 0.0
+    max_start = half_deg - win
+    if max_start < start_deg:
+        max_start = start_deg
 
-            # 在整帧 p_render 上重新算 inliers（不让“格子切分”影响最终内点统计）
-            c = fit.center.astype(np.float64, copy=False).reshape(3)
-            r = float(fit.radius)
-            d0 = np.linalg.norm(p64 - c.reshape(1, 3), axis=1)
-            in0 = np.abs(d0 - r) < float(SPHERE_INLIER_THRESH_M)
-            cnt0 = int(np.count_nonzero(in0))
-            if cnt0 < int(SPHERE_MIN_INLIERS_GLOBAL):
-                continue
+    starts = np.arange(start_deg, max_start + 1e-6, step, dtype=np.float64)
+    if starts.size == 0:
+        starts = np.array([start_deg], dtype=np.float64)
 
-            refined = _sphere_refine_least_squares(p64[in0])
-            if refined is not None:
-                c2, r2 = refined
-                if float(SPHERE_R_MIN_M) <= float(r2) <= float(SPHERE_R_MAX_M):
-                    d2 = np.linalg.norm(p64 - c2.reshape(1, 3), axis=1)
-                    in2 = np.abs(d2 - float(r2)) < float(SPHERE_INLIER_THRESH_M)
-                    if int(np.count_nonzero(in2)) >= cnt0:
-                        c, r, in0 = c2, float(r2), in2
-                        cnt0 = int(np.count_nonzero(in0))
+    for s0 in starts.tolist():
+        s1 = float(s0 + win)
+        sel = (pitch_deg >= float(s0)) & (pitch_deg < float(s1))
+        if not np.any(sel):
+            continue
+        idx_win = idx_fov[sel]
+        if int(idx_win.size) < 50:
+            continue
 
-            if not _sphere_edge_coverage_ok(pts=p64, center=c, inliers=in0):
-                continue
+        # 14° 窗口内：先找“参考最近距离”并过滤，再 RANSAC
+        p_win0 = p_render[idx_win]
+        # 同时记录“第一轮过滤”保留下来的点（并集）
+        p_win = _window_near_filter(p_win0)
+        if p_win.shape[0] > 0:
+            # 通过距离一致性把 p_win 映射回 idx_win（避免重复计算 ref）
+            # 这里用 mask 的方式更稳定：直接在窗口内重新算一次 keep mask
+            p64w = p_win0.astype(np.float64, copy=False)
+            rw = np.linalg.norm(p64w, axis=1)
+            rank = int(VERT_NEAREST_RANK)
+            if rank <= 0:
+                rank = 1
+            kw = min(rank, int(rw.size)) - 1
+            refw = float(np.partition(rw, kw)[kw])
+            keep_delta = float(VERT_NEAREST_KEEP_DELTA_M)
+            if (not np.isfinite(keep_delta)) or keep_delta < 0.0:
+                keep_delta = 0.2
+            mw = rw <= (refw + keep_delta)
+            stage1_keep[idx_win[mw]] = True
+        if p_win.shape[0] < 50:
+            continue
+        p_fit = _maybe_subsample(p_win, int(SPHERE_MAX_FIT_POINTS), rng)
 
-            if cnt0 > best_cnt:
-                best_cnt = cnt0
-                best_c = c
-                best_r = float(r)
-                best_in = in0
+        fit = _ransac_sphere(
+            p_fit,
+            r_min=float(SPHERE_R_MIN_M),
+            r_max=float(SPHERE_R_MAX_M),
+            iters=int(SPHERE_RANSAC_ITERS),
+            inlier_thresh=float(SPHERE_INLIER_THRESH_M),
+            min_inliers=int(SPHERE_MIN_INLIERS_CELL),
+            seed=int(seed) + int(round(s0 * 10.0)),
+        )
+        if fit is None:
+            continue
+
+        # 在整帧 p_render 上重新算 inliers（不让“窗口切分”影响最终内点统计）
+        c = fit.center.astype(np.float64, copy=False).reshape(3)
+        r = float(fit.radius)
+        d0 = np.linalg.norm(p64 - c.reshape(1, 3), axis=1)
+        in0 = np.abs(d0 - r) < float(SPHERE_INLIER_THRESH_M)
+        cnt0 = int(np.count_nonzero(in0))
+        if cnt0 < int(SPHERE_MIN_INLIERS_GLOBAL):
+            continue
+
+        refined = _sphere_refine_least_squares(p64[in0])
+        if refined is not None:
+            c2, r2 = refined
+            if float(SPHERE_R_MIN_M) <= float(r2) <= float(SPHERE_R_MAX_M):
+                d2 = np.linalg.norm(p64 - c2.reshape(1, 3), axis=1)
+                in2 = np.abs(d2 - float(r2)) < float(SPHERE_INLIER_THRESH_M)
+                if int(np.count_nonzero(in2)) >= cnt0:
+                    c, r, in0 = c2, float(r2), in2
+                    cnt0 = int(np.count_nonzero(in0))
+
+        if not _sphere_edge_coverage_ok(pts=p64, center=c, inliers=in0):
+            continue
+
+        if cnt0 > best_cnt:
+            best_cnt = cnt0
+            best_c = c
+            best_r = float(r)
+            best_in = in0
 
     if best_c is None or best_in is None:
-        return BallFindResult(center_xyz=None, sphere=None, render_points=p_render, inlier_points=p_render[:0])
+        return BallFindResult(center_xyz=None, sphere=None, render_points=p_render, filtered_points=p_render, inlier_points=p_render[:0])
 
     cx0, cy0, cz0 = best_c.tolist()
     inlier_pts = p_render[best_in].astype(np.float32, copy=False)
     sphere = SphereFit(center=best_c, radius=float(best_r), inliers=best_in)
+    filt_pts = p_render[stage1_keep].astype(np.float32, copy=False) if np.any(stage1_keep) else p_render.astype(np.float32, copy=False)
     return BallFindResult(
         center_xyz=(float(cx0), float(cy0), float(cz0)),
         sphere=sphere,
         render_points=p_render,
+        filtered_points=filt_pts,
         inlier_points=inlier_pts,
     )
 

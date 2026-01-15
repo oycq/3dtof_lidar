@@ -28,6 +28,11 @@ from typing import Optional, Tuple
 import numpy as np
 
 from ball_finder import BallFindResult, SphereFit, find_ball_from_lidar
+try:
+    # 用于叠加显示“竖直窗口步长(7°)”的边界线（和 ball_finder.py 保持一致）
+    from ball_finder import VERT_STEP_DEG as BALL_FINDER_VERT_STEP_DEG  # type: ignore
+except Exception:
+    BALL_FINDER_VERT_STEP_DEG = 7.0
 
 
 # ========= 与 visualize_data.py/client.py 对齐的一些常量 =========
@@ -39,6 +44,12 @@ LIDAR_IMG_W = 700
 LIDAR_IMG_H = 700
 FOV_DEG = 70.0
 HALF_FOV = float(np.deg2rad(FOV_DEG / 2.0))
+
+# 是否在 LiDAR 2D 视图上叠加“竖直(elevation)分组”的边界线
+DRAW_ELEV_BINS = True
+ELEV_BIN_DEG = float(BALL_FINDER_VERT_STEP_DEG)  # 7° 一条线
+ELEV_LINE_COLOR = (255, 255, 255)  # BGR
+ELEV_LINE_THICKNESS = 1
 
 # LiDAR 投影渲染参数（与 visualize_data.py 一致）
 MAX_RANGE_M = 20.0
@@ -76,7 +87,8 @@ def _lidar_xyz_to_uv(x: float, y: float, z: float) -> tuple[int, int, bool]:
     if x <= 0:
         return 0, 0, False
     yaw = float(np.arctan2(y, x))
-    pitch = float(np.arctan2(z, x))
+    # 竖直角用 elevation：atan2(z, hypot(x,y))，和 ball_finder.py 分组一致
+    pitch = float(np.arctan2(z, float(np.hypot(x, y))))
     in_fov = (abs(yaw) <= HALF_FOV) and (abs(pitch) <= HALF_FOV)
     u = int(((HALF_FOV - yaw) / (2.0 * HALF_FOV) * (LIDAR_IMG_W - 1)))
     v = int(((HALF_FOV - pitch) / (2.0 * HALF_FOV) * (LIDAR_IMG_H - 1)))
@@ -113,7 +125,7 @@ def _render_lidar_gray(points_xyz: np.ndarray) -> np.ndarray:
     z = points_xyz[:, 2].astype(np.float32, copy=False)
 
     yaw = np.arctan2(y, x)
-    pitch = np.arctan2(z, x)
+    pitch = np.arctan2(z, np.hypot(x, y))
     m = (x > 0) & (np.abs(yaw) <= HALF_FOV) & (np.abs(pitch) <= HALF_FOV)
     x, y, z = x[m], y[m], z[m]
     if x.size == 0:
@@ -123,7 +135,7 @@ def _render_lidar_gray(points_xyz: np.ndarray) -> np.ndarray:
     depth_u8 = np.clip(np.rint(255.0 / depth_m), 0.0, 255.0).astype(np.uint8)
 
     yaw = np.arctan2(y, x)
-    pitch = np.arctan2(z, x)
+    pitch = np.arctan2(z, np.hypot(x, y))
     col = ((HALF_FOV - yaw) / (2.0 * HALF_FOV) * (LIDAR_IMG_W - 1)).astype(np.int32)
     row = ((HALF_FOV - pitch) / (2.0 * HALF_FOV) * (LIDAR_IMG_H - 1)).astype(np.int32)
     col = np.clip(col, 0, LIDAR_IMG_W - 1)
@@ -144,12 +156,45 @@ def _draw_cross(img_bgr: np.ndarray, u: int, v: int, *, color: tuple[int, int, i
     cv2.circle(img_bgr, (u, v), max(2, t), (0, 0, 0), -1, cv2.LINE_AA)
 
 
+def _draw_elev_bin_lines(
+    img_bgr: np.ndarray,
+    *,
+    bin_deg: float,
+    color: tuple[int, int, int],
+    thickness: int = 1,
+) -> None:
+    """在 700x700 LiDAR 投影视图上叠加 elevation 分桶的边界线（水平线）。"""
+    try:
+        import cv2  # type: ignore
+    except Exception:
+        return
+
+    if img_bgr.ndim != 3 or img_bgr.shape[0] <= 2 or img_bgr.shape[1] <= 2:
+        return
+    if (not np.isfinite(bin_deg)) or bin_deg <= 0.0:
+        return
+
+    half_deg = float(np.rad2deg(HALF_FOV))
+    # 只画“组与组之间”的边界：...,-10,-5,0,5,10,...（不画最上/最下边框）
+    k_min = int(np.floor(-half_deg / bin_deg))
+    k_max = int(np.ceil(half_deg / bin_deg))
+    for k in range(k_min, k_max + 1):
+        deg = float(k) * float(bin_deg)
+        if deg <= -half_deg + 1e-6 or deg >= half_deg - 1e-6:
+            continue
+        pitch = float(np.deg2rad(deg))
+        v = int(((HALF_FOV - pitch) / (2.0 * HALF_FOV) * (LIDAR_IMG_H - 1)))
+        v = int(np.clip(v, 0, LIDAR_IMG_H - 1))
+        cv2.line(img_bgr, (0, v), (LIDAR_IMG_W - 1, v), color, int(thickness), cv2.LINE_AA)
+
+
 def _build_views(
     env_dir: Path,
     *,
     lidar_center: Optional[Tuple[float, float, float]],
     lidar_sphere: Optional[SphereFit],
     lidar_render_points: np.ndarray,
+    lidar_filtered_points: np.ndarray,
     lidar_inlier_points: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, dict]:
     try:
@@ -164,9 +209,28 @@ def _build_views(
     lidar_ball_bgr = np.zeros((LIDAR_IMG_H, LIDAR_IMG_W, 3), dtype=np.uint8)
 
     # --- LiDAR：不再依赖 view.png，直接从点云渲染 2D ---
+    # LiDAR_RAW：显示“基础预过滤后”的点
     raw_u8 = _render_lidar_gray(lidar_render_points if lidar_render_points.shape[0] else np.zeros((0, 3), dtype=np.float32))
     lidar_raw_bgr = cv2.applyColorMap(raw_u8, cv2.COLORMAP_TURBO)
-    lidar_ball_bgr = lidar_raw_bgr.copy()
+
+    # LiDAR_BALL：只显示“最终过滤后(窗口内过滤)”的点（被过滤掉的点不显示）
+    ball_u8 = _render_lidar_gray(lidar_filtered_points if lidar_filtered_points.shape[0] else np.zeros((0, 3), dtype=np.float32))
+    lidar_ball_bgr = cv2.applyColorMap(ball_u8, cv2.COLORMAP_TURBO)
+
+    # 叠加 elevation 分组边界线（便于确认“竖直 5° 一组”的切分）
+    if bool(DRAW_ELEV_BINS):
+        _draw_elev_bin_lines(
+            lidar_raw_bgr,
+            bin_deg=float(ELEV_BIN_DEG),
+            color=tuple(int(c) for c in ELEV_LINE_COLOR),
+            thickness=int(ELEV_LINE_THICKNESS),
+        )
+        _draw_elev_bin_lines(
+            lidar_ball_bgr,
+            bin_deg=float(ELEV_BIN_DEG),
+            color=tuple(int(c) for c in ELEV_LINE_COLOR),
+            thickness=int(ELEV_LINE_THICKNESS),
+        )
 
     if lidar_sphere is not None:
         meta["lidar_sphere_center_xyz_m"] = [float(x) for x in lidar_sphere.center.tolist()]
@@ -180,7 +244,7 @@ def _build_views(
             ys = in_pts[:, 1]
             zs = in_pts[:, 2]
             yaw = np.arctan2(ys, xs)
-            pitch = np.arctan2(zs, xs)
+            pitch = np.arctan2(zs, np.hypot(xs, ys))
             m = (xs > 0) & (np.abs(yaw) <= HALF_FOV) & (np.abs(pitch) <= HALF_FOV)
             xs, ys, zs, yaw, pitch = xs[m], ys[m], zs[m], yaw[m], pitch[m]
             col = ((HALF_FOV - yaw) / (2.0 * HALF_FOV) * (LIDAR_IMG_W - 1)).astype(np.int32)
@@ -248,6 +312,7 @@ def main() -> int:
             lidar_center=res.center_xyz,
             lidar_sphere=res.sphere,
             lidar_render_points=res.render_points,
+            lidar_filtered_points=res.filtered_points,
             lidar_inlier_points=res.inlier_points,
         )
 
