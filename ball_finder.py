@@ -24,7 +24,7 @@ SPHERE_R_MIN_M = 0.05
 SPHERE_R_MAX_M = 0.10
 
 # RANSAC
-SPHERE_RANSAC_ITERS = 100  # 每个格子各自做 100 次
+SPHERE_RANSAC_ITERS = 50  # 每个格子各自做 100 次
 SPHERE_INLIER_THRESH_M = 0.02 # | ||p-c|| - r | < thresh
 SPHERE_MIN_INLIERS_GLOBAL = 250  # 全局（在整帧点云上重新算 inliers 后）最低内点数
 SPHERE_MIN_INLIERS_CELL = 80     # 单个格子内做 RANSAC 时的最低内点数（允许只看到部分球面）
@@ -247,7 +247,7 @@ def find_ball_from_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> BallFindRe
     if p_render.shape[0] == 0:
         return BallFindResult(center_xyz=None, sphere=None, render_points=p_render, filtered_points=p_render, inlier_points=p_render[:0])
 
-    # -------- 竖直重叠窗口：每个窗口(14°)先过滤，再做 RANSAC，最后选全局 inliers 最多的一个 --------
+    # -------- 竖直重叠窗口：每个窗口(14°)先过滤，再做 RANSAC --------
     rng = np.random.default_rng(int(seed))
 
     # 视场角筛选（竖直窗口也只在该 FOV 内滑动）
@@ -268,10 +268,6 @@ def find_ball_from_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> BallFindRe
     if idx_fov.size == 0:
         return BallFindResult(center_xyz=None, sphere=None, render_points=p_render, filtered_points=p_render, inlier_points=p_render[:0])
 
-    best_c = None
-    best_r = 0.0
-    best_cnt = 0  # 先用“窗口内内点数”挑候选；最后只对最佳候选做一次全局重算
-
     # 用于显示：第一轮过滤（4m裁剪 + 竖直窗口内“最近距离+0.2m”）后的点的并集
     stage1_keep = np.zeros((p_render.shape[0],), dtype=bool)
 
@@ -286,15 +282,12 @@ def find_ball_from_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> BallFindRe
     if (not np.isfinite(step)) or step <= 0.0:
         step = 7.0
 
-    # 竖直滑窗应覆盖整个视场：从 FOV 最底部开始扫到顶部
-    # 否则会忽略负仰角（例如球放在地上，位于水平线以下）。
-    start_deg = -half_deg
-    max_start = half_deg - win
-    if max_start < start_deg:
-        # FOV 太小/窗口太大：至少做一次窗口
-        max_start = start_deg
-
-    starts = np.arange(start_deg, max_start + 1e-6, step, dtype=np.float64)
+    # 竖直滑窗覆盖整个视场：固定从上往下扫描（+half_deg -> -half_deg）
+    start_deg = half_deg - win
+    end_deg = -half_deg
+    if start_deg < end_deg:
+        start_deg = end_deg
+    starts = np.arange(start_deg, end_deg - 1e-6, -step, dtype=np.float64)
     if starts.size == 0:
         starts = np.array([start_deg], dtype=np.float64)
 
@@ -349,43 +342,44 @@ def find_ball_from_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> BallFindRe
         dwin = np.linalg.norm(pwin64 - c.reshape(1, 3), axis=1)
         inw = np.abs(dwin - r) < float(SPHERE_INLIER_THRESH_M)
         cntw = int(np.count_nonzero(inw))
-        if cntw > best_cnt and cntw >= int(SPHERE_MIN_INLIERS_CELL):
-            best_cnt = cntw
-            best_c = c
-            best_r = float(r)
+        if cntw < int(SPHERE_MIN_INLIERS_CELL):
+            continue
 
-    if best_c is None:
-        return BallFindResult(center_xyz=None, sphere=None, render_points=p_render, filtered_points=p_render, inlier_points=p_render[:0])
+        # 固定策略：从上往下扫描，扫描到球就直接退出
+        d0 = np.linalg.norm(p64 - c.reshape(1, 3), axis=1)
+        in0 = np.abs(d0 - r) < float(SPHERE_INLIER_THRESH_M)
+        cnt0 = int(np.count_nonzero(in0))
+        if cnt0 < int(SPHERE_MIN_INLIERS_GLOBAL):
+            continue
 
-    # 只对最佳候选做一次全局重算 inliers + refine（用于稳定的最终球心/高亮内点）
-    c = best_c.astype(np.float64, copy=False).reshape(3)
-    r = float(best_r)
-    d0 = np.linalg.norm(p64 - c.reshape(1, 3), axis=1)
-    in0 = np.abs(d0 - r) < float(SPHERE_INLIER_THRESH_M)
-    cnt0 = int(np.count_nonzero(in0))
-    if cnt0 < int(SPHERE_MIN_INLIERS_GLOBAL):
-        return BallFindResult(center_xyz=None, sphere=None, render_points=p_render, filtered_points=p_render, inlier_points=p_render[:0])
+        refined = _sphere_refine_least_squares(p64[in0])
+        if refined is not None:
+            c2, r2 = refined
+            if float(SPHERE_R_MIN_M) <= float(r2) <= float(SPHERE_R_MAX_M):
+                d2 = np.linalg.norm(p64 - c2.reshape(1, 3), axis=1)
+                in2 = np.abs(d2 - float(r2)) < float(SPHERE_INLIER_THRESH_M)
+                if int(np.count_nonzero(in2)) >= cnt0:
+                    c, r, in0 = c2, float(r2), in2
+                    cnt0 = int(np.count_nonzero(in0))
 
-    refined = _sphere_refine_least_squares(p64[in0])
-    if refined is not None:
-        c2, r2 = refined
-        if float(SPHERE_R_MIN_M) <= float(r2) <= float(SPHERE_R_MAX_M):
-            d2 = np.linalg.norm(p64 - c2.reshape(1, 3), axis=1)
-            in2 = np.abs(d2 - float(r2)) < float(SPHERE_INLIER_THRESH_M)
-            if int(np.count_nonzero(in2)) >= cnt0:
-                c, r, in0 = c2, float(r2), in2
-                cnt0 = int(np.count_nonzero(in0))
+        cx0, cy0, cz0 = c.tolist()
+        inlier_pts = p_render[in0].astype(np.float32, copy=False)
+        sphere = SphereFit(center=c, radius=float(r), inliers=in0)
+        # 注意：stage1_keep 只累计到“命中时刻”，因此显示不会包含后续窗口的点
+        filt_pts = (
+            p_render[stage1_keep].astype(np.float32, copy=False)
+            if np.any(stage1_keep)
+            else p_render.astype(np.float32, copy=False)
+        )
+        return BallFindResult(
+            center_xyz=(float(cx0), float(cy0), float(cz0)),
+            sphere=sphere,
+            render_points=p_render,
+            filtered_points=filt_pts,
+            inlier_points=inlier_pts,
+        )
 
-    cx0, cy0, cz0 = c.tolist()
-    inlier_pts = p_render[in0].astype(np.float32, copy=False)
-    sphere = SphereFit(center=c, radius=float(r), inliers=in0)
-    filt_pts = p_render[stage1_keep].astype(np.float32, copy=False) if np.any(stage1_keep) else p_render.astype(np.float32, copy=False)
-    return BallFindResult(
-        center_xyz=(float(cx0), float(cy0), float(cz0)),
-        sphere=sphere,
-        render_points=p_render,
-        filtered_points=filt_pts,
-        inlier_points=inlier_pts,
-    )
+    # 扫描完整个视场仍未命中
+    return BallFindResult(center_xyz=None, sphere=None, render_points=p_render, filtered_points=p_render, inlier_points=p_render[:0])
 
 
