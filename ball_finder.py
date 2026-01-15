@@ -186,7 +186,9 @@ def _ransac_sphere(
     if pts.shape[0] < 50:
         return None
 
-    rng = np.random.default_rng(int(seed))
+    # numpy 的 default_rng 要求 seed 为非负整数；这里统一映射到 uint32，避免负角度窗口导致 seed<0 报错
+    seed_u32 = int(seed) & 0xFFFFFFFF
+    rng = np.random.default_rng(seed_u32)
     p = pts.astype(np.float64, copy=False)
     n = p.shape[0]
 
@@ -284,10 +286,12 @@ def find_ball_from_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> BallFindRe
     if (not np.isfinite(step)) or step <= 0.0:
         step = 7.0
 
-    # 按你的例子从 0° 开始：0-14, 7-21...
-    start_deg = 0.0
+    # 竖直滑窗应覆盖整个视场：从 FOV 最底部开始扫到顶部
+    # 否则会忽略负仰角（例如球放在地上，位于水平线以下）。
+    start_deg = -half_deg
     max_start = half_deg - win
     if max_start < start_deg:
+        # FOV 太小/窗口太大：至少做一次窗口
         max_start = start_deg
 
     starts = np.arange(start_deg, max_start + 1e-6, step, dtype=np.float64)
