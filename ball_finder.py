@@ -24,14 +24,21 @@ SPHERE_R_MIN_M = 0.05
 SPHERE_R_MAX_M = 0.10
 
 # RANSAC
-SPHERE_RANSAC_ITERS = 600  # 每个格子各自做 600 次
+SPHERE_RANSAC_ITERS = 1000  # 每个格子各自做 1000 次
 SPHERE_INLIER_THRESH_M = 0.012  # | ||p-c|| - r | < thresh
 SPHERE_MIN_INLIERS_GLOBAL = 250  # 全局（在整帧点云上重新算 inliers 后）最低内点数
 SPHERE_MIN_INLIERS_CELL = 80     # 单个格子内做 RANSAC 时的最低内点数（允许只看到部分球面）
 SPHERE_MAX_FIT_POINTS = 60_000  # RANSAC 前最多参与拟合的点数（加速）
 
 # 基础预过滤（仅用于降低离群点/加速，不依赖外部引导）
-MAX_RANGE_M = 3.0
+# 1) 距离裁剪：先去掉距离 > 4m 的点（用户需求）
+MAX_RANGE_M = 4.0
+# 2) 竖直方向（elevation）分组：每 5° 一组
+VERT_BIN_DEG = 5.0
+# 2.1) 每组计算“参考最近距离”时，为了抗噪，使用排序后的第 N 个距离（1-based）
+VERT_NEAREST_RANK = 100
+# 3) 每组只保留距离在“该组最小距离 + 0.2m”窗口内的点
+VERT_NEAREST_KEEP_DELTA_M = 0.2
 
 # 3x3 网格划分（按 yaw/pitch）
 GRID_ROWS = 3
@@ -62,12 +69,66 @@ class BallFindResult:
 
 
 def _prefilter_lidar_points(pts: np.ndarray) -> np.ndarray:
-    """基础预过滤：只保留前方 + 量程裁剪。"""
+    """
+    预过滤（降低离群点/加速）：
+    - 只保留前方（x > 0）
+    - 距离裁剪：||p|| <= MAX_RANGE_M
+    - 竖直角（elevation）每 VERT_BIN_DEG 分一组；组内只保留距离 <= (该组最小距离 + VERT_NEAREST_KEEP_DELTA_M)
+    """
     if pts.shape[0] == 0:
         return pts
-    p = pts
-    m = (p[:, 0] > 0.0) & (p[:, 0] <= float(MAX_RANGE_M))
-    return p[m]
+
+    p = np.asarray(pts)
+    if p.ndim != 2 or p.shape[1] != 3:
+        return p[:0]
+
+    # 只保留前方 + 距离裁剪（用户：先将距离大于 4m 的点去掉）
+    x = p[:, 0].astype(np.float64, copy=False)
+    y = p[:, 1].astype(np.float64, copy=False)
+    z = p[:, 2].astype(np.float64, copy=False)
+    rng = np.sqrt(x * x + y * y + z * z)
+    m0 = (x > 0.0) & np.isfinite(rng) & (rng <= float(MAX_RANGE_M))
+    if not np.any(m0):
+        return p[:0]
+    p0 = p[m0]
+
+    # 竖直角 elevation：atan2(z, hypot(x,y))（比 atan2(z,x) 更稳健）
+    x0 = p0[:, 0].astype(np.float64, copy=False)
+    y0 = p0[:, 1].astype(np.float64, copy=False)
+    z0 = p0[:, 2].astype(np.float64, copy=False)
+    horiz = np.hypot(x0, y0)
+    elev = np.arctan2(z0, horiz)  # rad
+    elev_deg = np.rad2deg(elev)
+
+    bin_deg = float(VERT_BIN_DEG)
+    if (not np.isfinite(bin_deg)) or bin_deg <= 0.0:
+        bin_deg = 5.0
+
+    # 每 5° 一组：用 floor 量化（负角度也自然分桶）
+    b = np.floor(elev_deg / bin_deg).astype(np.int32, copy=False)
+    r0 = np.sqrt(x0 * x0 + y0 * y0 + z0 * z0)
+
+    # 按组求最小距离，然后保留距离 <= min + 0.2m 的点
+    uniq, inv = np.unique(b, return_inverse=True)
+
+    # 参考距离：每组排序后取第 VERT_NEAREST_RANK 个（1-based），更抗“极近噪声点”
+    rank = int(VERT_NEAREST_RANK)
+    if rank <= 0:
+        rank = 30
+    ref = np.full((uniq.shape[0],), np.inf, dtype=np.float64)
+    for gi in range(int(uniq.shape[0])):
+        rg = r0[inv == gi]
+        if rg.size == 0:
+            continue
+        # 第 N 个（1-based）=> index N-1；不足 N 个则取该组最小值兜底
+        k = min(rank, int(rg.size)) - 1
+        # 用 partition 取第 k 小值（不必全排序）
+        ref[gi] = float(np.partition(rg, k)[k])
+    keep_delta = float(VERT_NEAREST_KEEP_DELTA_M)
+    if (not np.isfinite(keep_delta)) or keep_delta < 0.0:
+        keep_delta = 0.2
+    m1 = r0 <= (ref[inv] + keep_delta)
+    return p0[m1]
 
 
 def _maybe_subsample(pts: np.ndarray, n_max: int, rng: np.random.Generator) -> np.ndarray:
@@ -294,7 +355,8 @@ def find_ball_from_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> BallFindRe
     y = p_render[:, 1].astype(np.float64, copy=False)
     z = p_render[:, 2].astype(np.float64, copy=False)
     yaw = np.arctan2(y, x)
-    pitch = np.arctan2(z, x)
+    # 竖直角使用 elevation：atan2(z, hypot(x,y))，避免 y≠0 时 atan2(z,x) 的偏差
+    pitch = np.arctan2(z, np.hypot(x, y))
     m_fov = (x > 0.0) & (np.abs(yaw) <= half) & (np.abs(pitch) <= half)
     idx_fov = np.nonzero(m_fov)[0].astype(np.int32, copy=False)
     if idx_fov.size == 0:
