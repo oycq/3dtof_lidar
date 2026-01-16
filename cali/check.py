@@ -4,31 +4,33 @@
 """
 cali/check.py
 
-遍历 cali/data/<场景>/，同时显示：
-- 3D ToF：Depth / Intensity，并标注“最亮点周围 5x5 的反射率加权重心”
-- LiDAR：点云投影图（RAW + BALL），标注球心与球面内点
+Traverse cali/data/<scene>/ and visualize:
+- ToF reflectivity (intensity) + 2D ball center (centroid).
+- LiDAR point cloud (2D projection) + fitted inliers (red) + ball center (cross) + text info.
 
-交互：
-- 4：上一个场景
-- 6：下一个场景
-- ESC：退出
+Keys:
+- 4: previous scene
+- 6: next scene
+- ESC: quit
 """
 
 from __future__ import annotations
 
+import ctypes
 import sys
+import shutil
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import numpy as np
 
-# 允许在 cali/ 目录直接运行：把项目根目录加进 sys.path 以便 import tof3d
+# Allow running from cali/ directly: add project root to sys.path to import tof3d.
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from lidar_ball_detector import LidarBallDetection, detect_ball_lidar  # noqa: E402
-from tof3d import ToF3DParams, tof_distance_matrix, tof_histograms  # noqa: E402
+from tof3d import ToF3DParams, tof_histograms  # noqa: E402
 from tof_ball_detector import detect_ball_tof_2d  # noqa: E402
 
 
@@ -36,26 +38,26 @@ from tof_ball_detector import detect_ball_tof_2d  # noqa: E402
 HERE = Path(__file__).resolve().parent
 DATA_DIR = HERE / "data"
 
-# ========= LiDAR 2D（与 visualize_data.py/client.py 对齐）=========
+# ========= LiDAR 2D (aligned with visualize_data.py/client.py) =========
 LIDAR_IMG_W = 700
 LIDAR_IMG_H = 700
 FOV_DEG = 70.0
 HALF_FOV = float(np.deg2rad(FOV_DEG / 2.0))
 
-# LiDAR 投影渲染（仅用于显示）
+# LiDAR projection rendering (visualization only).
 LIDAR_VIS_MAX_RANGE_M = 20.0
 LIDAR_NEAR_SAT_M = 1.0
 
-# 竖直分割线（7°一条线，和 ball_finder.py 的窗口步长一致）
-DRAW_ELEV_LINES = True
+# Optional elevation guide lines (disabled by request).
+DRAW_ELEV_LINES = False
 ELEV_LINE_DEG = 7.0
 ELEV_LINE_COLOR = (255, 255, 255)  # BGR
 ELEV_LINE_THICKNESS = 1
 
-# 鼠标悬停显示距离
+# Mouse hover shows LiDAR range at the cursor pixel.
 MOUSE_HOVER_ENABLED = True
 
-# ========= TOF 2D（显示尺寸）=========
+# ========= ToF 2D (display size) =========
 TOF_W = 40
 TOF_H = 30
 TOF_SHOW_W = 400
@@ -92,8 +94,8 @@ def _load_points(npz_path: Path) -> np.ndarray:
 
 def _tof_pixel_to_disp_xy(px: float, py: float) -> tuple[int, int]:
     """
-    与 visualize_data.py 一致的显示映射：
-    - 显示做了 flipV（上下翻转）
+    Display mapping aligned with visualize_data.py:
+    - Flip vertically for display.
     """
     px_i = float(np.clip(px, 0.0, TOF_W - 1.0))
     py_i = float(np.clip(py, 0.0, TOF_H - 1.0))
@@ -105,25 +107,11 @@ def _tof_pixel_to_disp_xy(px: float, py: float) -> tuple[int, int]:
     return dx, dy
 
 
-def _depth_to_u8(depth_m: np.ndarray, *, near_sat_m: float = 1.0, max_range_m: float = 20.0) -> np.ndarray:
-    """与 visualize_data.py 一致：I≈255/x(m)，0 表示无效。"""
-    if depth_m.size == 0:
-        return np.zeros((TOF_H, TOF_W), dtype=np.uint8)
-    dm = depth_m.astype(np.float32, copy=False)
-    out = np.zeros(dm.shape, dtype=np.uint8)
-    m = dm > 0
-    if not np.any(m):
-        return out
-    dm2 = np.clip(dm[m], float(near_sat_m), float(max_range_m))
-    out[m] = np.clip(np.rint(255.0 / dm2), 0.0, 255.0).astype(np.uint8)
-    return out
-
-
 def _tof_intensity_to_u8(intensity_sum: np.ndarray) -> np.ndarray:
     """
-    与 visualize_data.py 类似的强度显示策略：
-    - 先按整图平均值做归一化到 target_mean
-    - 再做 gamma 显示（1/gamma）
+    Intensity display mapping:
+    - Normalize by global mean -> target_mean.
+    - Gamma display (1/gamma).
     """
     if intensity_sum.size == 0:
         return np.zeros((TOF_H, TOF_W), dtype=np.uint8)
@@ -204,21 +192,35 @@ def _draw_elev_lines(img_bgr: np.ndarray, *, step_deg: float) -> None:
         cv2.line(img_bgr, (0, v), (LIDAR_IMG_W - 1, v), ELEV_LINE_COLOR, int(ELEV_LINE_THICKNESS), cv2.LINE_AA)
 
 
-def _build_lidar_views(det: LidarBallDetection) -> tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+def _confirm_delete_scene(scene_dir: Path) -> bool:
+    """
+    Show a blocking confirmation dialog.
+    Returns True if user confirms deletion.
+    """
+    title = "Confirm delete"
+    msg = f"Delete scene folder?\n\n{scene_dir.name}\n\nThis cannot be undone."
+    try:
+        # MessageBoxW: returns IDYES (6) or IDNO (7)
+        MB_YESNO = 0x00000004
+        MB_ICONWARNING = 0x00000030
+        IDYES = 6
+        ret = ctypes.windll.user32.MessageBoxW(0, msg, title, MB_YESNO | MB_ICONWARNING)
+        return int(ret) == IDYES
+    except Exception:
+        # Fallback: do not delete if dialog is not available.
+        return False
+
+
+def _build_lidar_view(det: LidarBallDetection) -> tuple[np.ndarray, Dict[str, Any]]:
     import cv2  # type: ignore
 
     meta: Dict[str, Any] = {}
+
+    # Base image from render_points, then overlay inliers (red) and center (cross).
     raw_u8, raw_range = _render_lidar_gray_and_range(det.render_points_xyz_m.astype(np.float32, copy=False))
-    ball_u8, ball_range = _render_lidar_gray_and_range(det.filtered_points_xyz_m.astype(np.float32, copy=False))
-
-    lidar_raw_bgr = cv2.applyColorMap(raw_u8, cv2.COLORMAP_TURBO)
-    lidar_ball_bgr = cv2.applyColorMap(ball_u8, cv2.COLORMAP_TURBO)
-
-    _draw_elev_lines(lidar_raw_bgr, step_deg=float(ELEV_LINE_DEG))
-    _draw_elev_lines(lidar_ball_bgr, step_deg=float(ELEV_LINE_DEG))
-
-    meta["lidar_raw_range_map"] = raw_range
-    meta["lidar_ball_range_map"] = ball_range
+    lidar_bgr = cv2.applyColorMap(raw_u8, cv2.COLORMAP_TURBO)
+    _draw_elev_lines(lidar_bgr, step_deg=float(ELEV_LINE_DEG))
+    meta["lidar_range_map"] = raw_range
 
     if det.fit_points_xyz_m.shape[0] > 0:
         in_pts = det.fit_points_xyz_m.astype(np.float32, copy=False)
@@ -231,7 +233,7 @@ def _build_lidar_views(det: LidarBallDetection) -> tuple[np.ndarray, np.ndarray,
         row = ((HALF_FOV - pitch) / (2.0 * HALF_FOV) * (LIDAR_IMG_H - 1)).astype(np.int32)
         col = np.clip(col, 0, LIDAR_IMG_W - 1)
         row = np.clip(row, 0, LIDAR_IMG_H - 1)
-        lidar_ball_bgr[row, col] = (0, 0, 255)
+        lidar_bgr[row, col] = (0, 0, 255)
 
     if det.center_xyz_m is not None:
         lx, ly, lz = det.center_xyz_m
@@ -242,11 +244,12 @@ def _build_lidar_views(det: LidarBallDetection) -> tuple[np.ndarray, np.ndarray,
             v = int(((HALF_FOV - pitch) / (2.0 * HALF_FOV) * (LIDAR_IMG_H - 1)))
             u = int(np.clip(u, 0, LIDAR_IMG_W - 1))
             v = int(np.clip(v, 0, LIDAR_IMG_H - 1))
-            _draw_cross(lidar_ball_bgr, u, v, color=(0, 255, 255), r=10, t=2)
-        r = float(det.radius_m) if det.radius_m is not None else 0.0
+            _draw_cross(lidar_bgr, u, v, color=(0, 255, 255), r=10, t=2)
+        r_m = float(det.radius_m) if det.radius_m is not None else 0.0
+        d_m = float(det.center_range_m) if det.center_range_m is not None else 0.0
         cv2.putText(
-            lidar_ball_bgr,
-            f"ball(lidar): center=({lx:.3f},{ly:.3f},{lz:.3f})m  r={r:.3f}m  in={int(det.fit_points_xyz_m.shape[0])}",
+            lidar_bgr,
+            f"lidar: c=({lx:.3f},{ly:.3f},{lz:.3f})m  r={r_m:.3f}m  d={d_m:.3f}m  in={int(det.fit_points_xyz_m.shape[0])}",
             (10, 24),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -256,8 +259,8 @@ def _build_lidar_views(det: LidarBallDetection) -> tuple[np.ndarray, np.ndarray,
         )
     else:
         cv2.putText(
-            lidar_ball_bgr,
-            "ball(lidar): not found",
+            lidar_bgr,
+            "lidar: not found",
             (10, 24),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -266,19 +269,17 @@ def _build_lidar_views(det: LidarBallDetection) -> tuple[np.ndarray, np.ndarray,
             cv2.LINE_AA,
         )
 
-    return lidar_raw_bgr, lidar_ball_bgr, meta
+    return lidar_bgr, meta
 
 
-def _build_tof_views(env_dir: Path, tof_center_xy: Optional[tuple[float, float]]) -> tuple[np.ndarray, np.ndarray]:
+def _build_tof_reflect_view(env_dir: Path, tof_center_xy: Optional[tuple[float, float]]) -> np.ndarray:
     import cv2  # type: ignore
 
-    tof_depth_bgr = np.zeros((TOF_SHOW_H, TOF_SHOW_W, 3), dtype=np.uint8)
-    tof_inten_bgr = np.zeros((TOF_SHOW_H, TOF_SHOW_W, 3), dtype=np.uint8)
+    tof_bgr = np.zeros((TOF_SHOW_H, TOF_SHOW_W, 3), dtype=np.uint8)
     tof_path = env_dir / "tof.raw"
 
-    if tof_center_xy is None or (not tof_path.exists()):
+    if not tof_path.exists():
         cv2.putText(
-            tof_depth_bgr,
             f"{env_dir.name}: missing tof.raw / tof center not found",
             (10, 24),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -287,76 +288,43 @@ def _build_tof_views(env_dir: Path, tof_center_xy: Optional[tuple[float, float]]
             2,
             cv2.LINE_AA,
         )
-        cv2.putText(
-            tof_inten_bgr,
-            f"{env_dir.name}: missing tof.raw / tof center not found",
-            (10, 24),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-        return tof_depth_bgr, tof_inten_bgr
+        return tof_bgr
 
     params = ToF3DParams(min_peak_count=float(TOF_MIN_PEAK))
-    depth = tof_distance_matrix(tof_path, params=params)
     hists = tof_histograms(tof_path, params=params).astype(np.float32, copy=False)
-    inten = hists.sum(axis=2).astype(np.float32, copy=False)
+    if hists.size == 0:
+        return tof_bgr
 
-    u8 = _depth_to_u8(depth)
-    u8_big = cv2.resize(u8, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
-    u8_big = cv2.flip(u8_big, 0)
-    tof_depth_bgr = cv2.applyColorMap(u8_big, cv2.COLORMAP_TURBO)
+    # Reflectivity (intensity): sum of all histogram bins.
+    # Keep this consistent with visualize_data.py: do not mask by peak threshold here,
+    # otherwise the image may look like a near-binary black/white map.
+    inten = hists.sum(axis=2).astype(np.float32, copy=False)
 
     inten_u8 = _tof_intensity_to_u8(inten)
     inten_big = cv2.resize(inten_u8, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
     inten_big = cv2.flip(inten_big, 0)
-    tof_inten_bgr = cv2.cvtColor(inten_big, cv2.COLOR_GRAY2BGR)
+    tof_bgr = cv2.cvtColor(inten_big, cv2.COLOR_GRAY2BGR)
 
-    cx, cy = tof_center_xy
-    dx, dy = _tof_pixel_to_disp_xy(float(cx), float(cy))
-    _draw_cross(tof_depth_bgr, dx, dy, color=(255, 255, 255), r=10, t=2)
-    _draw_cross(tof_inten_bgr, dx, dy, color=(255, 255, 255), r=10, t=2)
+    if tof_center_xy is not None:
+        cx, cy = tof_center_xy
+        dx, dy = _tof_pixel_to_disp_xy(float(cx), float(cy))
+        _draw_cross(tof_bgr, dx, dy, color=(255, 255, 255), r=10, t=2)
 
-    # 仅显示 2D 坐标；如需要也可在此处读取 depth[cx,cy] 作辅助显示
-    cv2.putText(
-        tof_depth_bgr,
-        f"ball(tof): px=({cx:.2f},{cy:.2f})",
-        (10, 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        tof_inten_bgr,
-        f"ball(tof): px=({cx:.2f},{cy:.2f})",
-        (10, 24),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
-    return tof_depth_bgr, tof_inten_bgr
+    return tof_bgr
 
 
 def main() -> int:
     try:
         import cv2  # type: ignore
     except Exception as e:
-        raise RuntimeError("缺少依赖 opencv-python，请先执行：py -m pip install opencv-python") from e
+        raise RuntimeError("missing dependency opencv-python, run: py -m pip install opencv-python") from e
 
     envs = _list_env_dirs(Path(DATA_DIR))
     if not envs:
-        raise FileNotFoundError(f"data 目录下没有场景：{DATA_DIR}")
+        raise FileNotFoundError(f"no scenes found under: {DATA_DIR}")
 
-    cv2.namedWindow("LiDAR_RAW", cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow("LiDAR_BALL", cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow("TOF_DEPTH", cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow("TOF_INTEN", cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow("LIDAR", cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow("TOF_REFLECT", cv2.WINDOW_AUTOSIZE)
 
     mouse_state: dict = {"x": 0, "y": 0}
 
@@ -368,8 +336,7 @@ def main() -> int:
         mouse_state["x"] = int(x)
         mouse_state["y"] = int(y)
 
-    cv2.setMouseCallback("LiDAR_RAW", _on_mouse)
-    cv2.setMouseCallback("LiDAR_BALL", _on_mouse)
+    cv2.setMouseCallback("LIDAR", _on_mouse)
 
     idx = 0
     while True:
@@ -378,32 +345,25 @@ def main() -> int:
         pts = _load_points(npz) if npz is not None and npz.exists() else np.zeros((0, 3), dtype=np.float32)
 
         tof_det = detect_ball_tof_2d(env / "tof.raw", window_size=5, min_peak=float(TOF_MIN_PEAK), valid_bins=int(TOF_VALID_BINS))
-        tof_depth, tof_inten = _build_tof_views(env, tof_det.centroid_xy)
+        tof_view = _build_tof_reflect_view(env, tof_det.centroid_xy)
 
         lidar_det: LidarBallDetection = detect_ball_lidar(pts, seed=0)
-        lidar_raw, lidar_ball, meta = _build_lidar_views(lidar_det)
+        lidar_view, meta = _build_lidar_view(lidar_det)
 
         # 场景索引
-        for img in (lidar_raw, lidar_ball):
-            cv2.putText(img, f"{env.name}  ({idx+1}/{len(envs)})", (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-        for img in (tof_depth, tof_inten):
-            cv2.putText(img, f"{env.name}  ({idx+1}/{len(envs)})", (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(lidar_view, f"{env.name}  ({idx+1}/{len(envs)})", (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+        # Do not overlay any text on TOF_REFLECT to avoid blocking the image.
 
-        # 鼠标悬停距离
+        # Mouse hover range (LiDAR only).
         if bool(MOUSE_HOVER_ENABLED):
             mx = int(np.clip(mouse_state.get("x", 0), 0, LIDAR_IMG_W - 1))
             my = int(np.clip(mouse_state.get("y", 0), 0, LIDAR_IMG_H - 1))
-            rr = float(meta["lidar_raw_range_map"][my, mx])
-            br = float(meta["lidar_ball_range_map"][my, mx])
-            txt_raw = f"r={rr:.3f}m" if np.isfinite(rr) else "r=--"
-            txt_ball = f"r={br:.3f}m" if np.isfinite(br) else "r=--"
-            cv2.putText(lidar_raw, txt_raw, (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(lidar_ball, txt_ball, (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+            rr = float(meta["lidar_range_map"][my, mx])
+            txt = f"r={rr:.3f}m" if np.isfinite(rr) else "r=--"
+            cv2.putText(lidar_view, txt, (10, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
 
-        cv2.imshow("LiDAR_RAW", lidar_raw)
-        cv2.imshow("LiDAR_BALL", lidar_ball)
-        cv2.imshow("TOF_DEPTH", tof_depth)
-        cv2.imshow("TOF_INTEN", tof_inten)
+        cv2.imshow("LIDAR", lidar_view)
+        cv2.imshow("TOF_REFLECT", tof_view)
 
         k = int(cv2.waitKey(30) & 0xFF)
         if k == 27:
@@ -412,6 +372,19 @@ def main() -> int:
             idx = (idx - 1) % len(envs)
         if k == ord("6"):
             idx = (idx + 1) % len(envs)
+        if k == ord("0"):
+            # Confirm and delete current scene folder.
+            if _confirm_delete_scene(env):
+                try:
+                    shutil.rmtree(env, ignore_errors=False)
+                except Exception:
+                    # If deletion fails, keep current list.
+                    pass
+                # Refresh scene list after deletion.
+                envs = _list_env_dirs(Path(DATA_DIR))
+                if not envs:
+                    break
+                idx = min(idx, len(envs) - 1)
 
     cv2.destroyAllWindows()
     return 0

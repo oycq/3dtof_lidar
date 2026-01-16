@@ -4,13 +4,13 @@
 """
 tof_ball_detector.py
 
-ToF 小球检测模块（纯检测，不做可视化）：
-- 输入：tof.raw
-- 输出：球在 ToF 图像上的 2D 像素坐标（重心）
+ToF ball detector module (pure detection, no visualization):
+- Input: tof.raw
+- Output: 2D pixel coord (centroid) in ToF image
 
-说明：
-- 检测策略：先找强度最亮像素（反射率强度=histogram sum，并做峰值阈值过滤），
-  再在其周围 window_size×window_size 的像素范围内用强度作为权重计算 2D 重心。
+Method:
+- Find the brightest pixel by reflectivity (histogram sum), with peak threshold filtering.
+- Compute a weighted centroid in a local window (window_size x window_size).
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-# 允许在 cali/ 目录直接运行：把项目根目录加进 sys.path（兼容 import tof3d）
+# Allow running from cali/ directly: add project root to sys.path (to import tof3d).
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -43,8 +43,8 @@ def detect_ball_tof_2d(
     valid_bins: int = 62,
 ) -> ToFBallDetection2D:
     """
-    返回 ToF 图像 2D 像素坐标（x,y）。
-    - centroid_xy 为 None 表示未检出
+    Return ToF 2D pixel coord (x,y).
+    - centroid_xy is None if not detected.
     """
     p = Path(tof_raw)
     if not p.exists():
