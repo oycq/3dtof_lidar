@@ -27,8 +27,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from ball_finder import BallFindResult, find_ball_from_lidar  # noqa: E402
+from lidar_ball_detector import LidarBallDetection, detect_ball_lidar  # noqa: E402
 from tof3d import ToF3DParams, tof_distance_matrix, tof_histograms  # noqa: E402
+from tof_ball_detector import detect_ball_tof_2d  # noqa: E402
 
 
 # ========= 数据目录 =========
@@ -140,71 +141,6 @@ def _tof_intensity_to_u8(intensity_sum: np.ndarray) -> np.ndarray:
     return np.clip(np.rint(n * 255.0), 0.0, 255.0).astype(np.uint8)
 
 
-def _tof_ball_center(tof_raw: Path, *, window_size: int = 5) -> Optional[Dict[str, Any]]:
-    if not tof_raw.exists():
-        return None
-
-    params = ToF3DParams(min_peak_count=float(TOF_MIN_PEAK))
-    depth = tof_distance_matrix(tof_raw, params=params)  # (30,40) m
-    hists = tof_histograms(tof_raw, params=params).astype(np.float32, copy=False)  # (30,40,64)
-    if depth.size == 0 or hists.size == 0:
-        return None
-
-    inten = hists.sum(axis=2).astype(np.float32, copy=False)  # (30,40)
-    peak = hists[:, :, : int(TOF_VALID_BINS)].max(axis=2).astype(np.float32, copy=False)
-    inten = np.where(peak >= float(TOF_MIN_PEAK), inten, 0.0)
-    if float(np.max(inten)) <= 0.0:
-        return None
-
-    flat_idx = int(np.argmax(inten))
-    y0, x0 = int(flat_idx // TOF_W), int(flat_idx % TOF_W)
-
-    r = int(window_size) // 2
-    xs = np.arange(max(0, x0 - r), min(TOF_W, x0 + r + 1), dtype=np.float32)
-    ys = np.arange(max(0, y0 - r), min(TOF_H, y0 + r + 1), dtype=np.float32)
-    xx, yy = np.meshgrid(xs, ys)
-    w = inten[ys.astype(np.int32)[:, None], xs.astype(np.int32)[None, :]].astype(np.float32, copy=False)
-    wsum = float(np.sum(w))
-    if wsum <= 0.0:
-        cx, cy = float(x0), float(y0)
-    else:
-        cx = float(np.sum(xx * w) / wsum)
-        cy = float(np.sum(yy * w) / wsum)
-
-    yaw_x = np.deg2rad(np.linspace(params.fov_x_deg / 2.0, -params.fov_x_deg / 2.0, TOF_W)).astype(np.float32)
-    pitch_y = np.deg2rad(np.linspace(-params.fov_y_deg / 2.0, params.fov_y_deg / 2.0, TOF_H)).astype(np.float32)
-
-    xs_i = xs.astype(np.int32)
-    ys_i = ys.astype(np.int32)
-    yaws = yaw_x[xs_i]
-    pitchs = pitch_y[ys_i]
-    yaw_grid, pitch_grid = np.meshgrid(yaws, pitchs)
-
-    depth_win = depth[ys_i[:, None], xs_i[None, :]].astype(np.float32, copy=False)
-    valid = depth_win > 0
-    denom = (np.cos(yaw_grid) * np.cos(pitch_grid)).astype(np.float32)
-    denom = np.where(np.abs(denom) > 1e-6, denom, 1e-6)
-    R = np.where(valid, depth_win / denom, 0.0)
-    X = np.where(valid, R * np.cos(yaw_grid) * np.cos(pitch_grid), 0.0)
-    Y = np.where(valid, R * np.sin(yaw_grid) * np.cos(pitch_grid), 0.0)
-    Z = np.where(valid, R * np.sin(pitch_grid), 0.0)
-
-    w3 = np.where(valid, w, 0.0)
-    w3sum = float(np.sum(w3))
-    if w3sum > 0.0:
-        x3 = float(np.sum(X * w3) / w3sum)
-        y3 = float(np.sum(Y * w3) / w3sum)
-        z3 = float(np.sum(Z * w3) / w3sum)
-    else:
-        x3, y3, z3 = float(depth[y0, x0]), 0.0, 0.0
-
-    return {
-        "brightest_pixel_xy": [int(x0), int(y0)],
-        "centroid_pixel_xy": [float(cx), float(cy)],
-        "centroid_xyz_m": [float(x3), float(y3), float(z3)],
-    }
-
-
 def _render_lidar_gray_and_range(points_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if points_xyz.shape[0] == 0:
         img = np.zeros((LIDAR_IMG_H, LIDAR_IMG_W), dtype=np.uint8)
@@ -268,12 +204,12 @@ def _draw_elev_lines(img_bgr: np.ndarray, *, step_deg: float) -> None:
         cv2.line(img_bgr, (0, v), (LIDAR_IMG_W - 1, v), ELEV_LINE_COLOR, int(ELEV_LINE_THICKNESS), cv2.LINE_AA)
 
 
-def _build_lidar_views(res: BallFindResult) -> tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+def _build_lidar_views(det: LidarBallDetection) -> tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     import cv2  # type: ignore
 
     meta: Dict[str, Any] = {}
-    raw_u8, raw_range = _render_lidar_gray_and_range(res.render_points.astype(np.float32, copy=False))
-    ball_u8, ball_range = _render_lidar_gray_and_range(res.filtered_points.astype(np.float32, copy=False))
+    raw_u8, raw_range = _render_lidar_gray_and_range(det.render_points_xyz_m.astype(np.float32, copy=False))
+    ball_u8, ball_range = _render_lidar_gray_and_range(det.filtered_points_xyz_m.astype(np.float32, copy=False))
 
     lidar_raw_bgr = cv2.applyColorMap(raw_u8, cv2.COLORMAP_TURBO)
     lidar_ball_bgr = cv2.applyColorMap(ball_u8, cv2.COLORMAP_TURBO)
@@ -284,8 +220,8 @@ def _build_lidar_views(res: BallFindResult) -> tuple[np.ndarray, np.ndarray, Dic
     meta["lidar_raw_range_map"] = raw_range
     meta["lidar_ball_range_map"] = ball_range
 
-    if res.inlier_points.shape[0] > 0:
-        in_pts = res.inlier_points.astype(np.float32, copy=False)
+    if det.fit_points_xyz_m.shape[0] > 0:
+        in_pts = det.fit_points_xyz_m.astype(np.float32, copy=False)
         xs, ys, zs = in_pts[:, 0], in_pts[:, 1], in_pts[:, 2]
         yaw = np.arctan2(ys, xs)
         pitch = np.arctan2(zs, np.hypot(xs, ys))
@@ -297,8 +233,8 @@ def _build_lidar_views(res: BallFindResult) -> tuple[np.ndarray, np.ndarray, Dic
         row = np.clip(row, 0, LIDAR_IMG_H - 1)
         lidar_ball_bgr[row, col] = (0, 0, 255)
 
-    if res.center_xyz is not None:
-        lx, ly, lz = res.center_xyz
+    if det.center_xyz_m is not None:
+        lx, ly, lz = det.center_xyz_m
         if lx > 0:
             yaw = float(np.arctan2(ly, lx))
             pitch = float(np.arctan2(lz, float(np.hypot(lx, ly))))
@@ -307,10 +243,10 @@ def _build_lidar_views(res: BallFindResult) -> tuple[np.ndarray, np.ndarray, Dic
             u = int(np.clip(u, 0, LIDAR_IMG_W - 1))
             v = int(np.clip(v, 0, LIDAR_IMG_H - 1))
             _draw_cross(lidar_ball_bgr, u, v, color=(0, 255, 255), r=10, t=2)
-        r = float(res.sphere.radius) if res.sphere is not None else 0.0
+        r = float(det.radius_m) if det.radius_m is not None else 0.0
         cv2.putText(
             lidar_ball_bgr,
-            f"ball(lidar): center=({lx:.3f},{ly:.3f},{lz:.3f})m  r={r:.3f}m  in={int(res.inlier_points.shape[0])}",
+            f"ball(lidar): center=({lx:.3f},{ly:.3f},{lz:.3f})m  r={r:.3f}m  in={int(det.fit_points_xyz_m.shape[0])}",
             (10, 24),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -333,14 +269,14 @@ def _build_lidar_views(res: BallFindResult) -> tuple[np.ndarray, np.ndarray, Dic
     return lidar_raw_bgr, lidar_ball_bgr, meta
 
 
-def _build_tof_views(env_dir: Path, tof_info: Optional[Dict[str, Any]]) -> tuple[np.ndarray, np.ndarray]:
+def _build_tof_views(env_dir: Path, tof_center_xy: Optional[tuple[float, float]]) -> tuple[np.ndarray, np.ndarray]:
     import cv2  # type: ignore
 
     tof_depth_bgr = np.zeros((TOF_SHOW_H, TOF_SHOW_W, 3), dtype=np.uint8)
     tof_inten_bgr = np.zeros((TOF_SHOW_H, TOF_SHOW_W, 3), dtype=np.uint8)
     tof_path = env_dir / "tof.raw"
 
-    if tof_info is None or (not tof_path.exists()):
+    if tof_center_xy is None or (not tof_path.exists()):
         cv2.putText(
             tof_depth_bgr,
             f"{env_dir.name}: missing tof.raw / tof center not found",
@@ -378,15 +314,15 @@ def _build_tof_views(env_dir: Path, tof_info: Optional[Dict[str, Any]]) -> tuple
     inten_big = cv2.flip(inten_big, 0)
     tof_inten_bgr = cv2.cvtColor(inten_big, cv2.COLOR_GRAY2BGR)
 
-    cx, cy = tof_info["centroid_pixel_xy"]
+    cx, cy = tof_center_xy
     dx, dy = _tof_pixel_to_disp_xy(float(cx), float(cy))
     _draw_cross(tof_depth_bgr, dx, dy, color=(255, 255, 255), r=10, t=2)
     _draw_cross(tof_inten_bgr, dx, dy, color=(255, 255, 255), r=10, t=2)
 
-    x3, y3, z3 = tof_info.get("centroid_xyz_m", [0.0, 0.0, 0.0])
+    # 仅显示 2D 坐标；如需要也可在此处读取 depth[cx,cy] 作辅助显示
     cv2.putText(
         tof_depth_bgr,
-        f"ball(tof): px=({cx:.2f},{cy:.2f})  xyz=({x3:.3f},{y3:.3f},{z3:.3f}) m",
+        f"ball(tof): px=({cx:.2f},{cy:.2f})",
         (10, 24),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
@@ -396,7 +332,7 @@ def _build_tof_views(env_dir: Path, tof_info: Optional[Dict[str, Any]]) -> tuple
     )
     cv2.putText(
         tof_inten_bgr,
-        f"ball(tof): px=({cx:.2f},{cy:.2f})  xyz=({x3:.3f},{y3:.3f},{z3:.3f}) m",
+        f"ball(tof): px=({cx:.2f},{cy:.2f})",
         (10, 24),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.55,
@@ -441,11 +377,11 @@ def main() -> int:
         npz = _find_points_npz(env)
         pts = _load_points(npz) if npz is not None and npz.exists() else np.zeros((0, 3), dtype=np.float32)
 
-        tof_info = _tof_ball_center(env / "tof.raw", window_size=5)
-        tof_depth, tof_inten = _build_tof_views(env, tof_info)
+        tof_det = detect_ball_tof_2d(env / "tof.raw", window_size=5, min_peak=float(TOF_MIN_PEAK), valid_bins=int(TOF_VALID_BINS))
+        tof_depth, tof_inten = _build_tof_views(env, tof_det.centroid_xy)
 
-        res: BallFindResult = find_ball_from_lidar(pts, seed=0)
-        lidar_raw, lidar_ball, meta = _build_lidar_views(res)
+        lidar_det: LidarBallDetection = detect_ball_lidar(pts, seed=0)
+        lidar_raw, lidar_ball, meta = _build_lidar_views(lidar_det)
 
         # 场景索引
         for img in (lidar_raw, lidar_ball):
