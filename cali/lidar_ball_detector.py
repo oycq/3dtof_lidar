@@ -4,20 +4,20 @@
 """
 lidar_ball_detector.py
 
-LiDAR ball detector module (pure detection, no visualization).
+LiDAR 小球检测模块, 只做检测, 不做可视化.
 
-Input:
-- points_xyz: (N,3) point cloud in meters.
+输入:
+- points_xyz: (N, 3) 点云, 单位 m
 
-Output:
-- 3D center (if found)
-- fitted radius (if found)
-- center range (if found)
-- final inlier points (fit_points_xyz_m)
+输出:
+- 球心 3D 坐标, center_xyz_m
+- 拟合半径, radius_m
+- 球心距离, center_range_m
+- 最终拟合内点坐标, fit_points_xyz_m
 
-Extras for check.py visualization:
-- render_points_xyz_m: points after basic prefilter (front + 4m).
-- filtered_points_xyz_m: points kept by the stage-1 filter accumulated up to the first hit window.
+为了便于 check.py 做可视化, 这里额外返回:
+- render_points_xyz_m: 基础预过滤后的点, 前方 + 4m 截断
+- filtered_points_xyz_m: 第一轮过滤后保留的点, 只累计到命中窗口时刻
 """
 
 from __future__ import annotations
@@ -29,14 +29,14 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-# Allow running from cali/ directly: add project root to sys.path.
+# 允许在 cali/ 目录直接运行: 把项目根目录加入 sys.path.
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-# ===================== Algorithm params (only here) =====================
-# Sphere radius range in meters (diameter ~10cm to 20cm).
+# ===================== 算法参数, 只允许在本文件出现 =====================
+# 球半径范围, 单位 m, 直径约 10cm 到 20cm.
 SPHERE_R_MIN_M = 0.05
 SPHERE_R_MAX_M = 0.10
 
@@ -47,16 +47,16 @@ SPHERE_MIN_INLIERS_GLOBAL = 250
 SPHERE_MIN_INLIERS_CELL = 80
 SPHERE_MAX_FIT_POINTS = 60_000
 
-# Basic prefilter.
+# 基础预过滤.
 MAX_RANGE_M = 4.0  # 先去掉距离 > 4m 的点
 
-# Vertical sliding windows (win 14 deg, step 7 deg).
+# 竖直重叠窗口, win=14deg, step=7deg.
 VERT_WIN_DEG = 14.0
 VERT_STEP_DEG = 7.0
 VERT_NEAREST_RANK = 100
 VERT_NEAREST_KEEP_DELTA_M = 0.2
 
-# LiDAR FOV in degrees (used to limit points and window scan range).
+# LiDAR 视场角, 单位 deg, 用于筛选点并限定窗口扫描范围.
 LIDAR_FOV_DEG = 70.0
 
 
@@ -65,15 +65,15 @@ class LidarBallDetection:
     center_xyz_m: Optional[Tuple[float, float, float]]
     radius_m: Optional[float]
     center_range_m: Optional[float]
-    fit_points_xyz_m: np.ndarray  # (K,3) float32, final inliers used as fit points.
+    fit_points_xyz_m: np.ndarray  # (K, 3) float32, 最终拟合内点
 
-    # For check.py visualization.
+    # 给 check.py 可视化用.
     render_points_xyz_m: np.ndarray  # (M,3) float32
     filtered_points_xyz_m: np.ndarray  # (M2,3) float32
 
 
 def _prefilter_lidar_points(pts: np.ndarray) -> np.ndarray:
-    """Keep only points in front (x>0) and within range (||p||<=MAX_RANGE_M)."""
+    # 只保留前方点 (x>0), 并做距离截断 (||p||<=MAX_RANGE_M).
     if pts.shape[0] == 0:
         return pts
     p = np.asarray(pts)
@@ -89,9 +89,9 @@ def _prefilter_lidar_points(pts: np.ndarray) -> np.ndarray:
 
 def _window_near_filter(pts: np.ndarray) -> np.ndarray:
     """
-    Stage-1 filter within one vertical window:
-    - Use the VERT_NEAREST_RANK-th smallest range as ref (robust to very-near noise).
-    - Keep points with r <= ref + VERT_NEAREST_KEEP_DELTA_M.
+    单个竖直窗口内的第一轮过滤:
+    - 取距离排序第 VERT_NEAREST_RANK 个作为 ref, 用于抗极近噪声点.
+    - 只保留 r <= ref + VERT_NEAREST_KEEP_DELTA_M.
     """
     if pts.shape[0] == 0:
         return pts
@@ -119,7 +119,7 @@ def _maybe_subsample(pts: np.ndarray, n_max: int, rng: np.random.Generator) -> n
 
 
 def _sphere_from_4pts(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, p4: np.ndarray) -> Optional[tuple[np.ndarray, float]]:
-    # Compute a sphere from 4 non-coplanar points. Return (center, radius) or None.
+    # 用 4 个点解球 (一般位置). 返回 (center, radius) 或 None.
     p1 = p1.astype(np.float64, copy=False)
     p2 = p2.astype(np.float64, copy=False)
     p3 = p3.astype(np.float64, copy=False)
@@ -148,13 +148,20 @@ def _sphere_from_4pts(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray, p4: np.nda
 
 
 def _sphere_refine_least_squares(pts: np.ndarray) -> Optional[tuple[np.ndarray, float]]:
-    # Linear least squares refinement on inliers.
+    # 在内点上做一次线性最小二乘 refine.
+    # 目标: 给定一组点 p=(x,y,z), 拟合球 (c,r), 满足 ||p-c||^2 = r^2.
+    # 展开可得线性形式:
+    #   x^2 + y^2 + z^2 = 2*cx*x + 2*cy*y + 2*cz*z + k
+    # 其中 k = r^2 - cx^2 - cy^2 - cz^2.
+    # 于是可以用最小二乘解 [2x,2y,2z,1] * [cx,cy,cz,k]^T = x^2+y^2+z^2.
     if pts.shape[0] < 10:
+        # 点太少时不做 refine, 避免不稳定.
         return None
     p = pts.astype(np.float64, copy=False)
     A = np.column_stack([2.0 * p[:, 0], 2.0 * p[:, 1], 2.0 * p[:, 2], np.ones((p.shape[0],), dtype=np.float64)])
     b = (p[:, 0] ** 2 + p[:, 1] ** 2 + p[:, 2] ** 2).astype(np.float64, copy=False)
     try:
+        # rcond=None 使用 numpy 默认策略.
         sol, *_ = np.linalg.lstsq(A, b, rcond=None)
     except Exception:
         return None
@@ -162,6 +169,7 @@ def _sphere_refine_least_squares(pts: np.ndarray) -> Optional[tuple[np.ndarray, 
     c = np.array([cx, cy, cz], dtype=np.float64)
     r2 = float(k + cx * cx + cy * cy + cz * cz)
     if r2 <= 0.0 or (not np.isfinite(r2)):
+        # r^2 非正或数值异常, 认为 refine 失败.
         return None
     return c, float(np.sqrt(r2))
 
@@ -177,6 +185,7 @@ def _ransac_sphere(
     seed: int = 0,
 ) -> Optional[tuple[np.ndarray, float]]:
     if pts.shape[0] < 50:
+        # 点太少时 RANSAC 意义不大, 直接失败.
         return None
     seed_u32 = int(seed) & 0xFFFFFFFF
     rng = np.random.default_rng(seed_u32)
@@ -188,25 +197,30 @@ def _ransac_sphere(
     best_radius = 0.0
 
     for _ in range(int(iters)):
+        # 每次随机选 4 个点, 解一个球. 4 点解球若退化(共面或数值不稳)则返回 None.
         idx = rng.choice(n, size=4, replace=False)
         m = _sphere_from_4pts(p[idx[0]], p[idx[1]], p[idx[2]], p[idx[3]])
         if m is None:
             continue
         c, r = m
+        # 半径约束, 过滤掉不在目标尺寸范围内的候选.
         if (r < float(r_min)) or (r > float(r_max)):
             continue
+        # 内点判定: 对每个点计算到球面的残差 | ||p-c|| - r |, 小于阈值认为是内点.
         d = np.linalg.norm(p - c.reshape(1, 3), axis=1)
         inliers = np.abs(d - float(r)) < float(inlier_thresh)
         cnt = int(np.count_nonzero(inliers))
         if cnt > best_cnt and cnt >= int(min_inliers):
+            # 只保留内点更多的候选.
             best_cnt = cnt
             best_center = c
             best_radius = float(r)
 
     if best_center is None or best_cnt < int(min_inliers):
+        # 没有任何满足最小内点数的候选.
         return None
 
-    # One refinement step using current inliers.
+    # 用当前内点做一次 refine.
     refined = _sphere_refine_least_squares(
         p[np.abs(np.linalg.norm(p - best_center.reshape(1, 3), axis=1) - best_radius) < float(inlier_thresh)]
     )
@@ -219,14 +233,14 @@ def _ransac_sphere(
 
 
 def detect_ball_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> LidarBallDetection:
-    # Main pipeline:
-    # 1) prefilter (front + range)
-    # 2) compute elevation angle, scan vertical windows top->bottom
-    # 3) per-window stage-1 filter (range ref + delta), then RANSAC
-    # 4) verify globally and early return on first hit
+    # 主流程:
+    # 1) 基础预过滤: 前方 + 距离截断
+    # 2) 计算竖直角 elevation, 从上往下扫描竖直窗口
+    # 3) 窗口内做第一轮过滤 (ref + delta), 再做 RANSAC 拟合球
+    # 4) 在全局点云上验证内点数, 命中即退出
     pts = np.asarray(points_xyz)
     if pts.ndim != 2 or pts.shape[1] != 3:
-        raise ValueError("points_xyz must be a (N,3) numpy array")
+        raise ValueError("points_xyz must be a (N, 3) numpy array")
 
     if pts.shape[0] == 0:
         z = pts.astype(np.float32, copy=False)
@@ -238,7 +252,7 @@ def detect_ball_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> LidarBallDete
 
     rng = np.random.default_rng(int(seed) & 0xFFFFFFFF)
 
-    # FOV filter and elevation (pitch) computation.
+    # FOV 筛选 + 竖直角 elevation 计算.
     fov = float(LIDAR_FOV_DEG)
     if (not np.isfinite(fov)) or fov <= 0.0:
         fov = 70.0
@@ -255,7 +269,7 @@ def detect_ball_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> LidarBallDete
     if idx_fov.size == 0:
         return LidarBallDetection(None, None, None, p_render[:0], p_render, p_render)
 
-    # For check.py: stage-1 kept points, accumulated up to the hit window.
+    # 给 check.py: 第一轮过滤保留点的并集, 只累计到命中窗口时刻.
     stage1_keep = np.zeros((p_render.shape[0],), dtype=bool)
     p64 = p_render.astype(np.float64, copy=False)
     pitch_deg = np.rad2deg(pitch[idx_fov]).astype(np.float64, copy=False)
@@ -267,7 +281,7 @@ def detect_ball_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> LidarBallDete
     if (not np.isfinite(step)) or step <= 0.0:
         step = 7.0
 
-    # Fixed scan order: top -> bottom (+half_deg -> -half_deg), early return on first hit.
+    # 固定扫描顺序: 从上到下 (+half_deg -> -half_deg), 命中即退出.
     start_deg = half_deg - win
     end_deg = -half_deg
     if start_deg < end_deg:
@@ -288,7 +302,7 @@ def detect_ball_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> LidarBallDete
         p_win0 = p_render[idx_win]
         p_win = _window_near_filter(p_win0)
 
-        # Record stage-1 kept points (union): apply the same ref+delta mask on p_win0.
+        # 记录第一轮过滤保留点 (并集): 对窗口内点应用 ref+delta mask.
         if p_win0.shape[0] > 0:
             p64w = p_win0.astype(np.float64, copy=False)
             rw = np.linalg.norm(p64w, axis=1)
@@ -320,7 +334,7 @@ def detect_ball_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> LidarBallDete
             continue
         c, r = model
 
-        # Global verification: compute inliers on p_render and require a minimum count.
+        # 全局验证: 在 p_render 上算 inliers, 要求内点数达到阈值.
         d0 = np.linalg.norm(p64 - c.reshape(1, 3), axis=1)
         in0 = np.abs(d0 - float(r)) < float(SPHERE_INLIER_THRESH_M)
         if int(np.count_nonzero(in0)) < int(SPHERE_MIN_INLIERS_GLOBAL):
@@ -348,7 +362,7 @@ def detect_ball_lidar(points_xyz: np.ndarray, *, seed: int = 0) -> LidarBallDete
             filtered_points_xyz_m=filt_pts,
         )
 
-    # Not found.
+    # 未命中.
     return LidarBallDetection(None, None, None, p_render[:0], p_render, p_render)
 
 

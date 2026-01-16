@@ -4,14 +4,15 @@
 """
 cali/check.py
 
-Traverse cali/data/<scene>/ and visualize:
-- ToF reflectivity (intensity) + 2D ball center (centroid).
-- LiDAR point cloud (2D projection) + fitted inliers (red) + ball center (cross) + text info.
+遍历 cali/data/<scene>/, 做可视化:
+- TOF_REFLECT: ToF 反射率(强度)灰度图, 叠加球心十字
+- LIDAR: 雷达点云投影图, 叠加拟合内点(红色), 球心(十字), 以及文字信息
 
-Keys:
-- 4: previous scene
-- 6: next scene
-- ESC: quit
+按键:
+- 4: 上一个场景
+- 6: 下一个场景
+- 0: 删除当前场景(弹窗确认)
+- ESC: 退出
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-# Allow running from cali/ directly: add project root to sys.path to import tof3d.
+# 允许在 cali/ 目录直接运行: 把项目根目录加入 sys.path, 以便 import tof3d.
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -38,26 +39,26 @@ from tof_ball_detector import detect_ball_tof_2d  # noqa: E402
 HERE = Path(__file__).resolve().parent
 DATA_DIR = HERE / "data"
 
-# ========= LiDAR 2D (aligned with visualize_data.py/client.py) =========
+# ========= LiDAR 2D 显示参数, 与 visualize_data.py/client.py 对齐 =========
 LIDAR_IMG_W = 700
 LIDAR_IMG_H = 700
 FOV_DEG = 70.0
 HALF_FOV = float(np.deg2rad(FOV_DEG / 2.0))
 
-# LiDAR projection rendering (visualization only).
+# LiDAR 投影渲染参数, 仅用于显示.
 LIDAR_VIS_MAX_RANGE_M = 20.0
 LIDAR_NEAR_SAT_M = 1.0
 
-# Optional elevation guide lines (disabled by request).
+# 可选的竖直辅助线, 按需求默认关闭.
 DRAW_ELEV_LINES = False
 ELEV_LINE_DEG = 7.0
 ELEV_LINE_COLOR = (255, 255, 255)  # BGR
 ELEV_LINE_THICKNESS = 1
 
-# Mouse hover shows LiDAR range at the cursor pixel.
+# 鼠标悬停显示 LiDAR 距离, 只作用于 LIDAR 窗口.
 MOUSE_HOVER_ENABLED = True
 
-# ========= ToF 2D (display size) =========
+# ========= ToF 2D 显示尺寸 =========
 TOF_W = 40
 TOF_H = 30
 TOF_SHOW_W = 400
@@ -94,8 +95,8 @@ def _load_points(npz_path: Path) -> np.ndarray:
 
 def _tof_pixel_to_disp_xy(px: float, py: float) -> tuple[int, int]:
     """
-    Display mapping aligned with visualize_data.py:
-    - Flip vertically for display.
+    与 visualize_data.py 对齐的显示映射:
+    - 显示做 flipV(上下翻转).
     """
     px_i = float(np.clip(px, 0.0, TOF_W - 1.0))
     py_i = float(np.clip(py, 0.0, TOF_H - 1.0))
@@ -109,9 +110,9 @@ def _tof_pixel_to_disp_xy(px: float, py: float) -> tuple[int, int]:
 
 def _tof_intensity_to_u8(intensity_sum: np.ndarray) -> np.ndarray:
     """
-    Intensity display mapping:
-    - Normalize by global mean -> target_mean.
-    - Gamma display (1/gamma).
+    ToF 强度显示映射:
+    - 先按整图 mean 做归一化到 target_mean
+    - 再做 gamma 显示(1/gamma)
     """
     if intensity_sum.size == 0:
         return np.zeros((TOF_H, TOF_W), dtype=np.uint8)
@@ -130,6 +131,7 @@ def _tof_intensity_to_u8(intensity_sum: np.ndarray) -> np.ndarray:
 
 
 def _render_lidar_gray_and_range(points_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    # 把 3D 点投影成 2D 灰度图, 并输出每像素的最近距离 rmap.
     if points_xyz.shape[0] == 0:
         img = np.zeros((LIDAR_IMG_H, LIDAR_IMG_W), dtype=np.uint8)
         rmap = np.full((LIDAR_IMG_H, LIDAR_IMG_W), np.inf, dtype=np.float32)
@@ -173,6 +175,7 @@ def _draw_cross(img_bgr: np.ndarray, u: int, v: int, *, color: tuple[int, int, i
 
 
 def _draw_elev_lines(img_bgr: np.ndarray, *, step_deg: float) -> None:
+    # 绘制竖直辅助线, 当前默认关闭.
     import cv2  # type: ignore
 
     if not bool(DRAW_ELEV_LINES):
@@ -194,8 +197,8 @@ def _draw_elev_lines(img_bgr: np.ndarray, *, step_deg: float) -> None:
 
 def _confirm_delete_scene(scene_dir: Path) -> bool:
     """
-    Show a blocking confirmation dialog.
-    Returns True if user confirms deletion.
+    弹出阻塞确认框.
+    用户点击 Yes 返回 True, 否则返回 False.
     """
     title = "Confirm delete"
     msg = f"Delete scene folder?\n\n{scene_dir.name}\n\nThis cannot be undone."
@@ -216,7 +219,7 @@ def _build_lidar_view(det: LidarBallDetection) -> tuple[np.ndarray, Dict[str, An
 
     meta: Dict[str, Any] = {}
 
-    # Base image from render_points, then overlay inliers (red) and center (cross).
+    # 先用 render_points 渲染底图, 再叠加拟合内点(红色)和球心(十字).
     raw_u8, raw_range = _render_lidar_gray_and_range(det.render_points_xyz_m.astype(np.float32, copy=False))
     lidar_bgr = cv2.applyColorMap(raw_u8, cv2.COLORMAP_TURBO)
     _draw_elev_lines(lidar_bgr, step_deg=float(ELEV_LINE_DEG))
@@ -295,9 +298,8 @@ def _build_tof_reflect_view(env_dir: Path, tof_center_xy: Optional[tuple[float, 
     if hists.size == 0:
         return tof_bgr
 
-    # Reflectivity (intensity): sum of all histogram bins.
-    # Keep this consistent with visualize_data.py: do not mask by peak threshold here,
-    # otherwise the image may look like a near-binary black/white map.
+    # 反射率强度 = histogram sum.
+    # 与 visualize_data.py 保持一致: 这里不做 peak mask, 否则容易看起来像二值黑白图.
     inten = hists.sum(axis=2).astype(np.float32, copy=False)
 
     inten_u8 = _tof_intensity_to_u8(inten)
@@ -354,7 +356,7 @@ def main() -> int:
         cv2.putText(lidar_view, f"{env.name}  ({idx+1}/{len(envs)})", (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
         # Do not overlay any text on TOF_REFLECT to avoid blocking the image.
 
-        # Mouse hover range (LiDAR only).
+        # 鼠标悬停距离, 只针对 LiDAR.
         if bool(MOUSE_HOVER_ENABLED):
             mx = int(np.clip(mouse_state.get("x", 0), 0, LIDAR_IMG_W - 1))
             my = int(np.clip(mouse_state.get("y", 0), 0, LIDAR_IMG_H - 1))
@@ -373,7 +375,7 @@ def main() -> int:
         if k == ord("6"):
             idx = (idx + 1) % len(envs)
         if k == ord("0"):
-            # Confirm and delete current scene folder.
+            # 删除当前场景目录, 弹窗确认.
             if _confirm_delete_scene(env):
                 try:
                     shutil.rmtree(env, ignore_errors=False)
