@@ -31,6 +31,15 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+CAMERA_MATRIX_INIT = np.array(
+    [
+        [36.0, 0.0, 20.0],
+        [0.0, 36.0, 15.0],
+        [0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+
 
 # Allow running from cali/ directly.
 HERE = Path(__file__).resolve().parent
@@ -140,15 +149,8 @@ def main() -> int:
     obj = np.array(obj_pts, dtype=np.float32).reshape(-1, 1, 3)
     img = np.array(img_pts, dtype=np.float32).reshape(-1, 1, 2)
 
-    # Init camera matrix guess.
-    camera_matrix = np.array(
-        [
-            [float(tof_w), 0.0, float(tof_w) / 2.0],
-            [0.0, float(tof_w), float(tof_h) / 2.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
+    # Init camera matrix guess (hard-coded).
+    camera_matrix = CAMERA_MATRIX_INIT.copy()
     dist = np.zeros((5, 1), dtype=np.float64)
 
     flags = 0
