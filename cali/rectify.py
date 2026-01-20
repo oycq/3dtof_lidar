@@ -158,25 +158,45 @@ def build_tof_reflect_view(env_dir, cv2):
 
 def project_lidar_to_tof(pts_lidar_xyz, calib, cv2):
     # 用标定参数把 LiDAR 3D 点投影到 ToF 像素坐标(u,v), 同时返回相机坐标系 Z 以判断前后
-    if pts_lidar_xyz.shape[0] == 0:
-        return np.zeros((0, 2), dtype=np.float64), np.zeros((0,), dtype=np.float64)
+    # 旧实现使用 cv2.projectPoints，速度较慢；这里改成纯 numpy 投影：
+    # cam = R*X + t; u = fx*Xc/Zc + cx; v = fy*Yc/Zc + cy
 
-    obj = pts_lidar_xyz.astype(np.float32, copy=False).reshape(-1, 1, 3)
-    uv, _ = cv2.projectPoints(
-        obj,
-        calib["rvec"].reshape(3, 1),
-        calib["tvec"].reshape(3, 1),
-        calib["camera_matrix"],
-        np.zeros((5, 1), dtype=np.float64),
-    )
-    uv = uv.reshape(-1, 2).astype(np.float64, copy=False)
+    def _prepare_calib_fast(calib_dict):
+        # 缓存 R/t/K（每次 scene 复用），避免重复 Rodrigues/类型转换
+        if "_R_fast" not in calib_dict:
+            R64, _ = cv2.Rodrigues(calib_dict["rvec"].reshape(3, 1))
+            calib_dict["_R_fast"] = R64.astype(np.float32, copy=False)
+        if "_t_fast" not in calib_dict:
+            # (1,3) 便于广播相加
+            calib_dict["_t_fast"] = calib_dict["tvec"].reshape(1, 3).astype(np.float32, copy=False)
+        if "_K_fast" not in calib_dict:
+            calib_dict["_K_fast"] = calib_dict["camera_matrix"].astype(np.float32, copy=False)
+        return calib_dict["_R_fast"], calib_dict["_t_fast"], calib_dict["_K_fast"]
 
-    R, _ = cv2.Rodrigues(calib["rvec"].reshape(3, 1))
-    t = calib["tvec"].reshape(3, 1)
-    xyz = pts_lidar_xyz.astype(np.float64, copy=False).T  # (3,N)
-    cam = (R @ xyz) + t
-    zc = cam[2, :].astype(np.float64, copy=False)
-    return uv, zc
+    def _project_lidar_to_tof_fast(pts_lidar_xyz_, R_, t_, K_):
+        if pts_lidar_xyz_.shape[0] == 0:
+            return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.float32)
+
+        X = pts_lidar_xyz_.astype(np.float32, copy=False)  # (N,3)
+        cam = (R_ @ X.T).T + t_  # (N,3)
+        zc_ = cam[:, 2].astype(np.float32, copy=False)
+
+        # avoid div0, keep for later filtering
+        z = zc_.copy()
+        z[z == 0.0] = 1e-6
+
+        fx = float(K_[0, 0])
+        fy = float(K_[1, 1])
+        cx = float(K_[0, 2])
+        cy = float(K_[1, 2])
+
+        u = fx * (cam[:, 0] / z) + cx
+        v = fy * (cam[:, 1] / z) + cy
+        uv_ = np.stack([u, v], axis=1).astype(np.float32, copy=False)
+        return uv_, zc_
+
+    R, t, K = _prepare_calib_fast(calib)
+    return _project_lidar_to_tof_fast(pts_lidar_xyz, R, t, K)
 
 
 def resize_keep_aspect_to_h(img, target_h, cv2):
