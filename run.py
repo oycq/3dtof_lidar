@@ -34,6 +34,7 @@ from tof_server import ToFRealtimeServer
 
 CAPTURE_SECONDS = 2.0  # 显示/渲染“最近多少秒”的点云（采集滑窗长度）
 DATA_DIR = Path(__file__).resolve().parent / "data"
+SHOW_DONE_POPUP_ON_SAVE = True  # 一个场景数据保存完成后：弹窗 Done（不退出采集）
 
 IMG_W = 700
 IMG_H = 700
@@ -155,8 +156,38 @@ def _try_save_tof_raw(dest_raw: Path) -> bool:
         return False
 
 
-def _save_snapshot_async(
-    *, x: np.ndarray, y: np.ndarray, z: np.ndarray, view_img: np.ndarray, tof_raw_bytes: bytes | None
+def _show_done_popup(*, cv2, duration_ms: int = 400) -> None:
+    """
+    采集完成提示：绿色背景，白字 'Done'，duration_ms 后自动关闭。
+    注意：cv2.waitKey 参数单位是毫秒。
+    """
+    w, h = 360, 160
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    img[:] = (0, 200, 0)  # BGR: green
+
+    text = "Done"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 2.0
+    thickness = 4
+    (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+    x = max((w - tw) // 2, 0)
+    y = max((h + th) // 2, th)
+    cv2.putText(img, text, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+    win = "采集成功"
+    cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
+    cv2.imshow(win, img)
+    cv2.waitKey(int(max(duration_ms, 1)))
+    cv2.destroyWindow(win)
+
+
+def _save_snapshot(
+    *,
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    view_img: np.ndarray,
+    tof_raw_bytes: bytes | None,
 ) -> None:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = DATA_DIR / ts
@@ -250,15 +281,13 @@ def main() -> int:
 
             cv2.imshow("LIDAR (ESC=quit)", last_img)
             cv2.imshow("TOF_REFLECT", last_tof)
+
             key = int(cv2.waitKey(1) & 0xFF)
             if key == 32:  # SPACE：保存当前“最近 N 秒”点云 + tof.raw + jpg
-                # 后台保存，避免卡顿
-                t = threading.Thread(
-                    target=_save_snapshot_async,
-                    kwargs={"x": x, "y": y, "z": z, "view_img": last_img.copy(), "tof_raw_bytes": last_tof_bytes},
-                    daemon=True,
-                )
-                t.start()
+                # 同步保存：实现更简单；保存时 UI 会短暂卡顿
+                _save_snapshot(x=x, y=y, z=z, view_img=last_img.copy(), tof_raw_bytes=last_tof_bytes)
+                if SHOW_DONE_POPUP_ON_SAVE:
+                    _show_done_popup(cv2=cv2, duration_ms=400)
             if key == 27:  # ESC
                 break
     finally:
