@@ -50,6 +50,8 @@ class ToFRealtimeServer:
         queue_maxlen: int = 5,
         min_peak_count: float = 100.0,
         target_fps: float = 10.0,
+        raw_expected_bytes: Optional[int] = None,
+        read_retry: int = 3,
     ) -> None:
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -58,6 +60,13 @@ class ToFRealtimeServer:
 
         self._params = ToF3DParams(min_peak_count=float(min_peak_count))
         self._target_dt = 1.0 / float(max(target_fps, 1.0))
+        self._read_retry = int(max(read_retry, 0))
+
+        # tof.raw 期望长度：header + H*W*bin*2bytes
+        if raw_expected_bytes is None:
+            self._raw_expected_bytes = int(self._params.header_bytes + self._params.height * self._params.width * self._params.bin_num * 2)
+        else:
+            self._raw_expected_bytes = int(raw_expected_bytes)
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -99,41 +108,64 @@ class ToFRealtimeServer:
             return False
 
     @staticmethod
-    def _adb_read_raw_bytes() -> Optional[bytes]:
+    def _adb_read_raw_bytes(*, expected_bytes: int, retry: int) -> tuple[Optional[bytes], str]:
         """
         读取设备侧 /tmp/tof.raw 内容为 bytes。
         优先用 adb exec-out（不落盘），失败则 fallback 到 adb pull tmp/tof.raw（会落盘）。
+
+        关键修复：读取增加“长度校验 + 短重试”。
+        - expected_bytes: 期望 tof.raw 长度（不足视作半包/未写完）
+        - retry: 失败/长度不足时短重试次数
         """
         import subprocess
 
+        expected_bytes = int(expected_bytes)
+        retry = int(max(retry, 0))
+
         # 1) 尝试 exec-out（更快、不会写 tmp 文件）
-        try:
-            r = subprocess.run(
-                ["adb", "exec-out", "cat", "/tmp/tof.raw"],
-                timeout=1.2,
-                check=False,
-                capture_output=True,
-            )
-            if int(r.returncode) == 0 and r.stdout and len(r.stdout) >= 5120:
-                return bytes(r.stdout)
-        except Exception:
-            pass
+        for k in range(retry + 1):
+            try:
+                r = subprocess.run(
+                    ["adb", "exec-out", "cat", "/tmp/tof.raw"],
+                    timeout=1.2,
+                    check=False,
+                    capture_output=True,
+                )
+                out = r.stdout or b""
+                if int(r.returncode) == 0 and len(out) >= expected_bytes:
+                    return bytes(out[:expected_bytes]), "exec-out"
+            except Exception:
+                pass
+            if k < retry:
+                time.sleep(0.02)
 
         # 2) fallback: pull 到本地 tmp/tof.raw，再读入内存
-        try:
-            local = TMP_DIR / "tof.raw"
-            p = subprocess.run(
-                ["adb", "pull", "/tmp/tof.raw", str(local)],
-                timeout=1.2,
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            if int(p.returncode) != 0 or (not local.exists()) or local.stat().st_size < 5120:
-                return None
-            return local.read_bytes()
-        except Exception:
-            return None
+        local = TMP_DIR / "tof.raw"
+        for k in range(retry + 1):
+            try:
+                p = subprocess.run(
+                    ["adb", "pull", "/tmp/tof.raw", str(local)],
+                    timeout=1.2,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if int(p.returncode) != 0:
+                    if k < retry:
+                        time.sleep(0.03)
+                    continue
+                if (not local.exists()) or local.stat().st_size < expected_bytes:
+                    # 这里很关键：如果设备还在写文件，pull 可能成功但内容不全 -> 这会造成间歇性“卡顿/断流”
+                    if k < retry:
+                        time.sleep(0.03)
+                    continue
+                b = local.read_bytes()
+                if len(b) >= expected_bytes:
+                    return bytes(b[:expected_bytes]), "pull"
+            except Exception:
+                if k < retry:
+                    time.sleep(0.03)
+        return None, ""
 
     @staticmethod
     def _tof_intensity_to_u8(intensity_sum: np.ndarray, *, gamma: float = 2.2, target_mean: float = 0.18) -> np.ndarray:
@@ -158,9 +190,8 @@ class ToFRealtimeServer:
 
     def _run(self) -> None:
         fail_sleep = 0.15
-        while not self._stop.is_set():
-            t0 = time.time()
 
+        while not self._stop.is_set():
             ok = self._adb_trigger_generate_raw()
             if not ok:
                 time.sleep(fail_sleep)
@@ -168,7 +199,9 @@ class ToFRealtimeServer:
 
             # 给设备一点点写文件时间（过短容易拿到空/半包）
             time.sleep(0.05)
-            raw_bytes = self._adb_read_raw_bytes()
+
+            t0 = time.perf_counter()
+            raw_bytes, _mode = self._adb_read_raw_bytes(expected_bytes=self._raw_expected_bytes, retry=self._read_retry)
             if not raw_bytes:
                 time.sleep(fail_sleep)
                 continue
@@ -187,7 +220,7 @@ class ToFRealtimeServer:
             with self._lock:
                 self._q.append(frame)
 
-            dt = time.time() - t0
+            dt = time.perf_counter() - t0
             # 简单限帧，避免 adb 过载
             sleep = self._target_dt - dt
             if sleep > 0:
