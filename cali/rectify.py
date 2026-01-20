@@ -9,7 +9,7 @@
 - ToF 反射率图: 对每个像素直方图做 sum 得到强度, 再做归一化+gamma, 最后 flipV+resize 到 400x300
 - LiDAR 投影图: 用 cv2.projectPoints 把 LiDAR 3D 点投到 ToF 40x30 像素坐标系
   - 过滤: 只保留落在 0<=u<40, 0<=v<30 且位于相机"前方"的点(前方 Z 符号自动选择)
-  - 聚合: 同一 ToF 像素内多个点, 对 LiDAR 前向距离 x 做平均(mean)
+- 聚合: 同一 ToF 像素内多个点, 取"最近"(x 最小)的前 5%-10% 点再求均值
   - 显示: 把平均 x 映射成强度 u8=round(255/x), 再用 COLORMAP_TURBO 着色, 无点为黑
 """
 
@@ -230,7 +230,8 @@ def main():
         # ToF 反射率
         tof_reflect = build_tof_reflect_view(env, cv2=cv2)
 
-        # 投影到 ToF 40x30, 并按每个 ToF 像素聚合(取 LiDAR 的 x 平均值)
+        # 投影到 ToF 40x30, 并按每个 ToF 像素聚合:
+        # - 不用全体均值, 而是取距离最近(x 最小)的前 5%-10% 点再求均值
         uv, zc = project_lidar_to_tof(pts, calib, cv2=cv2)
         n_all = int(uv.shape[0])
         n_z_pos = int(np.count_nonzero(zc > 1e-6)) if n_all > 0 else 0
@@ -254,18 +255,35 @@ def main():
                 ui = np.clip(np.floor(uu).astype(np.int32, copy=False), 0, TOF_W - 1)
                 vi = np.clip(np.floor(vv).astype(np.int32, copy=False), 0, TOF_H - 1)
 
-                pix = (vi * TOF_W + ui).astype(np.int32, copy=False)
-                dsum = np.zeros((TOF_H * TOF_W,), dtype=np.float32)
-                dcnt = np.zeros((TOF_H * TOF_W,), dtype=np.int32)
-                np.add.at(dsum, pix, x_lidar)
-                np.add.at(dcnt, pix, 1)
+                TOP_FRAC = 0.10  # 0.10=最近10%; 你要更"近"就改成 0.05
 
-                hit = dcnt > 0
-                if np.any(hit):
-                    dmean = np.zeros_like(dsum)
-                    dmean[hit] = dsum[hit] / np.maximum(dcnt[hit].astype(np.float32), 1.0)
-                    dm = np.clip(dmean[hit], float(LIDAR_NEAR_SAT_M), float(LIDAR_VIS_MAX_RANGE_M))
-                    u8map_flat[hit] = np.clip(np.rint(255.0 / dm), 0.0, 255.0).astype(np.uint8, copy=False)
+                pix = (vi * TOF_W + ui).astype(np.int32, copy=False)
+                order = np.argsort(pix, kind="stable")
+                pix_s = pix[order]
+                x_s = x_lidar[order].astype(np.float32, copy=False)
+
+                if pix_s.size > 0:
+                    cuts = np.flatnonzero(pix_s[1:] != pix_s[:-1]) + 1
+                    starts = np.concatenate([np.array([0], dtype=np.int32), cuts.astype(np.int32, copy=False)])
+                    ends = np.concatenate([cuts.astype(np.int32, copy=False), np.array([pix_s.size], dtype=np.int32)])
+                    grp_ids = pix_s[starts]
+
+                    for gid, s, e in zip(grp_ids.tolist(), starts.tolist(), ends.tolist()):
+                        vals = x_s[int(s) : int(e)]
+                        n = int(vals.size)
+                        if n <= 0:
+                            continue
+                        k = int(max(1, int(np.ceil(float(n) * float(TOP_FRAC)))))
+
+                        # 取最小的 k 个(最近的一小撮), 用 partition 比全排序快
+                        if k >= n:
+                            nearest = vals
+                        else:
+                            nearest = np.partition(vals, k - 1)[:k]
+
+                        d = float(np.mean(nearest))
+                        d = float(np.clip(d, float(LIDAR_NEAR_SAT_M), float(LIDAR_VIS_MAX_RANGE_M)))
+                        u8map_flat[int(gid)] = np.clip(np.rint(255.0 / d), 0.0, 255.0).astype(np.uint8)
 
         u8map = u8map_flat.reshape((TOF_H, TOF_W))
         u8_big = cv2.resize(u8map, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
