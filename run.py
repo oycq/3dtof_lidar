@@ -29,7 +29,8 @@ import time
 
 import numpy as np
 
-from server import LivoxRealtimeServer
+from lidar_server import LivoxRealtimeServer
+from tof_server import ToFRealtimeServer
 
 CAPTURE_SECONDS = 2.0  # 显示/渲染“最近多少秒”的点云（采集滑窗长度）
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -48,6 +49,11 @@ AE_HIGH_PCT = 98.0  # 百分位拉伸：高端裁剪
 AE_GAMMA = 0.8  # <1 会提亮暗部（更容易看清远处）；=1 关闭 gamma
 AE_MEAN_SECONDS = 2.0  # 量程平滑：用最近 N 秒的均值（更稳定，不跳）
 
+# ToF 显示尺寸（与 cali/check.py 对齐）
+TOF_W = 40
+TOF_H = 30
+TOF_SHOW_W = 400
+TOF_SHOW_H = 300
 
 def _render_2d(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
     if x.size == 0:
@@ -149,7 +155,9 @@ def _try_save_tof_raw(dest_raw: Path) -> bool:
         return False
 
 
-def _save_snapshot_async(*, x: np.ndarray, y: np.ndarray, z: np.ndarray, view_img: np.ndarray) -> None:
+def _save_snapshot_async(
+    *, x: np.ndarray, y: np.ndarray, z: np.ndarray, view_img: np.ndarray, tof_raw_bytes: bytes | None
+) -> None:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = DATA_DIR / ts
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -173,8 +181,15 @@ def _save_snapshot_async(*, x: np.ndarray, y: np.ndarray, z: np.ndarray, view_im
     except Exception:
         pass
 
-    # 3) tof.raw（尽力而为：没有 adb/设备侧不支持则跳过）
-    _try_save_tof_raw(out_dir / "tof.raw")
+    # 3) tof.raw（优先保存“ToF server 的最新帧”；没有则 fallback 到 adb 拉取一次）
+    dest_raw = out_dir / "tof.raw"
+    if tof_raw_bytes:
+        try:
+            dest_raw.write_bytes(tof_raw_bytes)
+        except Exception:
+            _try_save_tof_raw(dest_raw)
+    else:
+        _try_save_tof_raw(dest_raw)
 
     print(f"[SAVE] -> {out_dir} (pts={int(x.size)})")
 
@@ -186,15 +201,22 @@ def main() -> int:
         raise RuntimeError("缺少依赖 opencv-python，请先执行：py -m pip install opencv-python") from e
     colormap = cv2.COLORMAP_TURBO
 
-    cv2.namedWindow("OpenPyLivox - 2D (ESC=quit)", cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow("LIDAR (ESC=quit)", cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow("TOF_REFLECT", cv2.WINDOW_AUTOSIZE)
 
     srv = LivoxRealtimeServer(max_seconds=CAPTURE_SECONDS)
     srv.start()
+
+    tof_srv = ToFRealtimeServer(queue_maxlen=5, min_peak_count=100.0, target_fps=10.0)
+    tof_srv.start()
 
     last_img = np.zeros((IMG_H, IMG_W), dtype=np.uint8)
     last_pts = 0
     last_ts = 0.0
     ae_state = _AutoExposeState()
+
+    last_tof = np.zeros((TOF_SHOW_H, TOF_SHOW_W, 3), dtype=np.uint8)
+    last_tof_bytes: bytes | None = None
 
     try:
         while True:
@@ -210,20 +232,30 @@ def main() -> int:
             last_pts = int(x.size)
             last_ts = now_ts
             cv2.setWindowTitle(
-                "OpenPyLivox - 2D (ESC=quit)",
-                f"OpenPyLivox - 2D | last={CAPTURE_SECONDS:.1f}s | pts={last_pts} | fov=±35° | I≈255/x(m) | "
+                "LIDAR (ESC=quit)",
+                f"LIDAR | last={CAPTURE_SECONDS:.1f}s | pts={last_pts} | fov=±35° | I≈255/x(m) | "
                 f"range=1~{MAX_RANGE_M:.0f}m | "
                 f"ae={'on' if AUTO_EXPOSURE else 'off'}(mean={AE_MEAN_SECONDS:.1f}s) | "
                 f"color={(COLORMAP_NAME if USE_COLORMAP else 'off')} | t={last_ts:.2f}",
             )
 
-            cv2.imshow("OpenPyLivox - 2D (ESC=quit)", last_img)
+            # ToF：实时拿最新反射率图显示（没有数据就保持上一帧）
+            tof_frame = tof_srv.get_latest()
+            if tof_frame is not None and isinstance(tof_frame.reflect_u8, np.ndarray) and tof_frame.reflect_u8.size:
+                inten_u8 = tof_frame.reflect_u8
+                inten_big = cv2.resize(inten_u8, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
+                inten_big = cv2.flip(inten_big, 0)  # 与 cali/check.py 对齐：显示 flipV
+                last_tof = cv2.cvtColor(inten_big, cv2.COLOR_GRAY2BGR)
+                last_tof_bytes = tof_frame.raw_bytes
+
+            cv2.imshow("LIDAR (ESC=quit)", last_img)
+            cv2.imshow("TOF_REFLECT", last_tof)
             key = int(cv2.waitKey(1) & 0xFF)
             if key == 32:  # SPACE：保存当前“最近 N 秒”点云 + tof.raw + jpg
                 # 后台保存，避免卡顿
                 t = threading.Thread(
                     target=_save_snapshot_async,
-                    kwargs={"x": x, "y": y, "z": z, "view_img": last_img.copy()},
+                    kwargs={"x": x, "y": y, "z": z, "view_img": last_img.copy(), "tof_raw_bytes": last_tof_bytes},
                     daemon=True,
                 )
                 t.start()
@@ -231,6 +263,7 @@ def main() -> int:
                 break
     finally:
         srv.stop()
+        tof_srv.stop()
         cv2.destroyAllWindows()
 
     return 0
