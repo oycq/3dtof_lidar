@@ -21,4 +21,6 @@ cali_result
 
 train_data
 
+*.pt
+
 
