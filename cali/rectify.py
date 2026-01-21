@@ -15,6 +15,8 @@
 
 import json
 import sys
+import shutil
+import ctypes
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -52,7 +54,7 @@ TOF_SHOW_H = 300  # ToF 显示高度
 TOF_MIN_PEAK = 100  # ToF 最小峰值计数，用于过滤
 TOF_INTEN_GAMMA = 2.2  # ToF 强度 gamma 校正值
 TOF_INTEN_TARGET_MEAN = 0.18  # ToF 强度目标均值，用于归一化
-TOF_TOP_FRAC = 0.2  # 聚合时取最近的百分比（10%）
+TOF_TOP_FRAC = 0.2  # 聚合分位比例(0~1)，例如 0.2 表示取第 20% 分位处的距离值
 
 # 其他常量
 TITLE_H = 26  # 标题栏高度
@@ -319,6 +321,25 @@ def with_header(img: np.ndarray, header_text: str, header_h: int) -> np.ndarray:
     return out
 
 
+def confirm_delete_scene(scene_dir: Path) -> bool:
+    """
+    按下 0 删除场景前的确认弹窗（Windows）。
+    用户点击“是/Yes”返回 True，否则返回 False。
+    """
+    title = "确认删除"
+    msg = f"确定删除这个场景文件夹吗？\n\n{scene_dir.name}\n\n删除后不可恢复。"
+    try:
+        # MessageBoxW: returns IDYES (6) or IDNO (7)
+        MB_YESNO = 0x00000004
+        MB_ICONWARNING = 0x00000030
+        IDYES = 6
+        ret = ctypes.windll.user32.MessageBoxW(0, msg, title, MB_YESNO | MB_ICONWARNING)
+        return int(ret) == IDYES
+    except Exception:
+        # 无法弹窗时默认不删除
+        return False
+
+
 def compute_scene(env: Path, calib: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     """
     计算单个场景的渲染图像
@@ -463,6 +484,21 @@ def main() -> int:
         k = cv2.waitKey(30) & 0xFF
         if k == 27:  # ESC
             break
+        elif k == ord("0"):  # Delete current scene
+            if confirm_delete_scene(env):
+                try:
+                    shutil.rmtree(env)
+                except Exception as e:
+                    try:
+                        ctypes.windll.user32.MessageBoxW(0, str(e), "删除失败", 0x00000000 | 0x00000010)
+                    except Exception:
+                        pass
+                # 从列表/缓存移除，并跳到下一个
+                scene_cache.pop(key, None)
+                del envs[idx]
+                if not envs:
+                    break
+                idx = idx % len(envs)
         elif k == ord("4"):  # Left
             idx = (idx - 1) % len(envs)
         elif k == ord("6"):  # Right
