@@ -9,8 +9,8 @@
 - ToF 反射率图: 对每个像素直方图做 sum 得到强度, 再做归一化+gamma, 最后 flipV+resize 到 400x300
 - LiDAR 投影图: 用 cv2.projectPoints 把 LiDAR 3D 点投到 ToF 40x30 像素坐标系
   - 过滤: 只保留落在 0<=u<40, 0<=v<30 且位于相机"前方"的点(前方 Z 符号自动选择)
-- 聚合: 同一 ToF 像素内多个点, 取"最近"(x 最小)的前 5%-10% 点再求均值
-  - 显示: 把平均 x 映射成强度 u8=round(255/x), 再用 COLORMAP_TURBO 着色, 无点为黑
+- 聚合: 同一 ToF 像素内多个点, 取"最近"(欧式距离最小)的前 5%-10% 点再求均值
+  - 显示: 把平均距离映射成强度 u8=round(255/d), 再用 COLORMAP_TURBO 着色, 无点为黑
 """
 
 import json
@@ -125,7 +125,7 @@ def tof_intensity_to_u8(intensity_sum):
 def render_lidar_gray(points_xyz):
     # LiDAR 2D 投影渲染(仅用于显示):
     # - 只取 x>0 且 yaw/pitch 在 FOV 内的点
-    # - 用 x 作为"距离", 映射成 u8=round(255/x)
+    # - 用欧式距离作为"距离", 映射成 u8=round(255/d)
     if points_xyz.shape[0] == 0:
         return np.zeros((LIDAR_IMG_H, LIDAR_IMG_W), dtype=np.uint8)
 
@@ -135,11 +135,14 @@ def render_lidar_gray(points_xyz):
     yaw = np.arctan2(y, x)
     pitch = np.arctan2(z, np.hypot(x, y))
     m = (x > 0) & (np.abs(yaw) <= HALF_FOV) & (np.abs(pitch) <= HALF_FOV)
-    x, yaw, pitch = x[m], yaw[m], pitch[m]
-    if x.size == 0:
+    x_m = x[m]
+    y_m = y[m]
+    z_m = z[m]
+    yaw, pitch = yaw[m], pitch[m]
+    if x_m.size == 0:
         return np.zeros((LIDAR_IMG_H, LIDAR_IMG_W), dtype=np.uint8)
 
-    depth_m = x.astype(np.float32, copy=False)
+    depth_m = np.sqrt(x_m * x_m + y_m * y_m + z_m * z_m).astype(np.float32, copy=False)
     depth_u8 = np.clip(np.rint(255.0 / depth_m), 0.0, 255.0).astype(np.uint8)
 
     col = ((HALF_FOV - yaw) / (2.0 * HALF_FOV) * (LIDAR_IMG_W - 1)).astype(np.int32)
@@ -287,14 +290,14 @@ def main():
         tof_reflect = build_tof_reflect_view(env, cv2=cv2)
 
         # 投影到 ToF 40x30, 并按每个 ToF 像素聚合:
-        # - 不用全体均值, 而是取距离最近(x 最小)的前 5%-10% 点再求均值
+        # - 不用全体均值, 而是取距离最近(欧式距离最小)的前 5%-10% 点再求均值
         uv, zc = project_lidar_to_tof(pts, calib, cv2=cv2)
         n_all = int(uv.shape[0])
         n_z_pos = int(np.count_nonzero(zc > 1e-6)) if n_all > 0 else 0
         n_z_neg = int(np.count_nonzero(zc < -1e-6)) if n_all > 0 else 0
 
         u8map_flat = np.zeros((TOF_H * TOF_W,), dtype=np.uint8)
-        # 记录“每个 ToF 像素的聚合距离（x 距离）”，用于鼠标悬停显示
+        # 记录“每个 ToF 像素的聚合距离（欧式距离）”，用于鼠标悬停显示
         dmap_flat = np.zeros((TOF_H * TOF_W,), dtype=np.float32)
 
         if n_all > 0 and pts.shape[0] == n_all:
@@ -307,7 +310,8 @@ def main():
             if np.any(m):
                 uu = u[m].astype(np.float32, copy=False)
                 vv = v[m].astype(np.float32, copy=False)
-                x_lidar = pts[:, 0].astype(np.float32, copy=False)[m]
+                pts_m = pts[m].astype(np.float32, copy=False)
+                dist_lidar = np.sqrt(np.sum(pts_m * pts_m, axis=1, dtype=np.float32)).astype(np.float32, copy=False)
 
                 ui = np.clip(np.floor(uu).astype(np.int32, copy=False), 0, TOF_W - 1)
                 vi = np.clip(np.floor(vv).astype(np.int32, copy=False), 0, TOF_H - 1)
@@ -317,7 +321,7 @@ def main():
                 pix = (vi * TOF_W + ui).astype(np.int32, copy=False)
                 order = np.argsort(pix, kind="stable")
                 pix_s = pix[order]
-                x_s = x_lidar[order].astype(np.float32, copy=False)
+                d_s = dist_lidar[order].astype(np.float32, copy=False)
 
                 if pix_s.size > 0:
                     cuts = np.flatnonzero(pix_s[1:] != pix_s[:-1]) + 1
@@ -326,7 +330,7 @@ def main():
                     grp_ids = pix_s[starts]
 
                     for gid, s, e in zip(grp_ids.tolist(), starts.tolist(), ends.tolist()):
-                        vals = x_s[int(s) : int(e)]
+                        vals = d_s[int(s) : int(e)]
                         n = int(vals.size)
                         if n <= 0:
                             continue
@@ -339,9 +343,6 @@ def main():
                             nearest = np.partition(vals, k - 1)[:k]
 
                         d = float(np.mean(nearest))
-                        # 不做任何近/远裁剪；仅保证 d>0 才写入
-                        if not (d > 0.0):
-                            continue
                         u8map_flat[int(gid)] = np.clip(np.rint(255.0 / d), 0.0, 255.0).astype(np.uint8)
                         dmap_flat[int(gid)] = float(d)
 
