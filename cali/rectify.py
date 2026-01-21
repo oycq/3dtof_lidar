@@ -52,7 +52,7 @@ TOF_SHOW_H = 300  # ToF 显示高度
 TOF_MIN_PEAK = 100  # ToF 最小峰值计数，用于过滤
 TOF_INTEN_GAMMA = 2.2  # ToF 强度 gamma 校正值
 TOF_INTEN_TARGET_MEAN = 0.18  # ToF 强度目标均值，用于归一化
-TOF_TOP_FRAC = 0.10  # 聚合时取最近的百分比（10%）
+TOF_TOP_FRAC = 0.2  # 聚合时取最近的百分比（10%）
 
 # 其他常量
 TITLE_H = 26  # 标题栏高度
@@ -235,7 +235,7 @@ def project_lidar_to_tof(pts_lidar_xyz: np.ndarray, calib: Dict[str, np.ndarray]
 
 def aggregate_lidar_to_tof_pixels(uv: np.ndarray, zc: np.ndarray, pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
-    聚合: 同一 ToF 像素内多个点, 取最近的前 TOF_TOP_FRAC 点再求均值
+    聚合: 同一 ToF 像素内多个点, 取按欧式距离排序后第 TOF_TOP_FRAC 分位处的那个距离值
     - 自动选择前方 Z 符号
     - 使用 argsort 和 partition 高效处理分组和选择最近点
     返回 u8map (30,40) 和 dmap (30,40)
@@ -277,9 +277,10 @@ def aggregate_lidar_to_tof_pixels(uv: np.ndarray, zc: np.ndarray, pts: np.ndarra
         n = vals.size
         if n == 0:
             continue
+        # 取排序后第 ceil(n*TOF_TOP_FRAC) 小的那个值（一个值，不是均值）
         k = max(1, int(np.ceil(n * TOF_TOP_FRAC)))
-        nearest = vals if k >= n else np.partition(vals, k - 1)[:k]
-        d = np.mean(nearest)
+        k_idx = min(n - 1, k - 1)  # 0-based
+        d = float(np.partition(vals, k_idx)[k_idx])
         u8map_flat[gid] = np.clip(np.rint(255.0 / d), 0, 255).astype(np.uint8)
         dmap_flat[gid] = d
 
