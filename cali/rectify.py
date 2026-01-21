@@ -36,8 +36,6 @@ LIDAR_IMG_W = 700
 LIDAR_IMG_H = 700
 FOV_DEG = 70.0
 HALF_FOV = float(np.deg2rad(FOV_DEG / 2.0))
-LIDAR_VIS_MAX_RANGE_M = 20.0
-LIDAR_NEAR_SAT_M = 1.0
 
 # ToF 显示参数(与 cali/check.py 对齐)
 TOF_W = 40
@@ -92,7 +90,16 @@ def load_points(npz_path):
     z = np.asarray(d["z"], dtype=np.float32)
     if x.size == 0:
         return np.zeros((0, 3), dtype=np.float32)
-    return np.column_stack([x, y, z]).astype(np.float32, copy=False)
+    pts = np.column_stack([x, y, z]).astype(np.float32, copy=False)
+
+    # 删除 LiDAR 中“距离=0”的坏点（通常为 (0,0,0)），避免干扰投影/聚合结果
+    # 同时丢弃非有限值（nan/inf）
+    finite = np.isfinite(pts).all(axis=1)
+    # 距离=0：用范数判断更稳健
+    eps2 = np.float32(1e-12)
+    dist2 = np.sum(pts * pts, axis=1, dtype=np.float32)
+    good = finite & (dist2 > eps2)
+    return pts[good]
 
 
 def tof_intensity_to_u8(intensity_sum):
@@ -132,7 +139,7 @@ def render_lidar_gray(points_xyz):
     if x.size == 0:
         return np.zeros((LIDAR_IMG_H, LIDAR_IMG_W), dtype=np.uint8)
 
-    depth_m = np.clip(x.astype(np.float32, copy=False), float(LIDAR_NEAR_SAT_M), float(LIDAR_VIS_MAX_RANGE_M))
+    depth_m = x.astype(np.float32, copy=False)
     depth_u8 = np.clip(np.rint(255.0 / depth_m), 0.0, 255.0).astype(np.uint8)
 
     col = ((HALF_FOV - yaw) / (2.0 * HALF_FOV) * (LIDAR_IMG_W - 1)).astype(np.int32)
@@ -301,7 +308,6 @@ def main():
                 uu = u[m].astype(np.float32, copy=False)
                 vv = v[m].astype(np.float32, copy=False)
                 x_lidar = pts[:, 0].astype(np.float32, copy=False)[m]
-                x_lidar = np.clip(x_lidar, float(LIDAR_NEAR_SAT_M), float(LIDAR_VIS_MAX_RANGE_M))
 
                 ui = np.clip(np.floor(uu).astype(np.int32, copy=False), 0, TOF_W - 1)
                 vi = np.clip(np.floor(vv).astype(np.int32, copy=False), 0, TOF_H - 1)
@@ -333,7 +339,9 @@ def main():
                             nearest = np.partition(vals, k - 1)[:k]
 
                         d = float(np.mean(nearest))
-                        d = float(np.clip(d, float(LIDAR_NEAR_SAT_M), float(LIDAR_VIS_MAX_RANGE_M)))
+                        # 不做任何近/远裁剪；仅保证 d>0 才写入
+                        if not (d > 0.0):
+                            continue
                         u8map_flat[int(gid)] = np.clip(np.rint(255.0 / d), 0.0, 255.0).astype(np.uint8)
                         dmap_flat[int(gid)] = float(d)
 
