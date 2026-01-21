@@ -51,6 +51,24 @@ TOF_INTEN_TARGET_MEAN = 0.18
 TITLE_H = 26
 
 
+def _tof_disp_xy_to_pixel(dx: int, dy: int, *, show_w: int, show_h: int) -> tuple[int, int]:
+    """
+    把“显示窗口中的坐标”(已 resize 后的像素)映射回 ToF 40x30 像素坐标。
+    注意：rectify.py 的 ToF 显示同样做了 flipV(上下翻转)。
+
+    返回:
+      (px, py): 原始 ToF 像素坐标（未翻转的 py）
+    """
+    sw = int(max(show_w, 1))
+    sh = int(max(show_h, 1))
+    px = int(dx * TOF_W / sw)
+    py_disp = int(dy * TOF_H / sh)  # 显示坐标中的行
+    px = int(np.clip(px, 0, TOF_W - 1))
+    py_disp = int(np.clip(py_disp, 0, TOF_H - 1))
+    py = (TOF_H - 1) - py_disp  # 还原 flipV
+    return px, py
+
+
 def list_env_dirs(root):
     # 列出所有场景目录, 按目录名排序
     if not root.exists():
@@ -238,6 +256,17 @@ def main():
 
     cv2.namedWindow("VIEW", cv2.WINDOW_AUTOSIZE)
 
+    # 鼠标悬停：用于右下角投影图显示“距离”
+    mouse_state: dict = {"x": 0, "y": 0}
+
+    def _on_mouse(event: int, x: int, y: int, flags: int, userdata: object) -> None:
+        if int(event) != int(cv2.EVENT_MOUSEMOVE):
+            return
+        mouse_state["x"] = int(x)
+        mouse_state["y"] = int(y)
+
+    cv2.setMouseCallback("VIEW", _on_mouse)
+
     scene_cache = {}
 
     def compute_scene(env):
@@ -258,6 +287,8 @@ def main():
         n_z_neg = int(np.count_nonzero(zc < -1e-6)) if n_all > 0 else 0
 
         u8map_flat = np.zeros((TOF_H * TOF_W,), dtype=np.uint8)
+        # 记录“每个 ToF 像素的聚合距离（x 距离）”，用于鼠标悬停显示
+        dmap_flat = np.zeros((TOF_H * TOF_W,), dtype=np.float32)
 
         if n_all > 0 and pts.shape[0] == n_all:
             u = uv[:, 0]
@@ -304,8 +335,10 @@ def main():
                         d = float(np.mean(nearest))
                         d = float(np.clip(d, float(LIDAR_NEAR_SAT_M), float(LIDAR_VIS_MAX_RANGE_M)))
                         u8map_flat[int(gid)] = np.clip(np.rint(255.0 / d), 0.0, 255.0).astype(np.uint8)
+                        dmap_flat[int(gid)] = float(d)
 
         u8map = u8map_flat.reshape((TOF_H, TOF_W))
+        dmap = dmap_flat.reshape((TOF_H, TOF_W))
         u8_big = cv2.resize(u8map, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
         u8_big = cv2.flip(u8_big, 0)
         proj_full_color = cv2.applyColorMap(u8_big, cv2.COLORMAP_TURBO)
@@ -315,6 +348,7 @@ def main():
             "lidar_bgr": lidar_bgr,
             "tof_reflect": tof_reflect,
             "proj_full_color": proj_full_color,
+            "proj_dmap_m": dmap,  # (30,40) float32, 单位 m（无点为 0）
         }
 
     idx = 0
@@ -330,6 +364,7 @@ def main():
         lidar_bgr = cached["lidar_bgr"]
         tof_reflect = cached["tof_reflect"]
         proj_full_color = cached["proj_full_color"]
+        proj_dmap_m = cached.get("proj_dmap_m", None)
 
         # 只在点云图上叠加文字, 避免遮挡右侧分析用图像
         lidar_show = lidar_bgr.copy()
@@ -346,8 +381,34 @@ def main():
         right_bottom_src = proj_full_color if bottom_show_proj else tof_reflect
         right_bottom = resize_keep_aspect_to_h(right_bottom_src, bot_h, cv2=cv2)
 
+        # --- 鼠标悬停距离：仅对右下角“投影图”生效 ---
+        hover_txt = ""
+        if bool(bottom_show_proj) and isinstance(proj_dmap_m, np.ndarray) and proj_dmap_m.size:
+            # view 拼接后：右侧起点 x = lidar_show.width；右上高度 = right_top(with header).height
+            view_x0 = int(lidar_show.shape[1])
+            # right_top 还没加 header，这里先算加 header 后高度
+            right_top_h_total = int(right_top.shape[0] + header_h)
+
+            mx = int(mouse_state.get("x", 0))
+            my = int(mouse_state.get("y", 0))
+
+            # 右下角内容区域（不含 header）：(view_x0 .. view_x0+right_bottom.w, right_top_h_total+header_h .. +right_bottom.h)
+            if (mx >= view_x0) and (mx < view_x0 + int(right_bottom.shape[1])):
+                yy0 = int(right_top_h_total + header_h)
+                yy1 = int(right_top_h_total + header_h + int(right_bottom.shape[0]))
+                if (my >= yy0) and (my < yy1):
+                    dx = int(mx - view_x0)
+                    dy = int(my - yy0)
+                    px, py = _tof_disp_xy_to_pixel(dx, dy, show_w=int(right_bottom.shape[1]), show_h=int(right_bottom.shape[0]))
+                    d = float(proj_dmap_m[py, px])
+                    if d > 0.0:
+                        hover_txt = f" | hover=({px},{py}) {d:.3f}m"
+                    else:
+                        hover_txt = f" | hover=({px},{py}) --"
+
         right_top = with_header(right_top, "TOF REFLECT", header_h, cv2=cv2)
-        right_bottom = with_header(right_bottom, "LIAR" if bottom_show_proj else "TOF REFLECT", header_h, cv2=cv2)
+        right_bottom_title = ("LIDAR PROJ" if bottom_show_proj else "TOF REFLECT") + hover_txt
+        right_bottom = with_header(right_bottom, right_bottom_title, header_h, cv2=cv2)
 
         # 右侧上下两张补齐到同一宽度
         rw = int(max(right_top.shape[1], right_bottom.shape[1]))
