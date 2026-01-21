@@ -373,6 +373,67 @@ def compute_scene(env: Path, calib: Dict[str, np.ndarray]) -> Dict[str, np.ndarr
     }
 
 
+def _win_message_box(title: str, msg: str) -> None:
+    """Windows 下弹一个提示框；失败时静默忽略。"""
+    try:
+        ctypes.windll.user32.MessageBoxW(0, str(msg), str(title), 0x00000000)
+    except Exception:
+        pass
+
+
+def export_all_scenes_to_train_data(envs: List[Path], calib: Dict[str, np.ndarray], out_dir: Path) -> None:
+    """
+    导出所有场景到 train_data：
+    - input_00001.npy: ToF 原始直方图 (H,W,C) float32
+    - output_00001.npy: 聚合后的 LiDAR 距离图 (H,W) float32，单位米，无点为 0
+
+    说明：
+    - 场景顺序：按 envs 列表顺序（已按目录名排序）
+    - 每个场景都会产出一对文件；若某文件缺失，则写入全 0 占位
+    """
+    # 先删再建
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 预分配“缺失时”的占位数组
+    empty_in = np.zeros((TOF_H, TOF_W, 64), dtype=np.float32)
+    empty_out = np.zeros((TOF_H, TOF_W), dtype=np.float32)
+
+    total = len(envs)
+    for i, env in enumerate(envs, start=1):
+        # ToF input
+        tof_path = env / "tof.raw"
+        if tof_path.exists():
+            # tof_histograms 返回 uint16，这里转 float32 作为训练输入
+            hists = tof_histograms(tof_path, params=ToF3DParams()).astype(np.float32, copy=False)
+            if hists.shape != (TOF_H, TOF_W, 64):
+                # 防御：遇到异常形状则写占位
+                hists = empty_in
+        else:
+            hists = empty_in
+
+        # LiDAR output
+        npz = find_points_npz(env)
+        if npz and npz.exists():
+            pts = load_points(npz)
+            uv, zc = project_lidar_to_tof(pts, calib)
+            _, dmap = aggregate_lidar_to_tof_pixels(uv, zc, pts)
+            if dmap.shape != (TOF_H, TOF_W):
+                dmap = empty_out
+        else:
+            dmap = empty_out
+
+        in_path = out_dir / f"input_{i:05d}.npy"
+        out_path = out_dir / f"output_{i:05d}.npy"
+        np.save(str(in_path), hists.astype(np.float32, copy=False))
+        np.save(str(out_path), dmap.astype(np.float32, copy=False))
+
+        # 控制台进度（导出多场景时可见）
+        if (i == 1) or (i == total) or (i % 25 == 0):
+            print(f"[export train_data] {i}/{total} {env.name}")
+
+
 def main() -> int:
     """
     主函数:
@@ -505,6 +566,13 @@ def main() -> int:
             idx = (idx + 1) % len(envs)
         elif k == ord(" "):  # Space
             bottom_show_proj = not bottom_show_proj
+        elif k == ord("9"):  # Export all scenes to train_data
+            out_dir = ROOT / "train_data"
+            try:
+                export_all_scenes_to_train_data(envs, calib, out_dir)
+                _win_message_box("导出完成", f"已导出 {len(envs)} 组数据到:\n{out_dir}")
+            except Exception as e:
+                _win_message_box("导出失败", str(e))
 
     cv2.destroyAllWindows()
     return 0
