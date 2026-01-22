@@ -34,7 +34,7 @@ from net import Network
 
 
 # 固定配置（不从命令行读取）
-EPOCHS = 500
+EPOCHS = 100
 LR = 2e-3
 EPS = 1e-6
 BATCH_SIZE = 1  # 为了“每一次 loss 都打印”，默认用 1

@@ -26,18 +26,18 @@ class Network(nn.Module):
     def __init__(self, in_channels: int = 64):
         super().__init__()
 
-        # 3x3 卷积逐步降通道：64 -> ... -> 2
+        # 1x1 卷积逐步降通道：64 -> ... -> 2
         # 不下采样，保持 (H,W) 不变
         channels = [in_channels, 48, 32, 24, 16, 8, 4, 2]
         layers: list[nn.Module] = []
         for i in range(len(channels) - 2):
             layers.append(
-                nn.Conv2d(channels[i], channels[i + 1], kernel_size=3, stride=1, padding=1, bias=True)
+                nn.Conv2d(channels[i], channels[i + 1], kernel_size=1, stride=1, padding=0, bias=True)
             )
             layers.append(nn.ReLU(inplace=True))
 
         # 最后一层输出 2 通道（inv_depth 与 prob 的 logits）
-        layers.append(nn.Conv2d(channels[-2], channels[-1], kernel_size=3, stride=1, padding=1, bias=True))
+        layers.append(nn.Conv2d(channels[-2], channels[-1], kernel_size=1, stride=1, padding=0, bias=True))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
