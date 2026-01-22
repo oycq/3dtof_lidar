@@ -90,9 +90,11 @@ def _render_input_intensity_u8(hists: np.ndarray) -> np.ndarray:
 
 
 def _colorize_depth(depth_m: np.ndarray) -> np.ndarray:
-    """(H,W) depth(m) -> BGR (near red, far blue), 0 为黑.
+    """(H,W) depth(m) -> BGR (near red, far blue), 0 为黑。
 
-    实现：用 inv_depth = 1/depth 做归一化，再用 JET（低=蓝，高=红）。
+    注意：这个函数会“自适应”本张图的动态范围（vmin/vmax），因此如果要让
+    GT 和 PRED 使用同一套色彩映射，请改用 `_colorize_depth_with_range`，
+    并用 GT 计算出来的 (vmin,vmax) 去给 PRED 上色。
     """
     import cv2  # type: ignore
 
@@ -106,6 +108,44 @@ def _colorize_depth(depth_m: np.ndarray) -> np.ndarray:
     iv = inv[valid]
     vmin = float(np.min(iv))
     vmax = float(np.max(iv))
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
+
+    u8 = np.zeros((TOF_H, TOF_W), dtype=np.uint8)
+    u8[valid] = np.clip(np.rint((inv[valid] - vmin) / (vmax - vmin) * 255.0), 0, 255).astype(np.uint8)
+    bgr = cv2.applyColorMap(u8, cv2.COLORMAP_JET)
+    bgr[~valid] = (0, 0, 0)
+    return bgr
+
+
+def _inv_depth_range_from_depth(depth_m: np.ndarray) -> tuple[float, float] | None:
+    """从 depth(m) 计算 inv_depth 的 (vmin,vmax)；无有效像素返回 None。"""
+    d = np.asarray(depth_m, dtype=np.float32)
+    valid = d > 0
+    if not np.any(valid):
+        return None
+    inv_v = 1.0 / np.clip(d[valid], EPS, np.inf)
+    vmin = float(np.min(inv_v))
+    vmax = float(np.max(inv_v))
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
+    return vmin, vmax
+
+
+def _colorize_depth_with_range(depth_m: np.ndarray, inv_vmin: float, inv_vmax: float) -> np.ndarray:
+    """用指定的 inv_depth 范围给 depth(m) 上色（GT/PRED 统一色彩系统用）。"""
+    import cv2  # type: ignore
+
+    d = np.asarray(depth_m, dtype=np.float32)
+    valid = d > 0
+    if not np.any(valid):
+        return np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
+
+    inv = np.zeros_like(d, dtype=np.float32)
+    inv[valid] = 1.0 / np.clip(d[valid], EPS, np.inf)
+
+    vmin = float(inv_vmin)
+    vmax = float(inv_vmax)
     if vmax <= vmin:
         vmax = vmin + 1e-6
 
@@ -263,8 +303,15 @@ def main() -> int:
         in_bgr = cv2.cvtColor(in_big, cv2.COLOR_GRAY2BGR)
 
         # GT / PRED / PROB
-        gt_bgr = _colorize_depth(cached_gt)
-        pred_bgr = _colorize_depth(cached_pred_depth)
+        # 关键：以 GT 的动态范围建立“距离→颜色”映射系统，PRED 跟随同一套映射
+        inv_range = _inv_depth_range_from_depth(cached_gt)
+        if inv_range is None:
+            gt_bgr = np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
+            pred_bgr = np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
+        else:
+            inv_vmin, inv_vmax = inv_range
+            gt_bgr = _colorize_depth_with_range(cached_gt, inv_vmin, inv_vmax)
+            pred_bgr = _colorize_depth_with_range(cached_pred_depth, inv_vmin, inv_vmax)
         prob_bgr = _colorize_prob(cached_prob, valid)
 
         gt_big = cv2.flip(cv2.resize(gt_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST), 0)
