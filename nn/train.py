@@ -18,6 +18,8 @@ nn/train.py
 Loss：
 - inv_depth 的 L2（MSE）占 90%
 - prob 的熵（BCE）占 10%
+
+2026-01：全量 batch 训练（把所有样本堆成一个“大 patch”一次训完），训练 100 次。
 """
 
 from __future__ import annotations
@@ -34,11 +36,10 @@ from net import Network
 
 
 # 固定配置（不从命令行读取）
-EPOCHS = 100
+EPOCHS = 1000
 LR = 2e-3
 EPS = 1e-6
-BATCH_SIZE = 1  # 为了“每一次 loss 都打印”，默认用 1
-SHUFFLE = True
+SHUFFLE = False  # 全量 batch 下打乱只有“batch 内顺序变化”，对本网络通常无意义
 
 H, W, C = 30, 40, 64
 
@@ -75,6 +76,22 @@ def to_torch_target_depth(y_hw: np.ndarray, device: torch.device) -> torch.Tenso
     return t.to(device=device, dtype=torch.float32)
 
 
+def stack_all_pairs(pairs: List[Tuple[Path, Path]], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """把所有样本堆成一个大 batch：
+    - inp: (N,C,H,W)
+    - gt:  (N,1,H,W)
+    """
+    xs: list[torch.Tensor] = []
+    gts: list[torch.Tensor] = []
+    for ip, op in pairs:
+        x, gt_depth = load_pair(ip, op)
+        xs.append(to_torch_input(x, device).squeeze(0))  # (C,H,W)
+        gts.append(to_torch_target_depth(gt_depth, device).squeeze(0))  # (1,H,W)
+    inp = torch.stack(xs, dim=0).contiguous()
+    gt = torch.stack(gts, dim=0).contiguous()
+    return inp, gt
+
+
 def main() -> int:
     here = Path(__file__).resolve().parent
     train_dir = here / "train_data"
@@ -92,57 +109,64 @@ def main() -> int:
     net = Network(in_channels=C).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=LR)
 
-    # 简单打乱索引
-    idxs = np.arange(len(pairs))
+    # 全量 batch：一次性加载并堆叠
+    t_load0 = time.time()
+    try:
+        inp_all, gt_all = stack_all_pairs(pairs, device)
+    except RuntimeError as e:
+        raise RuntimeError(
+            "Failed to stack all training data into one big batch (possibly OOM). "
+            "Try: run on CPU or reduce files under nn/train_data."
+        ) from e
+    dt_load = time.time() - t_load0
+    print(f"[batch] inp={tuple(inp_all.shape)} gt={tuple(gt_all.shape)}  (load+stack {dt_load:.2f}s)")
 
     step = 0
     t0 = time.time()
     for ep in range(EPOCHS):
-        if SHUFFLE:
-            np.random.shuffle(idxs)
+        if SHUFFLE and inp_all.shape[0] > 1:
+            perm = torch.randperm(inp_all.shape[0], device=inp_all.device)
+            inp = inp_all[perm]
+            gt = gt_all[perm]
+        else:
+            inp = inp_all
+            gt = gt_all
 
-        for ii in idxs:
-            ip, op = pairs[int(ii)]
-            x, gt_depth = load_pair(ip, op)
+        net.train()
+        out = net(inp)  # (N,2,H,W)
+        pred_inv = out[:, 0:1, :, :]  # (N,1,H,W) >=0
+        pred_prob = out[:, 1:2, :, :]  # (N,1,H,W) 0~1
 
-            inp = to_torch_input(x, device)
-            gt = to_torch_target_depth(gt_depth, device)
+        valid = (gt > 0).to(dtype=torch.float32)
+        denom = torch.clamp(valid.sum(), min=1.0)
 
-            net.train()
-            out = net(inp)  # (1,2,H,W)
-            pred_inv = out[:, 0:1, :, :]  # (1,1,H,W) >=0
-            pred_prob = out[:, 1:2, :, :]  # (1,1,H,W) 0~1
+        # --- 1) inv_depth 的 L2（只在有效像素上算）---
+        gt_inv = torch.zeros_like(gt)
+        gt_inv[gt > 0] = 1.0 / torch.clamp(gt[gt > 0], min=EPS)
+        l2 = (((pred_inv - gt_inv) ** 2) * valid).sum() / denom
 
-            valid = (gt > 0).to(dtype=torch.float32)
-            denom = torch.clamp(valid.sum(), min=1.0)
+        # --- 2) prob 的熵（BCE）---
+        # 用当前距离预测是否在 ±5% 内来构造监督标签（注意 detach，避免反向影响距离分支）
+        pred_depth_detached = 1.0 / torch.clamp(pred_inv.detach(), min=EPS)
+        within = (torch.abs(pred_depth_detached - gt) <= (0.05 * gt)).to(dtype=torch.float32)
+        prob_label = within * valid  # 无效像素 label=0，且会被 mask 掉
 
-            # --- 1) inv_depth 的 L2（只在有效像素上算）---
-            gt_inv = torch.zeros_like(gt)
-            gt_inv[gt > 0] = 1.0 / torch.clamp(gt[gt > 0], min=EPS)
-            l2 = (((pred_inv - gt_inv) ** 2) * valid).sum() / denom
+        bce_map = F.binary_cross_entropy(pred_prob, prob_label, reduction="none")
+        bce = (bce_map * valid).sum() / denom
 
-            # --- 2) prob 的熵（BCE）---
-            # 用当前距离预测是否在 ±5% 内来构造监督标签（注意 detach，避免反向影响距离分支）
-            pred_depth_detached = 1.0 / torch.clamp(pred_inv.detach(), min=EPS)
-            within = (torch.abs(pred_depth_detached - gt) <= (0.05 * gt)).to(dtype=torch.float32)
-            prob_label = within * valid  # 无效像素 label=0，且会被 mask 掉
+        loss = 0.999 * l2 + 0.001 * bce
 
-            bce_map = F.binary_cross_entropy(pred_prob, prob_label, reduction="none")
-            bce = (bce_map * valid).sum() / denom
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
 
-            loss = 0.9 * l2 + 0.1 * bce
-
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-
-            step += 1
-            dt = time.time() - t0
-            print(
-                f"[ep {ep+1:03d}/{EPOCHS}] step {step:06d}  "
-                f"loss={loss.item():.6f}  l2={l2.item():.6f}  bce={bce.item():.6f}  "
-                f"({dt:.1f}s)  {ip.name}"
-            )
+        step += 1
+        dt = time.time() - t0
+        print(
+            f"[ep {ep+1:03d}/{EPOCHS}] step {step:06d}  "
+            f"loss={loss.item():.6f}  l2={l2.item():.6f}  bce={bce.item():.6f}  "
+            f"({dt:.1f}s)  batch=N={inp.shape[0]}"
+        )
 
     # 训练完保存一份
     ckpt = here / "model_last.pt"
