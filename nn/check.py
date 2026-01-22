@@ -256,6 +256,8 @@ def main() -> int:
         print(f"[warn] missing checkpoint: {ckpt_path} (use random weights)")
 
     cv2.namedWindow("CHECK_TRAIN", cv2.WINDOW_AUTOSIZE)
+    # 置信度阈值滑动条：低于该阈值的像素，PRED 直接置黑不显示
+    cv2.createTrackbar("conf%", "CHECK_TRAIN", 50, 100, lambda _: None)
 
     mouse = {"x": 0, "y": 0}
 
@@ -296,6 +298,7 @@ def main() -> int:
         assert cached_in is not None and cached_gt is not None and cached_pred_depth is not None and cached_prob is not None
 
         valid = cached_gt > 0
+        conf_thr = float(cv2.getTrackbarPos("conf%", "CHECK_TRAIN")) / 100.0
         # INPUT intensity
         inten_u8 = _render_input_intensity_u8(cached_in)
         in_big = cv2.resize(inten_u8, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
@@ -312,6 +315,13 @@ def main() -> int:
             inv_vmin, inv_vmax = inv_range
             gt_bgr = _colorize_depth_with_range(cached_gt, inv_vmin, inv_vmax)
             pred_bgr = _colorize_depth_with_range(cached_pred_depth, inv_vmin, inv_vmax)
+
+        # conf 过滤：低置信度像素不显示（置黑）
+        conf_mask = cached_prob >= conf_thr
+        if np.any(~conf_mask):
+            pred_bgr = pred_bgr.copy()
+            pred_bgr[~conf_mask] = (0, 0, 0)
+
         prob_bgr = _colorize_prob(cached_prob, valid)
 
         gt_big = cv2.flip(cv2.resize(gt_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST), 0)
@@ -329,7 +339,11 @@ def main() -> int:
         pr_v = float(cached_pred_depth[py, px])
         pb_v = float(np.clip(cached_prob[py, px], 0.0, 1.0))
         # 仅显示三项，且全 ASCII，避免 putText 乱码
-        hover_txt = f"pred {pr_v:.3f}  gt {gt_v:.3f}  prob {pb_v:.2f}" if gt_v > 0 else f"pred {pr_v:.3f}  gt --  prob {pb_v:.2f}"
+        hover_txt = (
+            f"pred {pr_v:.3f}  gt {gt_v:.3f}  prob {pb_v:.2f}  conf_thr {conf_thr:.2f}"
+            if gt_v > 0
+            else f"pred {pr_v:.3f}  gt --  prob {pb_v:.2f}  conf_thr {conf_thr:.2f}"
+        )
 
         # 单窗口拼图，更方便截图
         in_bgr = _with_text(in_bgr, "INPUT")
