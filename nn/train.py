@@ -40,6 +40,11 @@ LR = 2e-3
 EPS = 1e-6
 SHUFFLE = False  # 全量 batch 下打乱只有“batch 内顺序变化”，对本网络通常无意义
 
+# 是否使用 CUDA（不从命令行读取）
+# - True: 若本机有可用 CUDA，则使用 GPU；否则自动回退到 CPU（会打印提示）
+# - False: 强制使用 CPU
+USE_CUDA = True
+
 H, W, C = 30, 40, 64
 
 
@@ -101,7 +106,10 @@ def main() -> int:
     if not pairs:
         raise FileNotFoundError(f"no input/output pairs found under: {train_dir}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    cuda_ok = torch.cuda.is_available()
+    if USE_CUDA and not cuda_ok:
+        print("[device] USE_CUDA=True but torch.cuda.is_available()=False, fallback to CPU.")
+    device = torch.device("cuda" if (USE_CUDA and cuda_ok) else "cpu")
     print(f"[device] {device}")
     print(f"[data] {train_dir}  pairs={len(pairs)}")
 
