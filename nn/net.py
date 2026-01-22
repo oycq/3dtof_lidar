@@ -8,11 +8,10 @@ nn/net.py
 - 输入：ToF 直方图  (B, 64, H, W) 其中 H=30, W=40
 - 输出：            (B,  2, H, W)
   - out[:,0] = 距离倒数（inv_depth，>=0）
-  - out[:,1] = 概率（prob，0~1），表示“当前距离预测与真值相差在 ±5% 内”的概率
+  - out[:,1] = 高斯分布尺度（sigma，>0），表示以 inv_depth 为均值的观测噪声尺度
 
 训练 loss（在 train.py 实现）：
-- L2(inv_depth)  占 90%
-- 熵（BCE(prob)）占 10%
+- GT(inv_depth) 在 N(mu=pred_inv_depth, sigma) 下的负对数似然（-log 概率 / “熵”）
 """
 
 from __future__ import annotations
@@ -36,7 +35,7 @@ class Network(nn.Module):
             )
             layers.append(nn.ReLU(inplace=True))
 
-        # 最后一层输出 2 通道（inv_depth 与 prob 的 logits）
+        # 最后一层输出 2 通道（inv_depth 与 sigma 的 raw 输出）
         layers.append(nn.Conv2d(channels[-2], channels[-1], kernel_size=1, stride=1, padding=0, bias=True))
         self.net = nn.Sequential(*layers)
 
@@ -45,12 +44,12 @@ class Network(nn.Module):
         x: (B,64,H,W)
         return: (B,2,H,W)，其中
           - out[:,0] 已经过 softplus，保证非负
-          - out[:,1] 已经过 sigmoid，落在 0~1
+          - out[:,1] 已经过 softplus，保证为正（sigma）
         """
         y = self.net(x)  # (B,2,H,W)
         inv_depth = F.softplus(y[:, 0:1, :, :])
-        prob = torch.sigmoid(y[:, 1:2, :, :])
-        return torch.cat([inv_depth, prob], dim=1)
+        sigma = F.softplus(y[:, 1:2, :, :])
+        return torch.cat([inv_depth, sigma], dim=1)
 
 
 if __name__ == "__main__":

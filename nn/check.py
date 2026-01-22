@@ -13,12 +13,13 @@ check_train_effect.py
 - cv2.imshow
 - 4/6 切换样本，ESC 退出
 - ToF 强度与深度图做 resize + flipV 以对齐项目里的显示习惯
-- 鼠标悬停显示：pred/gt/prob（三个值，单行 ASCII，避免 cv2 putText 乱码）
+- 鼠标悬停显示：pred/gt/sigma（三个值，单行 ASCII，避免 cv2 putText 乱码）
 """
 
 from __future__ import annotations
 
 import sys
+import math
 from pathlib import Path
 from typing import List, Tuple
 
@@ -175,7 +176,10 @@ def _colorize_error(err_m: np.ndarray, valid: np.ndarray) -> np.ndarray:
 
 
 def _colorize_prob(prob: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    """prob 0~1 -> 灰度 BGR（gamma=2.2），invalid 为黑。"""
+    """0~1 的标量图 -> 灰度 BGR（gamma=2.2），invalid 为黑。
+
+    历史上这里用于显示 prob；现在用于显示 “P(gt 在 pred±5% 区间)” 的概率图。
+    """
     p = np.asarray(prob, dtype=np.float32)
     m = valid.astype(bool)
 
@@ -256,8 +260,9 @@ def main() -> int:
         print(f"[warn] missing checkpoint: {ckpt_path} (use random weights)")
 
     cv2.namedWindow("CHECK_TRAIN", cv2.WINDOW_AUTOSIZE)
-    # 置信度阈值滑动条：低于该阈值的像素，PRED 直接置黑不显示
-    cv2.createTrackbar("conf%", "CHECK_TRAIN", 50, 100, lambda _: None)
+    # 概率阈值滑动条：低于该阈值的像素，PRED 直接置黑不显示
+    # 概率 = 在 N(mu=pred_inv_depth, sigma) 下，真值落在 “pred_depth ±5%” 区间的积分概率
+    cv2.createTrackbar("pThr%", "CHECK_TRAIN", 50, 100, lambda _: None)
 
     mouse = {"x": 0, "y": 0}
 
@@ -274,6 +279,7 @@ def main() -> int:
     cached_in: np.ndarray | None = None
     cached_gt: np.ndarray | None = None
     cached_pred_depth: np.ndarray | None = None
+    cached_sigma: np.ndarray | None = None
     cached_prob: np.ndarray | None = None
 
     while True:
@@ -287,25 +293,44 @@ def main() -> int:
                 inp = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
                 out = net(inp)  # (1,2,H,W)
                 pred_inv = out[:, 0:1].clamp(min=EPS)
-                pred_prob = out[:, 1:2]
+                pred_sigma = out[:, 1:2].clamp(min=EPS)
+
+                # prob = P( gt_depth in [0.95*pred_depth, 1.05*pred_depth] )
+                # 由于高斯建模在 inv_depth 空间：pred_depth = 1/mu
+                # depth 区间对应的 inv_depth 区间为 [mu/1.05, mu/0.95]
+                a = pred_inv / 1.05
+                b = pred_inv / 0.95
+                inv_s = pred_sigma.clamp(min=EPS)
+                inv_sqrt2 = 1.0 / math.sqrt(2.0)
+                cdf = lambda z: 0.5 * (1.0 + torch.erf(z * inv_sqrt2))
+                prob_t = cdf((b - pred_inv) / inv_s) - cdf((a - pred_inv) / inv_s)
+                prob_t = prob_t.clamp(0.0, 1.0)
+
                 pred_depth = (1.0 / pred_inv).squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
-                prob = pred_prob.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+                sigma = pred_sigma.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+                prob = prob_t.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
 
             cached_in, cached_gt = x, gt
-            cached_pred_depth, cached_prob = pred_depth, prob
+            cached_pred_depth, cached_sigma, cached_prob = pred_depth, sigma, prob
             cached_idx = idx
 
-        assert cached_in is not None and cached_gt is not None and cached_pred_depth is not None and cached_prob is not None
+        assert (
+            cached_in is not None
+            and cached_gt is not None
+            and cached_pred_depth is not None
+            and cached_sigma is not None
+            and cached_prob is not None
+        )
 
         valid = cached_gt > 0
-        conf_thr = float(cv2.getTrackbarPos("conf%", "CHECK_TRAIN")) / 100.0
+        p_thr = float(cv2.getTrackbarPos("pThr%", "CHECK_TRAIN")) / 100.0
         # INPUT intensity
         inten_u8 = _render_input_intensity_u8(cached_in)
         in_big = cv2.resize(inten_u8, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
         in_big = cv2.flip(in_big, 0)
         in_bgr = cv2.cvtColor(in_big, cv2.COLOR_GRAY2BGR)
 
-        # GT / PRED / PROB
+        # GT / PRED / PROB(±5%)
         # 关键：以 GT 的动态范围建立“距离→颜色”映射系统，PRED 跟随同一套映射
         inv_range = _inv_depth_range_from_depth(cached_gt)
         if inv_range is None:
@@ -316,8 +341,8 @@ def main() -> int:
             gt_bgr = _colorize_depth_with_range(cached_gt, inv_vmin, inv_vmax)
             pred_bgr = _colorize_depth_with_range(cached_pred_depth, inv_vmin, inv_vmax)
 
-        # conf 过滤：低置信度像素不显示（置黑）
-        conf_mask = cached_prob >= conf_thr
+        # 概率过滤：低概率像素不显示（置黑）
+        conf_mask = cached_prob >= p_thr
         if np.any(~conf_mask):
             pred_bgr = pred_bgr.copy()
             pred_bgr[~conf_mask] = (0, 0, 0)
@@ -337,12 +362,13 @@ def main() -> int:
         px, py = _disp_xy_to_pixel(mx - tile_x0, my - tile_y0, SHOW_W, SHOW_H)
         gt_v = float(cached_gt[py, px])
         pr_v = float(cached_pred_depth[py, px])
+        sg_v = float(max(cached_sigma[py, px], 0.0))
         pb_v = float(np.clip(cached_prob[py, px], 0.0, 1.0))
         # 仅显示三项，且全 ASCII，避免 putText 乱码
         hover_txt = (
-            f"pred {pr_v:.3f}  gt {gt_v:.3f}  prob {pb_v:.2f}  conf_thr {conf_thr:.2f}"
+            f"pred {pr_v:.3f}  gt {gt_v:.3f}  sigma {sg_v:.4f}  {pb_v:.2f}"
             if gt_v > 0
-            else f"pred {pr_v:.3f}  gt --  prob {pb_v:.2f}  conf_thr {conf_thr:.2f}"
+            else f"pred {pr_v:.3f}  gt --  sigma {sg_v:.4f}  {pb_v:.2f}"
         )
 
         # 单窗口拼图，更方便截图

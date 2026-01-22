@@ -13,24 +13,23 @@ nn/train.py
 
 网络输出（见 net.py）：
 - 通道0：inv_depth = 1/depth（>=0）
-- 通道1：prob：预测“|pred_depth - gt_depth| <= 0.05*gt_depth”的概率
+- 通道1：sigma（>0），表示以 inv_depth 为均值的高斯分布尺度（标准差）
 
 Loss：
-- inv_depth 的 L2（MSE）占 90%
-- prob 的熵（BCE）占 10%
+- 真实 inv_depth 在该高斯分布下的负对数似然（-log 概率 / “概率熵”）
 
-2026-01：全量 batch 训练（把所有样本堆成一个“大 patch”一次训完），训练 100 次。
+2026-01：全量 batch 训练（把所有样本堆成一个“大 patch”一次训完），训练轮数见 EPOCHS。
 """
 
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from net import Network
 
@@ -135,26 +134,22 @@ def main() -> int:
         net.train()
         out = net(inp)  # (N,2,H,W)
         pred_inv = out[:, 0:1, :, :]  # (N,1,H,W) >=0
-        pred_prob = out[:, 1:2, :, :]  # (N,1,H,W) 0~1
+        pred_sigma = out[:, 1:2, :, :]  # (N,1,H,W) >0
 
         valid = (gt > 0).to(dtype=torch.float32)
         denom = torch.clamp(valid.sum(), min=1.0)
 
-        # --- 1) inv_depth 的 L2（只在有效像素上算）---
+        # --- GT inv_depth（只在有效像素上算）---
         gt_inv = torch.zeros_like(gt)
         gt_inv[gt > 0] = 1.0 / torch.clamp(gt[gt > 0], min=EPS)
-        l2 = (((pred_inv - gt_inv) ** 2) * valid).sum() / denom
 
-        # --- 2) prob 的熵（BCE）---
-        # 用当前距离预测是否在 ±5% 内来构造监督标签（注意 detach，避免反向影响距离分支）
-        pred_depth_detached = 1.0 / torch.clamp(pred_inv.detach(), min=EPS)
-        within = (torch.abs(pred_depth_detached - gt) <= (0.05 * gt)).to(dtype=torch.float32)
-        prob_label = within * valid  # 无效像素 label=0，且会被 mask 掉
-
-        bce_map = F.binary_cross_entropy(pred_prob, prob_label, reduction="none")
-        bce = (bce_map * valid).sum() / denom
-
-        loss = 0.999 * l2 + 0.001 * bce
+        # --- Gaussian NLL: -log p(gt_inv | mu=pred_inv, sigma=pred_sigma) ---
+        # NLL = 0.5 * [ ((x-mu)/sigma)^2 + 2*log(sigma) + log(2π) ]
+        sigma = torch.clamp(pred_sigma, min=EPS)
+        z = (gt_inv - pred_inv) / sigma
+        nll_map = 0.5 * (z * z + 2.0 * torch.log(sigma) + math.log(2.0 * math.pi))
+        nll = (nll_map * valid).sum() / denom
+        loss = nll
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -164,7 +159,7 @@ def main() -> int:
         dt = time.time() - t0
         print(
             f"[ep {ep+1:03d}/{EPOCHS}] step {step:06d}  "
-            f"loss={loss.item():.6f}  l2={l2.item():.6f}  bce={bce.item():.6f}  "
+            f"nll={nll.item():.6f}  "
             f"({dt:.1f}s)  batch=N={inp.shape[0]}"
         )
 
