@@ -53,8 +53,8 @@ AE_MEAN_SECONDS = 2.0  # 量程平滑：用最近 N 秒的均值（更稳定，�
 # ToF 显示尺寸（与 cali/check.py 对齐）
 TOF_W = 40
 TOF_H = 30
-TOF_SHOW_W = 400
-TOF_SHOW_H = 300
+TOF_SHOW_W = 300
+TOF_SHOW_H = 400
 
 def _render_2d(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
     if x.size == 0:
@@ -133,13 +133,13 @@ def _auto_expose_u8(img: np.ndarray, st: _AutoExposeState, now_ts: float) -> np.
 def _try_save_tof_raw(dest_raw: Path) -> bool:
     """
     按 get_tof.py 的方式尝试获取 tof.raw：
-    - adb shell 触发生成 /tmp/tof.raw（通过 /tmp/sv 机制）
+    - adb shell 触发生成 /tmp/tof.raw（通过 /tmp/sv_tof 机制）
     - adb pull /tmp/tof.raw 到本地
     """
     try:
         dest_raw.parent.mkdir(parents=True, exist_ok=True)
         # 触发设备侧生成 tof.raw
-        trigger_cmd = "if [ -e /tmp/sv ]; then rm /tmp/sv && rm /tmp/tof.raw; fi && touch /tmp/sv"
+        trigger_cmd = "if [ -e /tmp/sv_tof ]; then rm /tmp/sv_tof && rm /tmp/tof.raw; fi && touch /tmp/sv_tof"
         subprocess.run(["adb", "shell", trigger_cmd], check=False, capture_output=True, text=True)
 
         # 等待设备写文件（给一点时间，避免 pull 到空文件）
@@ -264,7 +264,7 @@ def main() -> int:
             last_ts = now_ts
             cv2.setWindowTitle(
                 "LIDAR (ESC=quit)",
-                f"LIDAR | last={CAPTURE_SECONDS:.1f}s | pts={last_pts} | fov=±35° | I≈255/x(m) | "
+                f"LIDAR | last={CAPTURE_SECONDS:.1f}s | pts={last_pts} | fov=70| I≈255/x(m) | "
                 f"range=1~{MAX_RANGE_M:.0f}m | "
                 f"ae={'on' if AUTO_EXPOSURE else 'off'}(mean={AE_MEAN_SECONDS:.1f}s) | "
                 f"color={(COLORMAP_NAME if USE_COLORMAP else 'off')} | t={last_ts:.2f}",
@@ -274,8 +274,9 @@ def main() -> int:
             tof_frame = tof_srv.get_latest()
             if tof_frame is not None and isinstance(tof_frame.reflect_u8, np.ndarray) and tof_frame.reflect_u8.size:
                 inten_u8 = tof_frame.reflect_u8
+                inten_u8 = cv2.rotate(inten_u8, cv2.ROTATE_90_CLOCKWISE)
+                inten_u8 = cv2.flip(inten_u8, 1) 
                 inten_big = cv2.resize(inten_u8, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
-                inten_big = cv2.flip(inten_big, 0)  # 与 cali/check.py 对齐：显示 flipV
                 last_tof = cv2.cvtColor(inten_big, cv2.COLOR_GRAY2BGR)
                 last_tof_bytes = tof_frame.raw_bytes
 

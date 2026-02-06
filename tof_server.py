@@ -90,11 +90,11 @@ class ToFRealtimeServer:
     @staticmethod
     def _adb_trigger_generate_raw() -> bool:
         """
-        触发设备侧生成 /tmp/tof.raw（与 get_tof.py / client.py 保持一致的 /tmp/sv 机制）。
+        触发设备侧生成 /tmp/tof.raw（与 get_tof.py / client.py 保持一致的 /tmp/sv_tof 机制）。
         """
         import subprocess
 
-        cmd = "if [ -e /tmp/sv ]; then rm /tmp/sv && rm /tmp/tof.raw; fi && touch /tmp/sv"
+        cmd = "if [ -e /tmp/sv_tof ]; then rm /tmp/sv_tof && rm /tmp/tof.raw; fi && touch /tmp/sv_tof"
         try:
             r = subprocess.run(
                 ["adb", "shell", cmd],

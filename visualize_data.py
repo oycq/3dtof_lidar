@@ -6,7 +6,7 @@ visualize_data.py
 
 可视化 client.py 保存到 data/ 目录下的“环境数据”：
 - 激光雷达：读取 points_last*.npz 中的 x/y/z，使用固定 FOV 的 2D 投影渲染
-- TOF：读取 tof.raw，参考 get_tof.py 的处理逻辑计算 30*40 深度图，并拉伸到 300*400 显示
+- TOF：读取 tof.raw，参考 get_tof.py 的处理逻辑计算 30*40 深度图，显示时做“向右旋转90° + 水平翻转”，并拉伸到 400x300（高x宽）显示
 
 按键：
 - 4：上一个环境
@@ -42,8 +42,9 @@ AE_GAMMA = 0.8
 
 TOF_W = 40
 TOF_H = 30
-TOF_SHOW_W = 400
-TOF_SHOW_H = 300
+# 与 run.py 对齐：旋转 90° 后显示窗口宽高对调
+TOF_SHOW_W = 300
+TOF_SHOW_H = 400
 TOF_MIN_PEAK = 100  # 峰值低于该值认为置信度不足（标黑/深度置 0）
 TOF_VALID_BINS = 62  # 峰值/质心只看前 62 个 bin（与 get_tof.py/tof3d.py 对齐）
 
@@ -145,13 +146,16 @@ def _make_hist_image(hist: np.ndarray, x: int, y: int, depth_m: float, *, low_co
 def _tof_disp_xy_to_pixel(dx: int, dy: int) -> tuple[int, int]:
     """
     把 TOF 窗口上的坐标（已放大显示后的像素）映射回 30x40 的像素坐标。
-    注意：当前显示做了 flipV（上下翻转），这里会映射回“未翻转”的原始 (x,y)。
+    注意：当前显示做了“向右旋转90° + 水平翻转”，这里会映射回“未变换”的原始 (x,y)。
     """
-    px = int(dx * TOF_W / max(TOF_SHOW_W, 1))
-    py_disp = int(dy * TOF_H / max(TOF_SHOW_H, 1))  # 显示坐标中的行
+    # 原始: (py, px) = (row, col) = (0..TOF_H-1, 0..TOF_W-1)
+    # 变换: rot90CW + flipH 后，显示坐标对应：
+    # - display x 轴（dx） -> 变换后图像的 col -> 对应原始 py
+    # - display y 轴（dy） -> 变换后图像的 row -> 对应原始 px
+    py = int(dx * TOF_H / max(TOF_SHOW_W, 1))
+    px = int(dy * TOF_W / max(TOF_SHOW_H, 1))
     px = int(np.clip(px, 0, TOF_W - 1))
-    py_disp = int(np.clip(py_disp, 0, TOF_H - 1))
-    py = (TOF_H - 1) - py_disp  # 还原 flipV
+    py = int(np.clip(py, 0, TOF_H - 1))
     return px, py
 
 
@@ -161,9 +165,10 @@ def _tof_pixel_to_disp_xy(px: int, py: int) -> tuple[int, int]:
     """
     px = int(np.clip(px, 0, TOF_W - 1))
     py = int(np.clip(py, 0, TOF_H - 1))
-    py_disp = (TOF_H - 1) - py
-    dx = int((px + 0.5) * TOF_SHOW_W / TOF_W)
-    dy = int((py_disp + 0.5) * TOF_SHOW_H / TOF_H)
+    # 与 _tof_disp_xy_to_pixel 的变换一致（rot90CW + flipH）：
+    # 变换后图像坐标：(row, col) = (px, py)
+    dx = int((py + 0.5) * TOF_SHOW_W / TOF_H)
+    dy = int((px + 0.5) * TOF_SHOW_H / TOF_W)
     return dx, dy
 
 
@@ -362,22 +367,26 @@ def main() -> int:
             # 反射率强度：直方图所有 bin 求和（按需求 0~1023 值域 + gamma=2.2）
             inten_sum = hists.sum(axis=2).astype(np.float32, copy=False)  # (30,40)
             inten_u8 = _tof_intensity_to_u8(inten_sum)
+            # 显示方向与 run.py 对齐：向右旋转90° + 水平翻转
+            inten_u8 = cv2.rotate(inten_u8, cv2.ROTATE_90_CLOCKWISE)
+            inten_u8 = cv2.flip(inten_u8, 1)
             inten_u8_big = cv2.resize(inten_u8, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
-            inten_u8_big = cv2.flip(inten_u8_big, 0)
             if TOF_INTEN_USE_COLORMAP:
                 tof_inten_view = cv2.applyColorMap(inten_u8_big, cv2.COLORMAP_TURBO)
             else:
                 tof_inten_view = cv2.cvtColor(inten_u8_big, cv2.COLOR_GRAY2BGR)
 
             u8 = _depth_to_u8(depth)
+            u8 = cv2.rotate(u8, cv2.ROTATE_90_CLOCKWISE)
+            u8 = cv2.flip(u8, 1)
             u8_big = cv2.resize(u8, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
-            # “旋转 180° + 左右镜像”等价于“只做上下镜像”
-            u8_big = cv2.flip(u8_big, 0)
             tof_view = cv2.applyColorMap(u8_big, cv2.COLORMAP_TURBO)
 
-            # 低置信度点标黑（按同样的 resize + flipV 映射到显示坐标）
-            low_big = cv2.resize(low_conf_mask.astype(np.uint8) * 255, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
-            low_big = cv2.flip(low_big, 0)
+            # 低置信度点标黑（按同样的 rot90CW + flipH 映射到显示坐标）
+            low_u8 = low_conf_mask.astype(np.uint8) * 255
+            low_u8 = cv2.rotate(low_u8, cv2.ROTATE_90_CLOCKWISE)
+            low_u8 = cv2.flip(low_u8, 1)
+            low_big = cv2.resize(low_u8, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
             tof_view[low_big > 0] = (0, 0, 0)
 
             # hover 直方图 + 距离
