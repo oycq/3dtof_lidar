@@ -47,10 +47,11 @@ FOV_DEG = 70.0  # 视场角（度）
 HALF_FOV_RAD = np.deg2rad(FOV_DEG / 2.0)  # 半视场角（弧度）
 
 # ToF 显示参数
-TOF_W = 40  # ToF 原始宽度
-TOF_H = 30  # ToF 原始高度
-TOF_SHOW_W = 400  # ToF 显示宽度
-TOF_SHOW_H = 300  # ToF 显示高度
+TOF_W = 40  # ToF 原始宽度（像素坐标系 x 轴）
+TOF_H = 30  # ToF 原始高度（像素坐标系 y 轴）
+# 与 `cali/check.py` / `visualize_data.py` 对齐：显示做 rot90CW + flipH 后，宽高对调
+TOF_SHOW_W = 300  # ToF 显示宽度
+TOF_SHOW_H = 400  # ToF 显示高度
 TOF_MIN_PEAK = 100  # ToF 最小峰值计数，用于过滤
 TOF_INTEN_GAMMA = 2.2  # ToF 强度 gamma 校正值
 TOF_INTEN_TARGET_MEAN = 0.18  # ToF 强度目标均值，用于归一化
@@ -65,7 +66,7 @@ DIST_EPS2 = 1e-12  # 距离平方 epsilon，用于过滤零点
 def tof_disp_xy_to_pixel(dx: int, dy: int, show_w: int, show_h: int) -> Tuple[int, int]:
     """
     把“显示窗口中的坐标”(已 resize 后的像素)映射回 ToF 40x30 像素坐标。
-    注意：rectify.py 的 ToF 显示同样做了 flipV(上下翻转)。
+    注意：当前显示与 `cali/check.py` 对齐：rot90CW + flipH（等价于显示转置）。
 
     参数:
       dx, dy: 显示坐标中的 x, y
@@ -76,9 +77,9 @@ def tof_disp_xy_to_pixel(dx: int, dy: int, show_w: int, show_h: int) -> Tuple[in
     """
     sw = max(show_w, 1)
     sh = max(show_h, 1)
-    px = int(np.clip(dx * TOF_W / sw, 0, TOF_W - 1))
-    py_disp = int(np.clip(dy * TOF_H / sh, 0, TOF_H - 1))
-    py = (TOF_H - 1) - py_disp  # 还原 flipV
+    # rot90CW + flipH 后：display_x -> 原始 py；display_y -> 原始 px
+    py = int(np.clip(dx * TOF_H / sw, 0, TOF_H - 1))
+    px = int(np.clip(dy * TOF_W / sh, 0, TOF_W - 1))
     return px, py
 
 
@@ -190,7 +191,7 @@ def load_calib(calib_json: Path) -> Dict[str, np.ndarray]:
 
 def build_tof_reflect_view(env_dir: Path) -> np.ndarray:
     """
-    生成 ToF 反射率图(400x300, flipV, BGR)
+    生成 ToF 反射率图(显示尺寸, rot90CW+flipH, BGR)
     - 读取 tof.raw 文件
     - 计算每个像素的强度总和
     - 转换为 uint8 并 resize 和 flip
@@ -208,8 +209,10 @@ def build_tof_reflect_view(env_dir: Path) -> np.ndarray:
     # 反射率强度：交给 tof3d.py 的统一策略
     inten = tof_reflectance_mean3_max(hists)
     inten_u8 = tof_intensity_to_u8(inten)
+    # 显示方向与 `cali/check.py` 对齐：向右旋转90° + 水平翻转
+    inten_u8 = cv2.rotate(inten_u8, cv2.ROTATE_90_CLOCKWISE)
+    inten_u8 = cv2.flip(inten_u8, 1)
     inten_big = cv2.resize(inten_u8, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
-    inten_big = cv2.flip(inten_big, 0)
     return cv2.cvtColor(inten_big, cv2.COLOR_GRAY2BGR)
 
 
@@ -361,8 +364,10 @@ def compute_scene(env: Path, calib: Dict[str, np.ndarray]) -> Dict[str, np.ndarr
     # 投影和聚合
     uv, zc = project_lidar_to_tof(pts, calib)
     u8map, dmap = aggregate_lidar_to_tof_pixels(uv, zc, pts)
-    u8_big = cv2.resize(u8map, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
-    u8_big = cv2.flip(u8_big, 0)
+    # 显示方向与 ToF 反射率一致：rot90CW + flipH
+    u8_show = cv2.rotate(u8map, cv2.ROTATE_90_CLOCKWISE)
+    u8_show = cv2.flip(u8_show, 1)
+    u8_big = cv2.resize(u8_show, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
     proj_full_color = cv2.applyColorMap(u8_big, cv2.COLORMAP_TURBO)
     proj_full_color[u8_big == 0] = (0, 0, 0)
 

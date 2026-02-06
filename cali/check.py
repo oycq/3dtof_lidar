@@ -32,12 +32,12 @@ if str(ROOT) not in sys.path:
 
 from lidar_ball_detector import LidarBallDetection, detect_ball_lidar  # noqa: E402
 from tof3d import ToF3DParams, tof_histograms, tof_reflectance_mean3_max  # noqa: E402
-from tof_ball_detector import detect_ball_tof_2d  # noqa: E402
+from tof_ball_detector import TOF_BALL_MIN_PEAK, detect_ball_tof_2d  # noqa: E402
 
 
 # ========= 数据目录 =========
 HERE = Path(__file__).resolve().parent
-DATA_DIR = HERE / "../data"
+DATA_DIR = HERE / "./data"
 
 # ========= LiDAR 2D 显示参数, 与 visualize_data.py/client.py 对齐 =========
 LIDAR_IMG_W = 700
@@ -65,8 +65,6 @@ TOF_H = 30
 TOF_SHOW_W = 300
 TOF_SHOW_H = 400
 
-TOF_MIN_PEAK = 1000
-TOF_VALID_BINS = int(ToF3DParams().valid_bin_num)
 TOF_INTEN_GAMMA = 1
 TOF_INTEN_TARGET_MEAN = 0.18
 
@@ -294,7 +292,7 @@ def _build_tof_reflect_view(env_dir: Path, tof_center_xy: Optional[tuple[float, 
         )
         return tof_bgr
 
-    params = ToF3DParams(min_peak_count=float(TOF_MIN_PEAK))
+    params = ToF3DParams(min_peak_count=float(TOF_BALL_MIN_PEAK))
     hists = tof_histograms(tof_path, params=params).astype(np.float32, copy=False)
     if hists.size == 0:
         return tof_bgr
@@ -349,7 +347,7 @@ def main() -> int:
         npz = _find_points_npz(env)
         pts = _load_points(npz) if npz is not None and npz.exists() else np.zeros((0, 3), dtype=np.float32)
 
-        tof_det = detect_ball_tof_2d(env / "tof.raw", window_size=5, min_peak=float(TOF_MIN_PEAK), valid_bins=int(TOF_VALID_BINS))
+        tof_det = detect_ball_tof_2d(env / "tof.raw", window_size=5)
         tof_view = _build_tof_reflect_view(env, tof_det.centroid_xy)
 
         lidar_det: LidarBallDetection = detect_ball_lidar(pts, seed=0)

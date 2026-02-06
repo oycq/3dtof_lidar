@@ -7,9 +7,9 @@ export_combine.py
 把 cali/data 下的所有场景输出一个拼接效果图, 保存为 combine.png.
 
 布局:
-- 固定 8 列.
-- 每行 4 个场景, 左 4 列是 LiDAR 图, 右 4 列是 ToF 反射率图.
-- 例如 20 个场景时, 共 5 行.
+- 固定 16 列.
+- 每行 8 个场景, 左 8 列是 LiDAR 图, 右 8 列是 ToF 反射率图.
+- 例如 20 个场景时, 共 3 行 (最后一行不满).
 
 说明:
 - LiDAR/ToF 的渲染逻辑直接复用 cali/check.py, 保证和 check.py 最终显示一致.
@@ -45,8 +45,8 @@ def main() -> int:
         raise FileNotFoundError(f"no scenes found under: {data_dir}")
 
     # Grid config.
-    scenes_per_row = 4
-    cols = 8  # 4 lidar + 4 tof
+    scenes_per_row = 8
+    cols = 16  # 8 lidar + 8 tof
     rows = int(ceil(len(envs) / scenes_per_row))
 
     w = int(chk.LIDAR_IMG_W)
@@ -61,8 +61,8 @@ def main() -> int:
         npz = chk._find_points_npz(env)
         pts = chk._load_points(npz) if npz is not None and npz.exists() else np.zeros((0, 3), dtype=np.float32)
 
-        # Detect.
-        tof_det = chk.detect_ball_tof_2d(env / "tof.raw", window_size=5, min_peak=float(chk.TOF_MIN_PEAK), valid_bins=int(chk.TOF_VALID_BINS))
+        # Detect (thresholds are defined in tof_ball_detector.py, do not override here).
+        tof_det = chk.detect_ball_tof_2d(env / "tof.raw", window_size=5)
         lidar_det = chk.detect_ball_lidar(pts, seed=0)
 
         # Render.

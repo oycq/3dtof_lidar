@@ -30,6 +30,18 @@ if str(ROOT) not in sys.path:
 from tof3d import ToF3DParams, tof_distance_and_histograms
 
 
+# ===================== 可调参数（统一入口） =====================
+# 注意：这些阈值不要在 check.py / my_calibrate.py 等外部脚本里重复定义，
+# 统一在本文件顶部维护，避免“一个脚本改了阈值另一个没改”造成结果不一致。
+#
+# check.py 里验证过的阈值：
+TOF_BALL_MIN_PEAK: float = 1000.0
+# 使用的有效 bin 数（跟随 tof3d 参数上限）
+TOF_BALL_VALID_BINS: int = int(ToF3DParams().valid_bin_num)
+# 重心窗口默认值
+TOF_BALL_WINDOW_SIZE_DEFAULT: int = 3
+
+
 @dataclass(frozen=True)
 class ToFBallDetection2D:
     centroid_xy: Optional[Tuple[float, float]]  # (x, y), ToF 像素坐标系
@@ -38,9 +50,7 @@ class ToFBallDetection2D:
 def detect_ball_tof_2d(
     tof_raw: str | Path,
     *,
-    window_size: int = 3,
-    min_peak: float = 512.0,
-    valid_bins: int = int(ToF3DParams().valid_bin_num),
+    window_size: int = int(TOF_BALL_WINDOW_SIZE_DEFAULT),
 ) -> ToFBallDetection2D:
     """
     返回 ToF 2D 像素坐标 (x, y).
@@ -63,12 +73,12 @@ def detect_ball_tof_2d(
 
     h, w, _ = hists_u16.shape
     # “bin 值反射率”：取有效 bin 范围内的峰值（max bin count）
-    vb = int(np.clip(int(valid_bins), 1, min(int(ToF3DParams().valid_bin_num), hists_u16.shape[2])))
+    vb = int(np.clip(int(TOF_BALL_VALID_BINS), 1, min(int(ToF3DParams().valid_bin_num), hists_u16.shape[2])))
     peak = hists_u16[:, :, :vb].max(axis=2).astype(np.float32, copy=False)  # (H,W)
 
-    # 1) 在所有点里先筛：peak > min_peak（默认 512）
+    # 1) 在所有点里先筛：peak > min_peak（默认取 check.py 的 1000）
     # 2) 在这些点里找距离最近：depth>0 且 depth 最小
-    m = (peak > float(min_peak)) & (depth_m > 0.0)
+    m = (peak > float(TOF_BALL_MIN_PEAK)) & (depth_m > 0.0)
     if not bool(np.any(m)):
         return ToFBallDetection2D(centroid_xy=None)
 
