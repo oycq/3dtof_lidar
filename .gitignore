@@ -23,4 +23,5 @@ train_data
 
 *.pt
 
+network.onnx
 
