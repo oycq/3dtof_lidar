@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tof3d import ToF3DParams, tof_histograms, tof_reflectance_mean3_max
+from tof3d import ToF3DParams, tof_distance_and_histograms
 
 
 @dataclass(frozen=True)
@@ -38,8 +38,8 @@ class ToFBallDetection2D:
 def detect_ball_tof_2d(
     tof_raw: str | Path,
     *,
-    window_size: int = 5,
-    min_peak: float = 100.0,
+    window_size: int = 3,
+    min_peak: float = 512.0,
     valid_bins: int = int(ToF3DParams().valid_bin_num),
 ) -> ToFBallDetection2D:
     """
@@ -50,31 +50,43 @@ def detect_ball_tof_2d(
     if not p.exists():
         return ToFBallDetection2D(centroid_xy=None)
 
-    params = ToF3DParams(min_peak_count=float(min_peak))
-    hists = tof_histograms(p, params=params).astype(np.float32, copy=False)  # (H,W,64)
-    if hists.size == 0:
+    # 这里需要同时用到：
+    # - bin 峰值（作为“bin 值反射率”）做阈值过滤与重心权重
+    # - 距离矩阵做“最近点”选择
+    #
+    # 注意：距离矩阵内部会做一系列滤波/最小深度过滤，导致某些像素 depth=0；
+    # 我们在“最近点”选择时只考虑 depth>0 的像素。
+    params = ToF3DParams(min_peak_count=0.0)
+    depth_m, hists_u16 = tof_distance_and_histograms(p, params=params)
+    if hists_u16.size == 0 or depth_m.size == 0:
         return ToFBallDetection2D(centroid_xy=None)
 
-    h, w, _ = hists.shape
-    # 反射率/强度相关：只使用有效 bin 范围（与 tof3d.py 对齐）
-    vb = int(np.clip(int(valid_bins), 1, min(int(ToF3DParams().valid_bin_num), hists.shape[2])))
-    h_use = hists[:, :, :vb]
-    peak = h_use.max(axis=2).astype(np.float32, copy=False)
-    # 强度：交给 tof3d.py 的统一策略（这里已裁剪到 vb）
-    inten = tof_reflectance_mean3_max(h_use)
-    inten = np.where(peak >= float(min_peak), inten, 0.0)
-    if float(np.max(inten)) <= 0.0:
+    h, w, _ = hists_u16.shape
+    # “bin 值反射率”：取有效 bin 范围内的峰值（max bin count）
+    vb = int(np.clip(int(valid_bins), 1, min(int(ToF3DParams().valid_bin_num), hists_u16.shape[2])))
+    peak = hists_u16[:, :, :vb].max(axis=2).astype(np.float32, copy=False)  # (H,W)
+
+    # 1) 在所有点里先筛：peak > min_peak（默认 512）
+    # 2) 在这些点里找距离最近：depth>0 且 depth 最小
+    m = (peak > float(min_peak)) & (depth_m > 0.0)
+    if not bool(np.any(m)):
         return ToFBallDetection2D(centroid_xy=None)
 
-    flat_idx = int(np.argmax(inten))
+    depth_sel = np.where(m, depth_m.astype(np.float32, copy=False), np.inf)
+    flat_idx = int(np.argmin(depth_sel))
+    if not np.isfinite(float(depth_sel.flat[flat_idx])):
+        return ToFBallDetection2D(centroid_xy=None)
     y0, x0 = int(flat_idx // w), int(flat_idx % w)
 
-    # window_size x window_size 强度加权重心
-    r = max(0, int(window_size) // 2)
+    # 在该点周围 3x3（可通过 window_size 调整）用“反射率(peak)”做加权重心
+    ws = int(max(1, window_size))
+    if ws % 2 == 0:
+        ws += 1
+    r = max(0, ws // 2)
     xs = np.arange(max(0, x0 - r), min(w, x0 + r + 1), dtype=np.float32)
     ys = np.arange(max(0, y0 - r), min(h, y0 + r + 1), dtype=np.float32)
     xx, yy = np.meshgrid(xs, ys)
-    ww = inten[ys.astype(np.int32)[:, None], xs.astype(np.int32)[None, :]].astype(np.float32, copy=False)
+    ww = peak[ys.astype(np.int32)[:, None], xs.astype(np.int32)[None, :]].astype(np.float32, copy=False)
     wsum = float(np.sum(ww))
     if wsum <= 0.0:
         cx, cy = float(x0), float(y0)
