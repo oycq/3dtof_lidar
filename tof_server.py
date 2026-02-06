@@ -4,9 +4,9 @@
 """
 tof_server.py
 
-同进程 ToF 实时采集服务（与 server.py 的 LivoxRealtimeServer 风格一致）：
+    同进程 ToF 实时采集服务（与 server.py 的 LivoxRealtimeServer 风格一致）：
 - 后台线程持续触发设备侧生成 /tmp/tof.raw，并拉取到本机内存（bytes）
-- 把最新帧转换为“反射率图”（强度 = histogram sum），映射为 uint8 灰度（30x40）
+- 把最新帧转换为“反射率图”（强度计算见 tof3d.py 的统一策略），映射为 uint8 灰度（30x40）
 - 将“反射率图 + 原始 tof.raw bytes”放入一个容量受限的队列，供 client/server 随时取最新
 
 退出：
@@ -24,7 +24,7 @@ from typing import Deque, Optional
 
 import numpy as np
 
-from tof3d import ToF3DParams, tof_histograms_from_u16
+from tof3d import ToF3DParams, tof_histograms_from_u16, tof_reflectance_mean3_max
 
 
 HERE = Path(__file__).resolve().parent
@@ -213,7 +213,8 @@ class ToFRealtimeServer:
                 time.sleep(fail_sleep)
                 continue
 
-            inten = hist.sum(axis=2).astype(np.float32, copy=False)  # (30,40)
+            # 反射率强度：交给 tof3d.py 的统一策略
+            inten = tof_reflectance_mean3_max(hist)  # (30,40)
             reflect_u8 = self._tof_intensity_to_u8(inten)
 
             frame = ToFFrame(ts=time.time(), reflect_u8=reflect_u8, raw_bytes=raw_bytes)

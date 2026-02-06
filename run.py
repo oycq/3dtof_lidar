@@ -264,10 +264,7 @@ def main() -> int:
             last_ts = now_ts
             cv2.setWindowTitle(
                 "LIDAR (ESC=quit)",
-                f"LIDAR | last={CAPTURE_SECONDS:.1f}s | pts={last_pts} | fov=70| I≈255/x(m) | "
-                f"range=1~{MAX_RANGE_M:.0f}m | "
-                f"ae={'on' if AUTO_EXPOSURE else 'off'}(mean={AE_MEAN_SECONDS:.1f}s) | "
-                f"color={(COLORMAP_NAME if USE_COLORMAP else 'off')} | t={last_ts:.2f}",
+                f"LIDAR | last={CAPTURE_SECONDS:.1f}s | pts={last_pts}"
             )
 
             # ToF：实时拿最新反射率图显示（没有数据就保持上一帧）

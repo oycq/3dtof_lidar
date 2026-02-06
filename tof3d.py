@@ -195,6 +195,38 @@ def tof_distance_and_histograms(
     return depth, hist
 
 
+def tof_reflectance_mean3_max(hist: np.ndarray, *, use_bins: int = 62) -> np.ndarray:
+    """
+    从 ToF 直方图计算“反射率/强度”标量图（简化版）：
+    - 只使用前 use_bins 个 bin（默认 62，用于丢弃最后 2 个统计/打光量 bin）
+    - 先对 1D bin 序列做 3-bin 均值滤波（边界用 edge pad）
+    - 再取滤波后序列的最大值作为反射率/强度
+
+    Args:
+        hist: (H, W, B) 任意数值类型
+        use_bins: 使用的 bin 数量上限（会被 clip 到 [0, B]）
+
+    Returns:
+        (H, W) float32
+    """
+    h = np.asarray(hist, dtype=np.float32)
+    if h.size == 0:
+        return np.zeros(h.shape[:2], dtype=np.float32)
+    if h.ndim != 3 or int(h.shape[2]) <= 0:
+        return np.zeros(h.shape[:2], dtype=np.float32)
+
+    b = int(h.shape[2])
+    use = int(np.clip(int(use_bins), 0, b))
+    if use <= 0:
+        return np.zeros(h.shape[:2], dtype=np.float32)
+
+    h_use = h[:, :, :use]
+    # edge pad 后做 3-bin mean：m[i] = mean(h[i-1], h[i], h[i+1])
+    p = np.pad(h_use, ((0, 0), (0, 0), (1, 1)), mode="edge")  # (H,W,use+2)
+    mean3 = (p[:, :, 0:use] + p[:, :, 1 : use + 1] + p[:, :, 2 : use + 2]) / 3.0
+    return np.max(mean3, axis=2).astype(np.float32, copy=False)
+
+
 def _centroid_bins(hist: np.ndarray, max_pos_1based: np.ndarray, params: ToF3DParams) -> np.ndarray:
     """
     在峰值附近窗口计算质心位置（bin）。

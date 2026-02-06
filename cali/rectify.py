@@ -30,7 +30,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 # 导入自定义模块，用于处理 ToF 数据
-from tof3d import ToF3DParams, tof_histograms  # noqa: E402
+from tof3d import ToF3DParams, tof_histograms, tof_reflectance_mean3_max  # noqa: E402
 
 # HERE 是当前脚本所在目录
 HERE = Path(__file__).resolve().parent
@@ -205,7 +205,8 @@ def build_tof_reflect_view(env_dir: Path) -> np.ndarray:
     if hists.size == 0:
         return tof_bgr
 
-    inten = hists.sum(axis=2)
+    # 反射率强度：交给 tof3d.py 的统一策略
+    inten = tof_reflectance_mean3_max(hists)
     inten_u8 = tof_intensity_to_u8(inten)
     inten_big = cv2.resize(inten_u8, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
     inten_big = cv2.flip(inten_big, 0)

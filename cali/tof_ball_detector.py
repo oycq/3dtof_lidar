@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tof3d import ToF3DParams, tof_histograms
+from tof3d import ToF3DParams, tof_histograms, tof_reflectance_mean3_max
 
 
 @dataclass(frozen=True)
@@ -40,7 +40,7 @@ def detect_ball_tof_2d(
     *,
     window_size: int = 5,
     min_peak: float = 100.0,
-    valid_bins: int = 62,
+    valid_bins: int = int(ToF3DParams().valid_bin_num),
 ) -> ToFBallDetection2D:
     """
     返回 ToF 2D 像素坐标 (x, y).
@@ -56,9 +56,12 @@ def detect_ball_tof_2d(
         return ToFBallDetection2D(centroid_xy=None)
 
     h, w, _ = hists.shape
-    vb = int(np.clip(int(valid_bins), 1, hists.shape[2]))
-    peak = hists[:, :, :vb].max(axis=2).astype(np.float32, copy=False)
-    inten = hists.sum(axis=2).astype(np.float32, copy=False)
+    # 反射率/强度相关：只使用有效 bin 范围（与 tof3d.py 对齐）
+    vb = int(np.clip(int(valid_bins), 1, min(int(ToF3DParams().valid_bin_num), hists.shape[2])))
+    h_use = hists[:, :, :vb]
+    peak = h_use.max(axis=2).astype(np.float32, copy=False)
+    # 强度：交给 tof3d.py 的统一策略（这里已裁剪到 vb）
+    inten = tof_reflectance_mean3_max(h_use)
     inten = np.where(peak >= float(min_peak), inten, 0.0)
     if float(np.max(inten)) <= 0.0:
         return ToFBallDetection2D(centroid_xy=None)

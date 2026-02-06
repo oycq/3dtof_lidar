@@ -21,7 +21,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-from tof3d import ToF3DParams, tof_distance_and_histograms
+from tof3d import ToF3DParams, tof_distance_and_histograms, tof_reflectance_mean3_max
 import cv2
 
 # ========= 配置 =========
@@ -46,7 +46,7 @@ TOF_H = 30
 TOF_SHOW_W = 300
 TOF_SHOW_H = 400
 TOF_MIN_PEAK = 100  # 峰值低于该值认为置信度不足（标黑/深度置 0）
-TOF_VALID_BINS = 62  # 峰值/质心只看前 62 个 bin（与 get_tof.py/tof3d.py 对齐）
+TOF_VALID_BINS = int(ToF3DParams().valid_bin_num)  # 峰值/质心的有效 bin 数（与 tof3d.py 对齐）
 
 # TOF 距离补偿（标定公式）
 # 约定：x/y 为毫米（mm），最终显示仍用米（m）
@@ -54,8 +54,8 @@ TOF_COMP_ENABLE = True
 TOF_COMP_A = 1
 TOF_COMP_B_MM = -1447
 
-# TOF 反射率强度图：强度=直方图各 bin 求和，显示时映射到 0~1023 并做 gamma=2.2
-TOF_INTEN_GAMMA = 2.2
+# TOF 反射率强度图：强度计算见 tof3d.py 的统一策略；显示做归一化 + gamma
+TOF_INTEN_GAMMA = 1.0
 TOF_INTEN_USE_COLORMAP = False  # 需求：黑白图即可（无需伪彩）
 TOF_INTEN_TARGET_MEAN = 0.18  # 通过除以系数 k，让整张图的平均反射率变为 0.18（之后再做 gamma 显示）
 
@@ -280,7 +280,7 @@ def _tof_intensity_to_u8(intensity_sum: np.ndarray) -> np.ndarray:
     """
     把 TOF 反射率强度（直方图求和）转为 u8：
     - 输入：任意数值类型 (H,W)，强度=∑hist[bin]
-    - 显示策略（按需求）：通过除以系数 k，让整张图平均反射率变为 0.18，然后 gamma=2.2（显示用 1/gamma），最后映射到 0~255
+    - 显示策略（按需求）：通过除以系数 k，让整张图平均反射率变为 target_mean，然后做 gamma（显示用 1/gamma），最后映射到 0~255
     """
     if intensity_sum.size == 0:
         return np.zeros((TOF_H, TOF_W), dtype=np.uint8)
@@ -361,12 +361,13 @@ def main() -> int:
                 distance_comp_b_mm=float(TOF_COMP_B_MM),
             )
             depth, hists = tof_distance_and_histograms(tof_path, params=params)  # depth:(30,40), hists:(30,40,64)
-            peak = hists[:, :, :62].max(axis=2)  # (30,40) uint16
+            # peak/置信度：与 tof3d.py 对齐，只看有效 bin 范围
+            peak = hists[:, :, : int(params.valid_bin_num)].max(axis=2)  # (30,40) uint16
             low_conf_mask = peak < int(TOF_MIN_PEAK)
 
-            # 反射率强度：直方图所有 bin 求和（按需求 0~1023 值域 + gamma=2.2）
-            inten_sum = hists.sum(axis=2).astype(np.float32, copy=False)  # (30,40)
-            inten_u8 = _tof_intensity_to_u8(inten_sum)
+            # 反射率强度：交给 tof3d.py 的统一策略
+            inten = tof_reflectance_mean3_max(hists)
+            inten_u8 = _tof_intensity_to_u8(inten)
             # 显示方向与 run.py 对齐：向右旋转90° + 水平翻转
             inten_u8 = cv2.rotate(inten_u8, cv2.ROTATE_90_CLOCKWISE)
             inten_u8 = cv2.flip(inten_u8, 1)

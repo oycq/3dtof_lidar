@@ -31,13 +31,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from lidar_ball_detector import LidarBallDetection, detect_ball_lidar  # noqa: E402
-from tof3d import ToF3DParams, tof_histograms  # noqa: E402
+from tof3d import ToF3DParams, tof_histograms, tof_reflectance_mean3_max  # noqa: E402
 from tof_ball_detector import detect_ball_tof_2d  # noqa: E402
 
 
 # ========= 数据目录 =========
 HERE = Path(__file__).resolve().parent
-DATA_DIR = HERE / "data"
+DATA_DIR = HERE / "../data"
 
 # ========= LiDAR 2D 显示参数, 与 visualize_data.py/client.py 对齐 =========
 LIDAR_IMG_W = 700
@@ -66,8 +66,8 @@ TOF_SHOW_W = 300
 TOF_SHOW_H = 400
 
 TOF_MIN_PEAK = 100
-TOF_VALID_BINS = 62
-TOF_INTEN_GAMMA = 2.2
+TOF_VALID_BINS = int(ToF3DParams().valid_bin_num)
+TOF_INTEN_GAMMA = 1
 TOF_INTEN_TARGET_MEAN = 0.18
 
 
@@ -299,9 +299,9 @@ def _build_tof_reflect_view(env_dir: Path, tof_center_xy: Optional[tuple[float, 
     if hists.size == 0:
         return tof_bgr
 
-    # 反射率强度 = histogram sum.
+    # 反射率强度：交给 tof3d.py 里的统一策略（见 tof_reflectance_mean3_max 默认配置）
     # 与 visualize_data.py 保持一致: 这里不做 peak mask, 否则容易看起来像二值黑白图.
-    inten = hists.sum(axis=2).astype(np.float32, copy=False)
+    inten = tof_reflectance_mean3_max(hists)
 
     inten_u8 = _tof_intensity_to_u8(inten)
     # 显示方向与 run.py / visualize_data.py 对齐：向右旋转90° + 水平翻转
