@@ -61,8 +61,9 @@ MOUSE_HOVER_ENABLED = True
 # ========= ToF 2D 显示尺寸 =========
 TOF_W = 40
 TOF_H = 30
-TOF_SHOW_W = 400
-TOF_SHOW_H = 300
+# 与 run.py / visualize_data.py 对齐：显示做“向右旋转90° + 水平翻转”，宽高对调
+TOF_SHOW_W = 300
+TOF_SHOW_H = 400
 
 TOF_MIN_PEAK = 100
 TOF_VALID_BINS = 62
@@ -95,14 +96,14 @@ def _load_points(npz_path: Path) -> np.ndarray:
 
 def _tof_pixel_to_disp_xy(px: float, py: float) -> tuple[int, int]:
     """
-    与 visualize_data.py 对齐的显示映射:
-    - 显示做 flipV(上下翻转).
+    与 run.py / visualize_data.py 对齐的显示映射:
+    - 显示做“向右旋转90° + 水平翻转”(rot90CW + flipH).
     """
     px_i = float(np.clip(px, 0.0, TOF_W - 1.0))
     py_i = float(np.clip(py, 0.0, TOF_H - 1.0))
-    py_disp = (TOF_H - 1.0) - py_i
-    dx = int((px_i + 0.5) * TOF_SHOW_W / TOF_W)
-    dy = int((py_disp + 0.5) * TOF_SHOW_H / TOF_H)
+    # rot90CW + flipH 后，变换图像坐标 (row, col) = (px, py)
+    dx = int((py_i + 0.5) * TOF_SHOW_W / TOF_H)
+    dy = int((px_i + 0.5) * TOF_SHOW_H / TOF_W)
     dx = int(np.clip(dx, 0, TOF_SHOW_W - 1))
     dy = int(np.clip(dy, 0, TOF_SHOW_H - 1))
     return dx, dy
@@ -303,8 +304,10 @@ def _build_tof_reflect_view(env_dir: Path, tof_center_xy: Optional[tuple[float, 
     inten = hists.sum(axis=2).astype(np.float32, copy=False)
 
     inten_u8 = _tof_intensity_to_u8(inten)
+    # 显示方向与 run.py / visualize_data.py 对齐：向右旋转90° + 水平翻转
+    inten_u8 = cv2.rotate(inten_u8, cv2.ROTATE_90_CLOCKWISE)
+    inten_u8 = cv2.flip(inten_u8, 1)
     inten_big = cv2.resize(inten_u8, (TOF_SHOW_W, TOF_SHOW_H), interpolation=cv2.INTER_NEAREST)
-    inten_big = cv2.flip(inten_big, 0)
     tof_bgr = cv2.cvtColor(inten_big, cv2.COLOR_GRAY2BGR)
 
     if tof_center_xy is not None:
