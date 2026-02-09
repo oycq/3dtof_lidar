@@ -12,18 +12,18 @@ nn/train.py
 - output_00001.npy: (30,40) float32，单位米；无效为 0（或 <=0）
 
 网络输出（见 net.py）：
-- 通道0：inv_depth = 1/depth（>=0）
-- 通道1：sigma（>0），表示以 inv_depth 为均值的高斯分布尺度（标准差）
+- 每个像素输出 64 个 logits（softmax 后为 64 个距离区间概率）
+  - 区间 k 表示 [k*0.15m, (k+1)*0.15m)
 
-Loss：
-- 真实 inv_depth 在该高斯分布下的负对数似然（-log 概率 / “概率熵”）
+Loss（“熵”）：
+- 对每个有效像素：只取 GT 落在的区间 k，对应的概率 p_k，loss = -log(p_k)
+- 等价实现：`torch.nn.functional.cross_entropy(logits, target_bin)`
 
 2026-01：全量 batch 训练（把所有样本堆成一个“大 patch”一次训完），训练轮数见 EPOCHS。
 """
 
 from __future__ import annotations
 
-import math
 import time
 from pathlib import Path
 from typing import List, Tuple
@@ -39,6 +39,11 @@ EPOCHS = 1000
 LR = 1e-3
 EPS = 1e-6
 SHUFFLE = False  # 全量 batch 下打乱只有“batch 内顺序变化”，对本网络通常无意义
+
+# 分类配置：64 个 bin，每个 bin 0.15m（15cm）
+NUM_BINS = 64
+BIN_M = 0.15
+IGNORE_INDEX = -1
 
 # 是否使用 CUDA（不从命令行读取）
 # - True: 若本机有可用 CUDA，则使用 GPU；否则自动回退到 CPU（会打印提示）
@@ -79,6 +84,27 @@ def to_torch_target_depth(y_hw: np.ndarray, device: torch.device) -> torch.Tenso
     t = torch.from_numpy(y_hw).unsqueeze(0).unsqueeze(0).contiguous()
     return t.to(device=device, dtype=torch.float32)
 
+def depth_to_bin_index(depth_m: torch.Tensor) -> torch.Tensor:
+    """depth(m) -> bin index (long), invalid(<=0) -> IGNORE_INDEX.
+
+    depth_m: (N,1,H,W) float32
+    return:  (N,H,W) int64
+    """
+    if depth_m.ndim != 4 or depth_m.shape[1] != 1:
+        raise ValueError(f"expect depth_m shape (N,1,H,W), got {tuple(depth_m.shape)}")
+
+    d = depth_m[:, 0, :, :]  # (N,H,W)
+    # 仅当真值落在 64 个区间内才参与 loss：
+    # bins: [0,0.15), [0.15,0.30), ..., [(NUM_BINS-1)*0.15, NUM_BINS*0.15)
+    # 注意上边界是开区间：depth == NUM_BINS*BIN_M 也应视为“不落在区间内”
+    max_m = float(NUM_BINS) * float(BIN_M)
+    finite = torch.isfinite(d)
+    valid = finite & (d > 0.0) & (d < max_m)
+    # floor: [0,0.15)->0, [0.15,0.30)->1, ...
+    idx = torch.floor(d / float(BIN_M)).to(dtype=torch.int64)
+    idx = torch.where(valid, idx, torch.full_like(idx, int(IGNORE_INDEX)))
+    return idx
+
 
 def stack_all_pairs(pairs: List[Tuple[Path, Path]], device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
     """把所有样本堆成一个大 batch：
@@ -113,7 +139,7 @@ def main() -> int:
     print(f"[device] {device}")
     print(f"[data] {train_dir}  pairs={len(pairs)}")
 
-    net = Network(in_channels=C).to(device)
+    net = Network(in_channels=C, out_bins=NUM_BINS).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=LR)
 
     # 全量 batch：一次性加载并堆叠
@@ -140,24 +166,28 @@ def main() -> int:
             gt = gt_all
 
         net.train()
-        out = net(inp)  # (N,2,H,W)
-        pred_inv = out[:, 0:1, :, :]  # (N,1,H,W) >=0
-        pred_sigma = out[:, 1:2, :, :]  # (N,1,H,W) >0
+        logits = net(inp)  # (N,64,H,W)
 
-        valid = (gt > 0).to(dtype=torch.float32)
-        denom = torch.clamp(valid.sum(), min=1.0)
+        # target bin: (N,H,W) long, invalid -> IGNORE_INDEX
+        target = depth_to_bin_index(gt)
+        valid = (target != IGNORE_INDEX)
+        denom = torch.clamp(valid.sum().to(dtype=torch.float32), min=1.0)
 
-        # --- GT inv_depth（只在有效像素上算）---
-        gt_inv = torch.zeros_like(gt)
-        gt_inv[gt > 0] = 1.0 / torch.clamp(gt[gt > 0], min=EPS)
+        # per-pixel cross entropy (sum then normalize by valid count)
+        # 等价于：loss = -log softmax(logits)[..., target]
+        ce_sum = torch.nn.functional.cross_entropy(
+            logits,
+            target,
+            ignore_index=int(IGNORE_INDEX),
+            reduction="sum",
+        )
+        loss = ce_sum / denom
 
-        # --- Gaussian NLL: -log p(gt_inv | mu=pred_inv, sigma=pred_sigma) ---
-        # NLL = 0.5 * [ ((x-mu)/sigma)^2 + 2*log(sigma) + log(2π) ]
-        sigma = torch.clamp(pred_sigma, min=EPS)
-        z = (gt_inv - pred_inv) / sigma
-        nll_map = 0.5 * (z * z + 2.0 * torch.log(sigma) + math.log(2.0 * math.pi))
-        nll = (nll_map * valid).sum() / denom
-        loss = nll
+        # 训练时简单算个 top1 accuracy（仅有效像素）
+        with torch.no_grad():
+            pred = torch.argmax(logits, dim=1)  # (N,H,W)
+            correct = (pred == target) & valid
+            acc = correct.sum().to(dtype=torch.float32) / denom
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -167,7 +197,8 @@ def main() -> int:
         dt = time.time() - t0
         print(
             f"[ep {ep+1:03d}/{EPOCHS}] step {step:06d}  "
-            f"nll={nll.item():.6f}  "
+            f"ce={loss.item():.6f}  "
+            f"acc={float(acc.detach().cpu().item()):.3f}  "
             f"({dt:.1f}s)  batch=N={inp.shape[0]}"
         )
 

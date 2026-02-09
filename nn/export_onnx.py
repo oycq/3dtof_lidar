@@ -25,12 +25,13 @@ def main() -> int:
     # 固定配置（不从命令行读取），与 train.py 对齐
     C, H, W = 64, 30, 40
     OPSET = 11
+    OUT_BINS = 64
 
     here = Path(__file__).resolve().parent
     ckpt_path = here / "model_last.pt"
     out_path = here / "network.onnx"
 
-    net = Network(in_channels=C)
+    net = Network(in_channels=C, out_bins=OUT_BINS)
     net.eval()
 
     if not ckpt_path.exists():

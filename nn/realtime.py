@@ -8,17 +8,16 @@ nn/realtime.py
 运行深度学习模型并实时显示 3 张图：
 - INPUT: ToF 强度（直方图求和）
 - PRED: 预测深度（伪彩）
-- PROB: 预测置信度图（±5% 区间概率）
+- PROB: 预测置信度图（top1 区间概率）
 
 交互：
-- 鼠标悬停：显示 pred/sigma/prob
+- 鼠标悬停：显示 pred/bin_range/prob
 - pThr% 滑动条：低于阈值的像素直接置黑（PRED 视图）
 - ESC 退出
 """
 
 from __future__ import annotations
 
-import math
 import sys
 from pathlib import Path
 from typing import Tuple
@@ -28,6 +27,10 @@ import numpy as np
 TOF_H = 30
 TOF_W = 40
 TOF_C = 64
+
+# 输出分类配置（与 train.py / net.py 对齐）
+NUM_BINS = 64
+BIN_M = 0.15
 
 SHOW_W = 400
 SHOW_H = 300
@@ -122,30 +125,21 @@ def _colorize_prob(prob: np.ndarray, valid: np.ndarray) -> np.ndarray:
     return bgr
 
 
-def _run_infer(net, device, hists: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """hist (H,W,64) -> pred_depth, sigma, prob (H,W)."""
+def _run_infer(net, device, hists: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """hist (H,W,64) -> pred_depth, prob (H,W)."""
     import torch
 
     with torch.no_grad():
         inp = torch.from_numpy(hists).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
-        out = net(inp)  # (1,2,H,W)
-        pred_inv = out[:, 0:1].clamp(min=EPS)
-        pred_sigma = out[:, 1:2].clamp(min=EPS)
+        logits = net(inp)  # (1,64,H,W)
+        probs_t = torch.softmax(logits, dim=1)  # (1,64,H,W)
+        top_prob_t, top_idx_t = torch.max(probs_t, dim=1)  # (1,H,W)
 
-        # prob = P( inv_depth in [mu/1.05, mu/0.95] ) under N(mu, sigma)
-        a = pred_inv / 1.05
-        b = pred_inv / 0.95
-        inv_s = pred_sigma.clamp(min=EPS)
-        inv_sqrt2 = 1.0 / math.sqrt(2.0)
-        cdf = lambda z: 0.5 * (1.0 + torch.erf(z * inv_sqrt2))
-        prob_t = cdf((b - pred_inv) / inv_s) - cdf((a - pred_inv) / inv_s)
-        prob_t = prob_t.clamp(0.0, 1.0)
+        pred_depth_t = (top_idx_t.to(dtype=torch.float32) + 0.5) * float(BIN_M)  # (1,H,W)
+        pred_depth = pred_depth_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+        prob = top_prob_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
 
-        pred_depth = (1.0 / pred_inv).squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
-        sigma = pred_sigma.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
-        prob = prob_t.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
-
-    return pred_depth, sigma, prob
+    return pred_depth, prob
 
 
 def main() -> int:
@@ -173,7 +167,7 @@ def main() -> int:
     ckpt_path = nn_dir / "model_last.pt"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = Network(in_channels=TOF_C).to(device)
+    net = Network(in_channels=TOF_C, out_bins=NUM_BINS).to(device)
     net.eval()
 
     if ckpt_path.exists():
@@ -206,7 +200,6 @@ def main() -> int:
     last_ts = 0.0
     cached_in: np.ndarray | None = None
     cached_pred_depth: np.ndarray | None = None
-    cached_sigma: np.ndarray | None = None
     cached_prob: np.ndarray | None = None
 
     try:
@@ -216,14 +209,13 @@ def main() -> int:
                 raw_u16 = np.frombuffer(frame.raw_bytes, dtype=np.uint16)
                 hists = tof_histograms_from_u16(raw_u16)
                 if hists.shape == (TOF_H, TOF_W, TOF_C):
-                    pred_depth, sigma, prob = _run_infer(net, device, hists)
+                    pred_depth, prob = _run_infer(net, device, hists)
                     cached_in = hists
                     cached_pred_depth = pred_depth
-                    cached_sigma = sigma
                     cached_prob = prob
                     last_ts = float(frame.ts)
 
-            if cached_in is None or cached_pred_depth is None or cached_sigma is None or cached_prob is None:
+            if cached_in is None or cached_pred_depth is None or cached_prob is None:
                 k = int(cv2.waitKey(5) & 0xFF)
                 if k == 27:
                     break
@@ -258,9 +250,12 @@ def main() -> int:
             px, py = _disp_xy_to_pixel(mx - tile_x0, my, SHOW_W, SHOW_H)
 
             pr_v = float(cached_pred_depth[py, px])
-            sg_v = float(max(cached_sigma[py, px], 0.0))
             pb_v = float(np.clip(cached_prob[py, px], 0.0, 1.0))
-            hover_txt = f"pred {pr_v:.3f}m  sigma {sg_v:.4f}  prob {pb_v:.2f}"
+            k_top = int(np.floor(pr_v / float(BIN_M)))
+            k_top = int(np.clip(k_top, 0, NUM_BINS - 1))
+            a_m = float(k_top) * float(BIN_M)
+            b_m = float(k_top + 1) * float(BIN_M)
+            hover_txt = f"pred {pr_v:.3f}m  bin[{k_top:02d}] {a_m:.2f}-{b_m:.2f}m  p {pb_v:.2f}"
 
             # 标题文字
             in_bgr = _with_text(in_bgr, "INPUT")
