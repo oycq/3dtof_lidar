@@ -12,7 +12,7 @@ check_train_effect.py
 可视化风格参考 cali/check.py：
 - cv2.imshow
 - 4/6 切换样本，ESC 退出
-- ToF 强度与深度图做 resize + flipV 以对齐项目里的显示习惯
+- ToF 强度与深度图做 resize + (rot90CW + flipH) 以对齐项目里的显示习惯（同 cali/check.py）
 - 鼠标悬停显示：pred/gt/sigma（三个值，单行 ASCII，避免 cv2 putText 乱码）
 """
 
@@ -30,33 +30,38 @@ TOF_H = 30
 TOF_W = 40
 TOF_C = 64
 
-SHOW_W = 400
-SHOW_H = 300
+# 显示方向使用 rot90CW + flipH 后，原始 (H,W)=(30,40) 会变成 (40,30)，
+# 因此显示的宽高比例应为 W:H = 30:40 = 3:4（竖屏）。
+# 与 cali/check.py 对齐：300x400
+SHOW_W = 390
+SHOW_H = 520
 HEADER_H = 32
 
 EPS = 1e-6
 
 
 def _disp_xy_to_pixel(dx: int, dy: int, show_w: int, show_h: int) -> Tuple[int, int]:
-    """显示坐标 -> ToF 像素坐标（显示做了 flipV，因此这里需要还原）。"""
+    """显示坐标 -> ToF 像素坐标。
+
+    显示方向对齐 cali/check.py：rot90CW + flipH。
+    该组合等价于转置：变换后 (row, col) = (px, py)。
+    因此 display 的 x 对应原始 py，display 的 y 对应原始 px。
+    """
     sw = max(int(show_w), 1)
     sh = max(int(show_h), 1)
-    px = int(np.clip(dx * TOF_W / sw, 0, TOF_W - 1))
-    py_disp = int(np.clip(dy * TOF_H / sh, 0, TOF_H - 1))
-    py = (TOF_H - 1) - py_disp
+    py = int(np.clip(dx * TOF_H / sw, 0, TOF_H - 1))
+    px = int(np.clip(dy * TOF_W / sh, 0, TOF_W - 1))
     return px, py
 
 
 def _pixel_to_disp_xy(px: int, py: int, show_w: int, show_h: int) -> Tuple[int, int]:
-    """ToF 像素坐标 -> 显示坐标（显示做了 flipV）。"""
+    """ToF 像素坐标 -> 显示坐标（显示做了 rot90CW + flipH）。"""
     sw = max(int(show_w), 1)
     sh = max(int(show_h), 1)
     px_i = int(np.clip(px, 0, TOF_W - 1))
     py_i = int(np.clip(py, 0, TOF_H - 1))
-    # disp 上的 y 对应 py_disp（0=top）: py = (TOF_H-1) - py_disp
-    py_disp = (TOF_H - 1) - py_i
-    dx = int(np.clip((px_i + 0.5) * sw / TOF_W, 0, sw - 1))
-    dy = int(np.clip((py_disp + 0.5) * sh / TOF_H, 0, sh - 1))
+    dx = int(np.clip((py_i + 0.5) * sw / TOF_H, 0, sw - 1))
+    dy = int(np.clip((px_i + 0.5) * sh / TOF_W, 0, sh - 1))
     return dx, dy
 
 
@@ -326,8 +331,10 @@ def main() -> int:
         p_thr = float(cv2.getTrackbarPos("pThr%", "CHECK_TRAIN")) / 100.0
         # INPUT intensity
         inten_u8 = _render_input_intensity_u8(cached_in)
+        # 显示方向对齐 cali/check.py：向右旋转90° + 水平翻转
+        inten_u8 = cv2.rotate(inten_u8, cv2.ROTATE_90_CLOCKWISE)
+        inten_u8 = cv2.flip(inten_u8, 1)
         in_big = cv2.resize(inten_u8, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
-        in_big = cv2.flip(in_big, 0)
         in_bgr = cv2.cvtColor(in_big, cv2.COLOR_GRAY2BGR)
 
         # GT / PRED / PROB(±5%)
@@ -349,9 +356,13 @@ def main() -> int:
 
         prob_bgr = _colorize_prob(cached_prob, valid)
 
-        gt_big = cv2.flip(cv2.resize(gt_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST), 0)
-        pred_big = cv2.flip(cv2.resize(pred_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST), 0)
-        prob_big = cv2.flip(cv2.resize(prob_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST), 0)
+        gt_bgr = cv2.flip(cv2.rotate(gt_bgr, cv2.ROTATE_90_CLOCKWISE), 1)
+        pred_bgr = cv2.flip(cv2.rotate(pred_bgr, cv2.ROTATE_90_CLOCKWISE), 1)
+        prob_bgr = cv2.flip(cv2.rotate(prob_bgr, cv2.ROTATE_90_CLOCKWISE), 1)
+
+        gt_big = cv2.resize(gt_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
+        pred_big = cv2.resize(pred_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
+        prob_big = cv2.resize(prob_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
 
         # hover info（单窗口拼图：2x2 + 顶部 header，需要先扣掉 header 高度）
         mx = int(np.clip(mouse.get("x", 0), 0, SHOW_W * 2 - 1))

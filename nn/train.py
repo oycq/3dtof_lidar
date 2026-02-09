@@ -35,7 +35,7 @@ from net import Network
 
 
 # 固定配置（不从命令行读取）
-EPOCHS = 1000
+EPOCHS = 3000
 LR = 2e-3
 EPS = 1e-6
 SHUFFLE = False  # 全量 batch 下打乱只有“batch 内顺序变化”，对本网络通常无意义
