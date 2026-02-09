@@ -37,6 +37,11 @@ SHOW_W = 390
 SHOW_H = 520
 HEADER_H = 32
 
+# 直方图显示：展示输入的前 62 个 bin（0~61），去掉最后两个 bin（通常为特殊/保留）
+HIST_BINS = 62
+HIST_W = 620
+HIST_H = 260
+
 EPS = 1e-6
 
 
@@ -84,6 +89,74 @@ def _with_text(img_bgr: np.ndarray, text: str) -> np.ndarray:
     out = img_bgr.copy()
     cv2.putText(out, text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
     return out
+
+
+def _render_histogram_bgr(bins: np.ndarray, w: int = HIST_W, h: int = HIST_H) -> np.ndarray:
+    """把一维 bins 渲染成柱状直方图（BGR uint8）。
+
+    - 默认显示输入的前 HIST_BINS 个 bin（0~61），最后两个 bin 不显示
+    - 为了便于观察，按当前 bins 的最大值做线性归一化
+    """
+    import cv2  # type: ignore
+
+    b = np.asarray(bins, dtype=np.float32).reshape(-1)
+    nb = int(min(HIST_BINS, b.shape[0]))
+    if nb <= 0:
+        return np.zeros((max(int(h), 1), max(int(w), 1), 3), dtype=np.uint8)
+
+    b = b[:nb]
+    sw = max(int(w), 1)
+    sh = max(int(h), 1)
+    img = np.zeros((sh, sw, 3), dtype=np.uint8)
+
+    # 画图区（留边距给文字和坐标）
+    top = 34
+    left = 14
+    right = 10
+    bottom = 18
+    x0, y0 = left, top
+    x1, y1 = sw - right, sh - bottom
+    if x1 <= x0 + 2 or y1 <= y0 + 2:
+        return img
+
+    vmax = float(np.max(b)) if b.size else 0.0
+    if not np.isfinite(vmax) or vmax <= 0.0:
+        vmax = 1.0
+
+    # 坐标框
+    cv2.rectangle(img, (x0, y0), (x1, y1), (80, 80, 80), 1, cv2.LINE_AA)
+
+    # 柱子宽度（至少 1px）
+    bar_area_w = max(x1 - x0, 1)
+    bar_w = max(int(bar_area_w / nb), 1)
+    gap = 0  # 可按需调成 1
+
+    for i in range(nb):
+        v = float(b[i])
+        if not np.isfinite(v) or v < 0:
+            v = 0.0
+        hh = int(np.clip(v / vmax, 0.0, 1.0) * (y1 - y0 - 1))
+        xL = x0 + i * bar_w
+        xR = min(xL + bar_w - gap, x1)
+        if xR <= xL:
+            continue
+        yT = y1 - hh
+        # 填充柱子（青色）+ 细边
+        cv2.rectangle(img, (xL, yT), (xR, y1), (255, 220, 0), -1)
+        cv2.rectangle(img, (xL, yT), (xR, y1), (30, 30, 30), 1)
+
+    # x 轴刻度（每 10 个 bin 一根）
+    step = 10
+    for k in range(0, nb, step):
+        xx = x0 + int(k * bar_w)
+        cv2.line(img, (xx, y1), (xx, y1 + 4), (120, 120, 120), 1, cv2.LINE_AA)
+        cv2.putText(img, str(k), (xx + 2, sh - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+
+    # 标题（ASCII，避免乱码）
+    ssum = float(np.sum(b))
+    title = f"HIST bins[0..{nb-1}]  max {vmax:.1f}  sum {ssum:.1f}"
+    img = _with_text(img, title)
+    return img
 
 
 def _render_input_intensity_u8(hists: np.ndarray) -> np.ndarray:
@@ -265,6 +338,7 @@ def main() -> int:
         print(f"[warn] missing checkpoint: {ckpt_path} (use random weights)")
 
     cv2.namedWindow("CHECK_TRAIN", cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow("HIST", cv2.WINDOW_AUTOSIZE)
     # 概率阈值滑动条：低于该阈值的像素，PRED 直接置黑不显示
     # 概率 = 在 N(mu=pred_inv_depth, sigma) 下，真值落在 “pred_depth ±5%” 区间的积分概率
     cv2.createTrackbar("pThr%", "CHECK_TRAIN", 50, 100, lambda _: None)
@@ -404,6 +478,14 @@ def main() -> int:
         view = np.vstack([header, view])
 
         cv2.imshow("CHECK_TRAIN", view)
+
+        # hovered point histogram（取输入的前 62 个 bin：0~61）
+        try:
+            hbins = cached_in[py, px, :]
+        except Exception:
+            hbins = np.zeros((TOF_C,), dtype=np.float32)
+        hist_img = _render_histogram_bgr(hbins, w=HIST_W, h=HIST_H)
+        cv2.imshow("HIST", hist_img)
 
         k = int(cv2.waitKey(30) & 0xFF)
         if k == 27:  # ESC
