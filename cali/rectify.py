@@ -173,10 +173,12 @@ def render_lidar_gray(points_xyz: np.ndarray) -> np.ndarray:
 def load_calib(calib_json: Path) -> Dict[str, np.ndarray]:
     """
     读取 calib_result.json 中的标定参数
-    预计算 R (旋转矩阵), t (平移向量), K (相机内参) 为 float32 以加速后续计算
+    预计算 R (旋转矩阵), t (平移向量), K (相机内参), dist (畸变系数) 为 float32 以加速后续计算
     """
     with calib_json.open("r", encoding="utf-8") as f:
         d = json.load(f)
+    # dist_coeffs: [k1,k2,p1,p2,k3]，老版本没有该字段则视为全 0（无畸变）
+    dist = np.asarray(d.get("dist_coeffs", [0.0, 0.0, 0.0, 0.0, 0.0]), dtype=np.float64).reshape(5)
     calib = {
         "camera_matrix": np.asarray(d["camera_matrix"], dtype=np.float64).reshape(3, 3),
         "rvec": np.asarray(d["rvec"], dtype=np.float64).reshape(3),
@@ -186,6 +188,7 @@ def load_calib(calib_json: Path) -> Dict[str, np.ndarray]:
     calib["R"] = cv2.Rodrigues(calib["rvec"].reshape(3, 1))[0].astype(np.float32)
     calib["t"] = calib["tvec"].reshape(1, 3).astype(np.float32)
     calib["K"] = calib["camera_matrix"].astype(np.float32)
+    calib["dist"] = dist.astype(np.float32, copy=False)
     return calib
 
 
@@ -224,18 +227,20 @@ def project_lidar_to_tof(pts_lidar_xyz: np.ndarray, calib: Dict[str, np.ndarray]
     if pts_lidar_xyz.shape[0] == 0:
         return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.float32)
 
-    R, t, K = calib["R"], calib["t"], calib["K"]
-    X = pts_lidar_xyz.astype(np.float32)  # (N,3)
-    cam = (R @ X.T).T + t  # (N,3)
-    zc = cam[:, 2]
+    # 1) 用 R,t 计算相机坐标系下的 Z，用于后续“前方”判断（与畸变无关）
+    R, t = calib["R"], calib["t"]  # float32
+    X32 = pts_lidar_xyz.astype(np.float32, copy=False)  # (N,3)
+    cam = (R @ X32.T).T + t  # (N,3)
+    zc = cam[:, 2].astype(np.float32, copy=False)
 
-    z = zc.copy()
-    z[z == 0] = EPSILON
-
-    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-    u = fx * (cam[:, 0] / z) + cx
-    v = fy * (cam[:, 1] / z) + cy
-    uv = np.column_stack([u, v])
+    # 2) 用 OpenCV 内置投影（含畸变），避免手写公式出错
+    obj = pts_lidar_xyz.astype(np.float64, copy=False).reshape(-1, 1, 3)
+    rvec = np.asarray(calib["rvec"], dtype=np.float64).reshape(3, 1)
+    tvec = np.asarray(calib["tvec"], dtype=np.float64).reshape(3, 1)
+    Kcv = np.asarray(calib["camera_matrix"], dtype=np.float64).reshape(3, 3)
+    dist = np.asarray(calib.get("dist", np.zeros((5,), dtype=np.float64)), dtype=np.float64).reshape(5, 1)
+    img_pts, _ = cv2.projectPoints(obj, rvec, tvec, Kcv, dist)
+    uv = img_pts.reshape(-1, 2).astype(np.float32, copy=False)
     return uv, zc
 
 

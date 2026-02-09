@@ -10,7 +10,7 @@ cali/calibrate_tof_lidar.py
 - 标定 LiDAR->ToF 外参: R, t
 
 注意:
-- 不标畸变, distCoeffs 固定为 0
+- 会估计基础畸变 distCoeffs: [k1,k2,p1,p2,k3]
 - 3D 点坐标系取 LiDAR 坐标系, 视为 objectPoints
 - 2D 点坐标系取 ToF 原始像素坐标系, 视为 imagePoints
 
@@ -56,6 +56,8 @@ from tof_ball_detector import detect_ball_tof_2d  # noqa: E402
 class CalibResult:
     rms: float
     camera_matrix: list[list[float]]
+    # OpenCV distCoeffs: [k1, k2, p1, p2, k3]
+    dist_coeffs: list[float]
     rvec: list[float]
     tvec: list[float]
     n_points: int
@@ -151,17 +153,12 @@ def main() -> int:
 
     # Init camera matrix guess (hard-coded).
     camera_matrix = CAMERA_MATRIX_INIT.copy()
+    # Distortion coeffs: [k1, k2, p1, p2, k3]
     dist = np.zeros((5, 1), dtype=np.float64)
 
     flags = 0
     flags |= cv2.CALIB_USE_INTRINSIC_GUESS
-    flags |= cv2.CALIB_ZERO_TANGENT_DIST
-    flags |= cv2.CALIB_FIX_K1
-    flags |= cv2.CALIB_FIX_K2
-    flags |= cv2.CALIB_FIX_K3
-    flags |= cv2.CALIB_FIX_K4
-    flags |= cv2.CALIB_FIX_K5
-    flags |= cv2.CALIB_FIX_K6
+    # 开启基础畸变参数估计: k1,k2,p1,p2,k3
 
     rms, cam_mtx, dist_out, rvecs, tvecs = cv2.calibrateCamera(
         [obj],
@@ -175,7 +172,7 @@ def main() -> int:
     tvec = np.array(tvecs[0], dtype=np.float64).reshape(3)
 
     # Reprojection and error stats.
-    proj, _ = cv2.projectPoints(obj.reshape(-1, 3), rvec, tvec, cam_mtx, np.zeros((5, 1), dtype=np.float64))
+    proj, _ = cv2.projectPoints(obj.reshape(-1, 3), rvec, tvec, cam_mtx, dist_out)
     proj = proj.reshape(-1, 2).astype(np.float64, copy=False)
     img2 = img.reshape(-1, 2).astype(np.float64, copy=False)
     err = proj - img2
@@ -191,6 +188,7 @@ def main() -> int:
     res = CalibResult(
         rms=float(rms),
         camera_matrix=cam_mtx.astype(np.float64).tolist(),
+        dist_coeffs=dist_out.reshape(-1).astype(np.float64).tolist(),
         rvec=rvec.tolist(),
         tvec=tvec.tolist(),
         n_points=int(len(obj_pts)),

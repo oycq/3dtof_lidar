@@ -110,10 +110,10 @@ py .\cali\calibrate.py
 
 输出：
 
-- `cali/cali_result/calib_result.json`：ToF 内参（`camera_matrix`）与 LiDAR→ToF 外参（`rvec/tvec`）
+- `cali/cali_result/calib_result.json`：ToF 内参（`camera_matrix`）、畸变（`dist_coeffs`）与 LiDAR→ToF 外参（`rvec/tvec`）
 - `cali/cali_result/reproj_error.png`：重投影误差可视化
 
-> 当前实现不估计畸变（`distCoeffs` 固定为 0）。
+> 当前实现会估计基础畸变（`dist_coeffs=[k1,k2,p1,p2,k3]`）。老的结果文件没有该字段时，代码会按“无畸变(全 0)”兼容处理。
 
 ### 4) 投影验证 / 对齐预览
 
