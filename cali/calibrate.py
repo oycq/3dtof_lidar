@@ -33,12 +33,17 @@ import numpy as np
 
 CAMERA_MATRIX_INIT = np.array(
     [
-        [36.0, 0.0, 20.0],
-        [0.0, 36.0, 15.0],
+        [27.5, 0.0, 20.0],
+        [0.0, 27.5, 15.0],
         [0.0, 0.0, 1.0],
     ],
     dtype=np.float64,
 )
+
+# “宏定义”：是否标定畸变参数。
+# - True: 估计畸变 distCoeffs: [k1,k2,p1,p2,k3]
+# - False: 不估计畸变，畸变系数固定为 0（输出也强制为 0）
+CALIBRATE_DISTORTION = False
 
 
 # Allow running from cali/ directly.
@@ -158,7 +163,13 @@ def main() -> int:
 
     flags = 0
     flags |= cv2.CALIB_USE_INTRINSIC_GUESS
-    # 开启基础畸变参数估计: k1,k2,p1,p2,k3
+    if not CALIBRATE_DISTORTION:
+        # 固定所有畸变参数，使其保持为 0，不参与优化。
+        flags |= cv2.CALIB_FIX_K1
+        flags |= cv2.CALIB_FIX_K2
+        flags |= cv2.CALIB_FIX_K3
+        # 对于 p1,p2（切向畸变）也固定为 0
+        flags |= cv2.CALIB_FIX_TANGENT_DIST
 
     rms, cam_mtx, dist_out, rvecs, tvecs = cv2.calibrateCamera(
         [obj],
@@ -168,6 +179,9 @@ def main() -> int:
         dist,
         flags=flags,
     )
+    if not CALIBRATE_DISTORTION:
+        # 进一步保证输出“权威 0”（避免 OpenCV 在特殊情况下返回极小非零值）。
+        dist_out = np.zeros_like(dist_out)
     rvec = np.array(rvecs[0], dtype=np.float64).reshape(3)
     tvec = np.array(tvecs[0], dtype=np.float64).reshape(3)
 

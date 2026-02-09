@@ -578,7 +578,7 @@ def main() -> int:
         elif k == ord(" "):  # Space
             bottom_show_proj = not bottom_show_proj
         elif k == ord("9"):  # Export all scenes to train_data
-            out_dir = ROOT / "train_data"
+            out_dir = ROOT / "nn/train_data"
             try:
                 export_all_scenes_to_train_data(envs, calib, out_dir)
                 _win_message_box("导出完成", f"已导出 {len(envs)} 组数据到:\n{out_dir}")

@@ -32,12 +32,12 @@ if str(ROOT) not in sys.path:
 
 from lidar_ball_detector import LidarBallDetection, detect_ball_lidar  # noqa: E402
 from tof3d import ToF3DParams, tof_histograms, tof_reflectance_mean3_max  # noqa: E402
-from tof_ball_detector import TOF_BALL_MIN_PEAK, detect_ball_tof_2d  # noqa: E402
+from tof_ball_detector import detect_ball_tof_2d  # noqa: E402
 
 
 # ========= 数据目录 =========
 HERE = Path(__file__).resolve().parent
-DATA_DIR = HERE / "./data"
+DATA_DIR = HERE / "data"
 
 # ========= LiDAR 2D 显示参数, 与 visualize_data.py/client.py 对齐 =========
 LIDAR_IMG_W = 700
@@ -292,7 +292,9 @@ def _build_tof_reflect_view(env_dir: Path, tof_center_xy: Optional[tuple[float, 
         )
         return tof_bgr
 
-    params = ToF3DParams(min_peak_count=float(TOF_BALL_MIN_PEAK))
+    # 可视化用的最小峰值过滤（只影响显示，不影响检测）。
+    # 这里不再依赖 tof_ball_detector.py 的固定阈值常量，避免检测与显示耦合。
+    params = ToF3DParams(min_peak_count=0.0)
     hists = tof_histograms(tof_path, params=params).astype(np.float32, copy=False)
     if hists.size == 0:
         return tof_bgr
