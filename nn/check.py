@@ -41,7 +41,7 @@ TOF_C = 64
 
 # 输出分类配置（与 train.py 对齐）
 NUM_BINS = 64
-BIN_M = 0.15
+BIN_M = 0.15 * 4
 MIN_RANGE_M = BIN_M
 MAX_RANGE_M = float(NUM_BINS) * float(BIN_M)
 

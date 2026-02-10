@@ -47,7 +47,7 @@ SHUFFLE = False  # 全量 batch 下打乱只有“batch 内顺序变化”，对
 # - bin0: 无效 GT 概率
 # - bin1..63: 有效距离区间
 NUM_BINS = 64
-BIN_M = 0.15
+BIN_M = 0.15 * 4
 # 最小/最大量程（GT 不在范围内则视为无效，落到 bin0）
 # - 为了避免有效深度落到 bin0（从而和 invalid 混在一起），这里把最小量程设置为 1 个 bin：
 #   depth < 0.15m 视为无效，depth in [0.15m, 9.60m) 视为有效。
