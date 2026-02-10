@@ -12,12 +12,15 @@ nn/train.py
 - output_00001.npy: (30,40) float32，单位米；无效为 0（或 <=0）
 
 网络输出（见 net.py）：
-- 每个像素输出 64 个 logits（softmax 后为 64 个距离区间概率）
-  - 区间 k 表示 [k*0.15m, (k+1)*0.15m)
+- 每个像素输出 64 个 logits（softmax 后为 64 个类别概率）
+  - 类别 0：GT 无效（真值 > 最大量程 / < 最小量程 / NA 等）
+  - 类别 1~63：距离区间概率（注意：为了让 bin0 专用于“无效”，有效距离从 bin1 开始）
+    - 类别 k 表示区间 [k*0.15m, (k+1)*0.15m)
 
 Loss（“熵”）：
-- 对每个有效像素：只取 GT 落在的区间 k，对应的概率 p_k，loss = -log(p_k)
-- 等价实现：`torch.nn.functional.cross_entropy(logits, target_bin)`
+- 对每个像素：取 GT 类别对应的概率 p_k，loss = -log(p_k)
+- 无效 GT 会落在类别 0，因此也参与 loss（学习“无效概率”）
+- 等价实现：`torch.nn.functional.cross_entropy(logits, target_class)`
 
 2026-01：全量 batch 训练（把所有样本堆成一个“大 patch”一次训完），训练轮数见 EPOCHS。
 """
@@ -40,10 +43,16 @@ LR = 1e-3
 EPS = 1e-6
 SHUFFLE = False  # 全量 batch 下打乱只有“batch 内顺序变化”，对本网络通常无意义
 
-# 分类配置：64 个 bin，每个 bin 0.15m（15cm）
+# 分类配置：固定 64 输出
+# - bin0: 无效 GT 概率
+# - bin1..63: 有效距离区间
 NUM_BINS = 64
 BIN_M = 0.15
-IGNORE_INDEX = -1
+# 最小/最大量程（GT 不在范围内则视为无效，落到 bin0）
+# - 为了避免有效深度落到 bin0（从而和 invalid 混在一起），这里把最小量程设置为 1 个 bin：
+#   depth < 0.15m 视为无效，depth in [0.15m, 9.60m) 视为有效。
+MIN_RANGE_M = BIN_M
+MAX_RANGE_M = float(NUM_BINS) * float(BIN_M)
 
 # 是否使用 CUDA（不从命令行读取）
 # - True: 若本机有可用 CUDA，则使用 GPU；否则自动回退到 CPU（会打印提示）
@@ -85,24 +94,29 @@ def to_torch_target_depth(y_hw: np.ndarray, device: torch.device) -> torch.Tenso
     return t.to(device=device, dtype=torch.float32)
 
 def depth_to_bin_index(depth_m: torch.Tensor) -> torch.Tensor:
-    """depth(m) -> bin index (long), invalid(<=0) -> IGNORE_INDEX.
+    """depth(m) -> bin index (long).
 
     depth_m: (N,1,H,W) float32
     return:  (N,H,W) int64
+      - 0: invalid (<=min_range / >=max_range / NA)
+      - 1..63: valid bins
     """
     if depth_m.ndim != 4 or depth_m.shape[1] != 1:
         raise ValueError(f"expect depth_m shape (N,1,H,W), got {tuple(depth_m.shape)}")
 
     d = depth_m[:, 0, :, :]  # (N,H,W)
-    # 仅当真值落在 64 个区间内才参与 loss：
-    # bins: [0,0.15), [0.15,0.30), ..., [(NUM_BINS-1)*0.15, NUM_BINS*0.15)
-    # 注意上边界是开区间：depth == NUM_BINS*BIN_M 也应视为“不落在区间内”
-    max_m = float(NUM_BINS) * float(BIN_M)
+    # 有效距离范围： [MIN_RANGE_M, MAX_RANGE_M)
+    # - 注意上边界是开区间：depth == MAX_RANGE_M 视为 invalid
+    max_m = float(MAX_RANGE_M)
     finite = torch.isfinite(d)
-    valid = finite & (d > 0.0) & (d < max_m)
-    # floor: [0,0.15)->0, [0.15,0.30)->1, ...
+    valid = finite & (d >= float(MIN_RANGE_M)) & (d < max_m)
+
+    # 有效：floor(d/bin_m) 得到 1..63（因为 d>=0.15）
     idx = torch.floor(d / float(BIN_M)).to(dtype=torch.int64)
-    idx = torch.where(valid, idx, torch.full_like(idx, int(IGNORE_INDEX)))
+    # 无效：置为 0
+    idx = torch.where(valid, idx, torch.zeros_like(idx))
+    # 安全裁剪到 [0,63]
+    idx = torch.clamp(idx, 0, int(NUM_BINS) - 1)
     return idx
 
 
@@ -168,26 +182,32 @@ def main() -> int:
         net.train()
         logits = net(inp)  # (N,64,H,W)
 
-        # target bin: (N,H,W) long, invalid -> IGNORE_INDEX
+        # target bin: (N,H,W) long, bin0=invalid
         target = depth_to_bin_index(gt)
-        valid = (target != IGNORE_INDEX)
-        denom = torch.clamp(valid.sum().to(dtype=torch.float32), min=1.0)
+        # loss 归一化：所有像素都参与（包含 invalid）
+        denom = float(target.numel())
+        denom_t = torch.tensor(denom, device=target.device, dtype=torch.float32).clamp(min=1.0)
 
         # per-pixel cross entropy (sum then normalize by valid count)
         # 等价于：loss = -log softmax(logits)[..., target]
         ce_sum = torch.nn.functional.cross_entropy(
             logits,
             target,
-            ignore_index=int(IGNORE_INDEX),
             reduction="sum",
         )
-        loss = ce_sum / denom
+        loss = ce_sum / denom_t
 
         # 训练时简单算个 top1 accuracy（仅有效像素）
         with torch.no_grad():
             pred = torch.argmax(logits, dim=1)  # (N,H,W)
-            correct = (pred == target) & valid
-            acc = correct.sum().to(dtype=torch.float32) / denom
+            correct_all = (pred == target)
+            acc_all = correct_all.to(dtype=torch.float32).mean()
+
+            # 额外输出一个 valid-only accuracy（便于观察有效距离的学习情况）
+            d = gt[:, 0, :, :]
+            valid_gt = torch.isfinite(d) & (d >= float(MIN_RANGE_M)) & (d < float(MAX_RANGE_M))
+            denom_valid = torch.clamp(valid_gt.sum().to(dtype=torch.float32), min=1.0)
+            acc_valid = ((pred == target) & valid_gt).sum().to(dtype=torch.float32) / denom_valid
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -198,7 +218,8 @@ def main() -> int:
         print(
             f"[ep {ep+1:03d}/{EPOCHS}] step {step:06d}  "
             f"ce={loss.item():.6f}  "
-            f"acc={float(acc.detach().cpu().item()):.3f}  "
+            f"acc_all={float(acc_all.detach().cpu().item()):.3f}  "
+            f"acc_valid={float(acc_valid.detach().cpu().item()):.3f}  "
             f"({dt:.1f}s)  batch=N={inp.shape[0]}"
         )
 

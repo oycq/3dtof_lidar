@@ -25,6 +25,7 @@ def main() -> int:
     # 固定配置（不从命令行读取），与 train.py 对齐
     C, H, W = 64, 30, 40
     OPSET = 11
+    # bin0=invalid, bin1..63=valid ranges
     OUT_BINS = 64
 
     here = Path(__file__).resolve().parent

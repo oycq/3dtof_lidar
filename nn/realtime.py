@@ -31,6 +31,8 @@ TOF_C = 64
 # 输出分类配置（与 train.py / net.py 对齐）
 NUM_BINS = 64
 BIN_M = 0.15
+MIN_RANGE_M = BIN_M
+MAX_RANGE_M = float(NUM_BINS) * float(BIN_M)
 
 SHOW_W = 400
 SHOW_H = 300
@@ -131,11 +133,15 @@ def _run_infer(net, device, hists: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
     with torch.no_grad():
         inp = torch.from_numpy(hists).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
-        logits = net(inp)  # (1,64,H,W)
-        probs_t = torch.softmax(logits, dim=1)  # (1,64,H,W)
+        logits = net(inp)  # (1,NUM_BINS,H,W)
+        probs_t = torch.softmax(logits, dim=1)  # (1,NUM_BINS,H,W)
         top_prob_t, top_idx_t = torch.max(probs_t, dim=1)  # (1,H,W)
 
-        pred_depth_t = (top_idx_t.to(dtype=torch.float32) + 0.5) * float(BIN_M)  # (1,H,W)
+        # pred depth:
+        # - bin0 => invalid => depth=0
+        # - bin k(1..63) => interval [k*BIN_M,(k+1)*BIN_M) => center=(k+0.5)*BIN_M
+        idx_f = top_idx_t.to(dtype=torch.float32)
+        pred_depth_t = torch.where(top_idx_t == 0, torch.zeros_like(idx_f), (idx_f + 0.5) * float(BIN_M))  # (1,H,W)
         pred_depth = pred_depth_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
         prob = top_prob_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
 
@@ -251,11 +257,15 @@ def main() -> int:
 
             pr_v = float(cached_pred_depth[py, px])
             pb_v = float(np.clip(cached_prob[py, px], 0.0, 1.0))
-            k_top = int(np.floor(pr_v / float(BIN_M)))
-            k_top = int(np.clip(k_top, 0, NUM_BINS - 1))
-            a_m = float(k_top) * float(BIN_M)
-            b_m = float(k_top + 1) * float(BIN_M)
-            hover_txt = f"pred {pr_v:.3f}m  bin[{k_top:02d}] {a_m:.2f}-{b_m:.2f}m  p {pb_v:.2f}"
+            # hover 显示用的 bin：
+            if pr_v <= 0.0 or (not np.isfinite(pr_v)):
+                hover_txt = f"pred --  bin[00] INVALID  p {pb_v:.2f}"
+            else:
+                k_bin = int(np.floor(pr_v / float(BIN_M)))  # 0..63
+                k_bin = int(np.clip(k_bin, 0, NUM_BINS - 1))
+                a_m = float(k_bin) * float(BIN_M)
+                b_m = float(k_bin + 1) * float(BIN_M)
+                hover_txt = f"pred {pr_v:.3f}m  bin[{k_bin:02d}] {a_m:.2f}-{b_m:.2f}m  p {pb_v:.2f}"
 
             # 标题文字
             in_bgr = _with_text(in_bgr, "INPUT")
