@@ -24,21 +24,14 @@ import torch.nn as nn
 class Network(nn.Module):
     def __init__(self, in_channels: int = 64, out_bins: int = 64):
         super().__init__()
-
-        # 1x1 卷积逐步降通道：64 -> ... -> out_bins
-        # 不下采样，保持 (H,W) 不变
-        if out_bins <= 0:
-            raise ValueError(f"out_bins must be positive, got {out_bins}")
         channels = [in_channels, 64, 64, 64, int(out_bins)]
         layers: list[nn.Module] = []
         for i in range(len(channels) - 2):
-            layers.append(
-                nn.Conv2d(channels[i], channels[i + 1], kernel_size=1, stride=1, padding=0, bias=True)
-            )
+            layers.append(nn.Linear(channels[i], channels[i + 1], bias=True))
             layers.append(nn.ReLU(inplace=True))
 
         # 最后一层输出 out_bins 通道 logits
-        layers.append(nn.Conv2d(channels[-2], channels[-1], kernel_size=1, stride=1, padding=0, bias=True))
+        layers.append(nn.Linear(channels[-2], channels[-1], bias=True))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -46,7 +39,11 @@ class Network(nn.Module):
         x: (B,64,H,W)
         return: (B,out_bins,H,W) probs（内部已做 softmax）
         """
-        logits = self.net(x)
+        # (B,C,H,W) -> (B,H,W,C)，在最后一维做逐像素全连接
+        z = x.permute(0, 2, 3, 1).contiguous()
+        logits = self.net(z)
+        # (B,H,W,out_bins) -> (B,out_bins,H,W)
+        logits = logits.permute(0, 3, 1, 2).contiguous()
         return torch.softmax(logits, dim=1)
 
 
