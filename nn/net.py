@@ -6,11 +6,10 @@ nn/net.py
 
 轻量网络（不做 downsample，适配 30x40 小分辨率）：
 - 输入：ToF 直方图  (B, 64, H, W) 其中 H=30, W=40
-- 输出：            (B, out_bins, H, W) logits
+- 输出：            (B, out_bins, H, W) 概率（每像素 64 类 softmax 后的概率）
   - 推荐 out_bins=64：
-    - 通道 0：无效类别（GT 超出量程 / NA 等）
-    - 通道 1..63：距离区间概率
-      - 通道 k 表示区间 [k*0.15m, (k+1)*0.15m) 的相对置信度（需在外部做 softmax 得到概率）
+    - 通道 0..62：有效距离类别
+    - 通道 63：无效类别（GT 超出量程 / NA 等）
 
 训练 loss（在 train.py 实现）：
 - per-pixel 交叉熵（等价于只取 GT bin 的概率做 -log(prob)，“熵”）
@@ -45,9 +44,10 @@ class Network(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (B,64,H,W)
-        return: (B,out_bins,H,W) logits（外部做 softmax 得概率）
+        return: (B,out_bins,H,W) probs（内部已做 softmax）
         """
-        return self.net(x)
+        logits = self.net(x)
+        return torch.softmax(logits, dim=1)
 
 
 if __name__ == "__main__":

@@ -16,14 +16,13 @@ check_train_effect.py
 - 鼠标悬停显示：pred/gt/bin_range/prob（单行 ASCII，避免 cv2 putText 乱码）
 
 模型输出语义（见 nn/net.py）：
-- 每个像素输出 64 个 logits（softmax 后为 64 个类别概率）
-  - 类别 0：无效（GT 超出量程/NA 等，训练时会落到该类）
-  - 类别 1~63：距离区间概率（有效距离从 bin1 开始，bin0 专用于“无效概率”）
-    - 类别 k 表示区间 [k*0.15m, (k+1)*0.15m)
+- 每个像素输出 64 个概率（net 内部已做 softmax）
+  - 类别 0~62：有效距离概率（非等间距，按 log_{1.06}(GT) 四舍五入映射）
+  - 类别 63：无效（NA / <=0 / >35m）
 - check 的 pred 距离：
-  - top1 类别为 0 时视为无效，显示深度为 0（黑色）
-  - 否则取 top1 区间中心值用于显示
-- check 的 prob = top1 probability（当 top1=0 时即“无效概率”）
+  - top1 类别为 63 时视为无效，显示深度为 0（黑色）
+  - 否则取 base**k 用于显示（k=0..62）
+- check 的 prob = top1 probability（当 top1=63 时即“无效概率”）
 """
 
 from __future__ import annotations
@@ -41,9 +40,10 @@ TOF_C = 64
 
 # 输出分类配置（与 train.py 对齐）
 NUM_BINS = 64
-BIN_M = 0.15 * 4
-MIN_RANGE_M = BIN_M
-MAX_RANGE_M = float(NUM_BINS) * float(BIN_M)
+VALID_BINS = 63
+INVALID_BIN = 63
+MAX_VALID_M = 35.0
+LOG_BASE = 1.06
 
 # 显示方向使用 rot90CW + flipH 后，原始 (H,W)=(30,40) 会变成 (40,30)，
 # 因此显示的宽高比例应为 W:H = 30:40 = 3:4（竖屏）。
@@ -391,25 +391,32 @@ def main() -> int:
     cached_prob: np.ndarray | None = None
     cached_out_probs: np.ndarray | None = None  # (H,W,NUM_BINS) float32
 
+    ln_base = float(np.log(LOG_BASE))
+    if (not np.isfinite(ln_base)) or ln_base <= 0.0:
+        raise ValueError(f"bad LOG_BASE={LOG_BASE}")
+
     while True:
         ip, op = pairs[idx]
         if cached_idx != idx:
             x, gt = _load_pair(ip, op)
             # 与训练对齐的 GT 有效性（用于显示/hover 文案）
-            valid_gt = np.isfinite(gt) & (gt >= float(MIN_RANGE_M)) & (gt < float(MAX_RANGE_M))
+            valid_gt = np.isfinite(gt) & (gt > 0.0) & (gt <= float(MAX_VALID_M))
 
             # run net
             with torch.no_grad():
                 inp = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
-                logits = net(inp)  # (1,NUM_BINS,H,W)
-                probs_t = torch.softmax(logits, dim=1)  # (1,NUM_BINS,H,W)
+                probs_t = net(inp)  # (1,NUM_BINS,H,W) probabilities
                 top_prob_t, top_idx_t = torch.max(probs_t, dim=1)  # (1,H,W)
 
                 # pred depth:
-                # - class0 => invalid => depth=0
-                # - class k(1..63) => interval [k*BIN_M,(k+1)*BIN_M) => center=(k+0.5)*BIN_M
+                # - class63 => invalid => depth=0
+                # - class k(0..62) => depth ~= base**k
                 idx_f = top_idx_t.to(dtype=torch.float32)
-                pred_depth_t = torch.where(top_idx_t == 0, torch.zeros_like(idx_f), (idx_f + 0.5) * float(BIN_M))  # (1,H,W)
+                pred_depth_t = torch.where(
+                    top_idx_t == int(INVALID_BIN),
+                    torch.zeros_like(idx_f),
+                    torch.exp(idx_f * float(ln_base)),
+                )  # (1,H,W)
 
                 pred_depth = (
                     pred_depth_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
@@ -431,7 +438,7 @@ def main() -> int:
             and cached_out_probs is not None
         )
 
-        valid_gt = np.isfinite(cached_gt) & (cached_gt >= float(MIN_RANGE_M)) & (cached_gt < float(MAX_RANGE_M))
+        valid_gt = np.isfinite(cached_gt) & (cached_gt > 0.0) & (cached_gt <= float(MAX_VALID_M))
         p_thr = float(cv2.getTrackbarPos("pThr%", "CHECK_TRAIN")) / 100.0
         # INPUT intensity
         inten_u8 = _render_input_intensity_u8(cached_in)
@@ -484,15 +491,17 @@ def main() -> int:
         # bin range
         k_top = int(np.argmax(cached_out_probs[py, px, :]))
         # 仅显示三项，且全 ASCII，避免 putText 乱码
-        if k_top == 0:
+        if k_top == int(INVALID_BIN):
             hover_txt = (
-                f"pred --  gt {gt_v:.3f}m  bin[00] INVALID  p {pb_v:.2f}"
+                f"pred --  gt {gt_v:.3f}m  bin[{INVALID_BIN:02d}] INVALID  p {pb_v:.2f}"
                 if gt_v > 0
-                else f"pred --  gt --  bin[00] INVALID  p {pb_v:.2f}"
+                else f"pred --  gt --  bin[{INVALID_BIN:02d}] INVALID  p {pb_v:.2f}"
             )
         else:
-            a_m = float(k_top) * float(BIN_M)
-            b_m = float(k_top + 1) * float(BIN_M)
+            # bin k 对应的 log 区间：log_b(d) in [k-0.5, k+0.5)
+            # => d in [b^(k-0.5), b^(k+0.5))
+            a_m = float(np.exp((float(k_top) - 0.5) * ln_base))
+            b_m = float(np.exp((float(k_top) + 0.5) * ln_base))
             hover_txt = (
                 f"pred {pr_v:.3f}m  gt {gt_v:.3f}m  bin[{k_top:02d}] {a_m:.2f}-{b_m:.2f}m  p {pb_v:.2f}"
                 if gt_v > 0

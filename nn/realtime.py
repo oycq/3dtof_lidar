@@ -30,9 +30,10 @@ TOF_C = 64
 
 # 输出分类配置（与 train.py / net.py 对齐）
 NUM_BINS = 64
-BIN_M = 0.15 * 4
-MIN_RANGE_M = BIN_M
-MAX_RANGE_M = float(NUM_BINS) * float(BIN_M)
+VALID_BINS = 63
+INVALID_BIN = 63
+MAX_VALID_M = 35.0
+LOG_BASE = 1.05
 
 SHOW_W = 400
 SHOW_H = 300
@@ -131,17 +132,24 @@ def _run_infer(net, device, hists: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """hist (H,W,64) -> pred_depth, prob (H,W)."""
     import torch
 
+    ln_base = float(np.log(LOG_BASE))
+    if (not np.isfinite(ln_base)) or ln_base <= 0.0:
+        raise ValueError(f"bad LOG_BASE={LOG_BASE}")
+
     with torch.no_grad():
         inp = torch.from_numpy(hists).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
-        logits = net(inp)  # (1,NUM_BINS,H,W)
-        probs_t = torch.softmax(logits, dim=1)  # (1,NUM_BINS,H,W)
+        probs_t = net(inp)  # (1,NUM_BINS,H,W) probabilities
         top_prob_t, top_idx_t = torch.max(probs_t, dim=1)  # (1,H,W)
 
         # pred depth:
-        # - bin0 => invalid => depth=0
-        # - bin k(1..63) => interval [k*BIN_M,(k+1)*BIN_M) => center=(k+0.5)*BIN_M
+        # - bin63 => invalid => depth=0
+        # - bin k(0..62) => depth ~= base**k
         idx_f = top_idx_t.to(dtype=torch.float32)
-        pred_depth_t = torch.where(top_idx_t == 0, torch.zeros_like(idx_f), (idx_f + 0.5) * float(BIN_M))  # (1,H,W)
+        pred_depth_t = torch.where(
+            top_idx_t == int(INVALID_BIN),
+            torch.zeros_like(idx_f),
+            torch.exp(idx_f * float(ln_base)),
+        )  # (1,H,W)
         pred_depth = pred_depth_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
         prob = top_prob_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
 
@@ -257,14 +265,15 @@ def main() -> int:
 
             pr_v = float(cached_pred_depth[py, px])
             pb_v = float(np.clip(cached_prob[py, px], 0.0, 1.0))
-            # hover 显示用的 bin：
+            # hover 显示用的 bin（与 log bin 对齐）：
+            ln_base = float(np.log(LOG_BASE))
             if pr_v <= 0.0 or (not np.isfinite(pr_v)):
-                hover_txt = f"pred --  bin[00] INVALID  p {pb_v:.2f}"
+                hover_txt = f"pred --  bin[{INVALID_BIN:02d}] INVALID  p {pb_v:.2f}"
             else:
-                k_bin = int(np.floor(pr_v / float(BIN_M)))  # 0..63
-                k_bin = int(np.clip(k_bin, 0, NUM_BINS - 1))
-                a_m = float(k_bin) * float(BIN_M)
-                b_m = float(k_bin + 1) * float(BIN_M)
+                k_bin = int(np.rint(np.log(max(pr_v, EPS)) / max(ln_base, EPS)))  # 0..62
+                k_bin = int(np.clip(k_bin, 0, VALID_BINS - 1))
+                a_m = float(np.exp((float(k_bin) - 0.5) * ln_base))
+                b_m = float(np.exp((float(k_bin) + 0.5) * ln_base))
                 hover_txt = f"pred {pr_v:.3f}m  bin[{k_bin:02d}] {a_m:.2f}-{b_m:.2f}m  p {pb_v:.2f}"
 
             # 标题文字
