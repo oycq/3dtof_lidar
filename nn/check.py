@@ -16,13 +16,9 @@ check_train_effect.py
 - 鼠标悬停显示：pred/gt/bin_range/prob（单行 ASCII，避免 cv2 putText 乱码）
 
 模型输出语义（见 nn/net.py）：
-- 每个像素输出 64 个概率（net 内部已做 softmax）
-  - 类别 0~62：有效距离概率（非等间距，按 log_{1.06}(GT) 四舍五入映射）
-  - 类别 63：无效（NA / <=0 / >35m）
-- check 的 pred 距离：
-  - top1 类别为 63 时视为无效，显示深度为 0（黑色）
-  - 否则取 base**k 用于显示（k=0..62）
-- check 的 prob = top1 probability（当 top1=63 时即“无效概率”）
+- bin_logits: 64-bin 分类输出
+- dist: 距离输出（米，argmax(bin) 还原）
+- conf: 置信输出，表示“预测误差在 ±7% 内”的概率
 """
 
 from __future__ import annotations
@@ -312,7 +308,7 @@ def _colorize_error(err_m: np.ndarray, valid: np.ndarray) -> np.ndarray:
 def _colorize_prob(prob: np.ndarray, valid: np.ndarray) -> np.ndarray:
     """0~1 的标量图 -> 灰度 BGR（gamma=DISP_GAMMA），invalid 为黑。
 
-    历史上这里用于显示 prob；现在用于显示 “P(gt 在 pred±5% 区间)” 的概率图。
+    历史上这里用于显示 top1 prob；现在用于显示 “P(|pred-gt|<=7%)” 的概率图。
     """
     p = np.asarray(prob, dtype=np.float32)
     m = valid.astype(bool)
@@ -361,7 +357,6 @@ def main() -> int:
 
     # 本文件已移动到 nn/ 下：nn_dir = .../nn
     nn_dir = Path(__file__).resolve().parent
-    root = nn_dir.parent
     train_dir = nn_dir / "train_data"
     ckpt_path = nn_dir / "model_last.pt"
 
@@ -378,7 +373,7 @@ def main() -> int:
     from net import Network  # noqa: E402
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = Network(in_channels=TOF_C, out_bins=NUM_BINS).to(device)
+    net = Network(in_channels=TOF_C).to(device)
     net.eval()
 
     if ckpt_path.exists():
@@ -397,7 +392,7 @@ def main() -> int:
     cv2.namedWindow("HIST", cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow("OUT_HIST", cv2.WINDOW_AUTOSIZE)
     # 概率阈值滑动条：低于该阈值的像素，PRED 直接置黑不显示
-    # 概率 = top1 区间的 softmax 概率
+    # 概率 = 置信输出 conf（P(|pred-gt|<=7%)）
     cv2.createTrackbar("pThr%", "CHECK_TRAIN", 50, 100, lambda _: None)
 
     mouse = {"x": 0, "y": 0}
@@ -432,26 +427,15 @@ def main() -> int:
             # run net
             with torch.no_grad():
                 inp = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
-                probs_t = net(inp)  # (1,NUM_BINS,H,W) probabilities
-                top_prob_t, top_idx_t = torch.max(probs_t, dim=1)  # (1,H,W)
+                out_t = net.forward_train(inp)
+                logits_t = out_t["bin_logits"]  # (1,NUM_BINS,H,W)
+                probs_t = torch.softmax(logits_t, dim=1)
+                dist_t = out_t["dist"][:, 0, :, :]  # (1,H,W), 直接为米
+                conf_t = out_t["conf"][:, 0, :, :]  # (1,H,W)
 
-                # pred depth:
-                # - class63 => invalid => depth=0
-                # - class k(0..62) => depth ~= base**k
-                idx_f = top_idx_t.to(dtype=torch.float32)
-                pred_depth_t = torch.where(
-                    top_idx_t == int(INVALID_BIN),
-                    torch.zeros_like(idx_f),
-                    torch.exp(idx_f * float(ln_base)),
-                )  # (1,H,W)
-
-                pred_depth = (
-                    pred_depth_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
-                )  # (H,W)
-                prob = top_prob_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)  # (H,W)
-                out_probs = (
-                    probs_t.squeeze(0).permute(1, 2, 0).detach().cpu().numpy().astype(np.float32, copy=False)
-                )  # (H,W,NUM_BINS)
+                pred_depth = dist_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)  # (H,W)
+                prob = conf_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)  # (H,W)
+                out_probs = probs_t.squeeze(0).permute(1, 2, 0).detach().cpu().numpy().astype(np.float32, copy=False)
 
             cached_in, cached_gt = x, gt
             cached_pred_depth, cached_prob, cached_out_probs = pred_depth, prob, out_probs
@@ -475,7 +459,7 @@ def main() -> int:
         in_big = cv2.resize(inten_u8, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
         in_bgr = cv2.cvtColor(in_big, cv2.COLOR_GRAY2BGR)
 
-        # GT / PRED / PROB(±5%)
+        # GT / PRED / P_OK(±7%)
         # 关键：以 GT 的动态范围建立“距离→颜色”映射系统，PRED 跟随同一套映射
         inv_range = _inv_depth_range_from_depth(cached_gt)
         if inv_range is None:
@@ -492,7 +476,7 @@ def main() -> int:
             pred_bgr = pred_bgr.copy()
             pred_bgr[~conf_mask] = (0, 0, 0)
 
-        # PROB 图：显示 top1 probability（不依赖 GT）
+        # PROB 图：显示置信头输出（不依赖 GT）
         valid_all = np.ones((TOF_H, TOF_W), dtype=bool)
         prob_bgr = _colorize_prob(cached_prob, valid_all)
 
@@ -516,14 +500,14 @@ def main() -> int:
         pb_v = float(np.clip(cached_prob[py, px], 0.0, 1.0))
         refl_v = float(np.sum(cached_in[py, px, :HIST_BINS], dtype=np.float32))
 
-        # bin range
+        # bin range（由网络输出概率直方图取 top1）
         k_top = int(np.argmax(cached_out_probs[py, px, :]))
         # 仅显示三项，且全 ASCII，避免 putText 乱码
         if k_top == int(INVALID_BIN):
             hover_txt = (
-                f"pred --  gt {gt_v:.3f}m  bin[{INVALID_BIN:02d}] INVALID  p {pb_v:.2f}  refl {refl_v:.1f}"
+                f"pred {pr_v:.3f}m  gt {gt_v:.3f}m  bin[{INVALID_BIN:02d}] INVALID  p7 {pb_v:.2f}  refl {refl_v:.1f}"
                 if gt_v > 0
-                else f"pred --  gt --  bin[{INVALID_BIN:02d}] INVALID  p {pb_v:.2f}  refl {refl_v:.1f}"
+                else f"pred {pr_v:.3f}m  gt --  bin[{INVALID_BIN:02d}] INVALID  p7 {pb_v:.2f}  refl {refl_v:.1f}"
             )
         else:
             # bin k 对应的 log 区间：log_b(d) in [k-0.5, k+0.5)
@@ -531,9 +515,9 @@ def main() -> int:
             a_m = float(np.exp((float(k_top) - 0.5) * ln_base))
             b_m = float(np.exp((float(k_top) + 0.5) * ln_base))
             hover_txt = (
-                f"pred {pr_v:.3f}m  gt {gt_v:.3f}m  bin[{k_top:02d}] {a_m:.2f}-{b_m:.2f}m  p {pb_v:.2f}  refl {refl_v:.1f}"
+                f"pred {pr_v:.3f}m  gt {gt_v:.3f}m  bin[{k_top:02d}] {a_m:.2f}-{b_m:.2f}m  p7 {pb_v:.2f}  refl {refl_v:.1f}"
                 if gt_v > 0
-                else f"pred {pr_v:.3f}m  gt --  bin[{k_top:02d}] {a_m:.2f}-{b_m:.2f}m  p {pb_v:.2f}  refl {refl_v:.1f}"
+                else f"pred {pr_v:.3f}m  gt --  bin[{k_top:02d}] {a_m:.2f}-{b_m:.2f}m  p7 {pb_v:.2f}  refl {refl_v:.1f}"
             )
 
         # 单窗口拼图，更方便截图
@@ -542,7 +526,7 @@ def main() -> int:
         )
         gt_big = _with_text(gt_big, "GT")
         pred_big = _with_text(pred_big, "PRED")
-        prob_big = _with_text(prob_big, "PROB")
+        prob_big = _with_text(prob_big, "P_OK(+-7%)")
 
         # 四张图同步绘制鼠标指向的点
         dx_m, dy_m = _pixel_to_disp_xy(px, py, SHOW_W, SHOW_H)
@@ -569,12 +553,11 @@ def main() -> int:
         hist_img = _render_histogram_bgr(hbins, w=HIST_W, h=HIST_H, max_bins=HIST_BINS, title="IN_HIST")
         cv2.imshow("HIST", hist_img)
 
-        # hovered point output histogram（网络输出 NUM_CLASSES 个概率）
+        # hovered point output histogram（网络输出 NUM_BINS 个概率）
         try:
             obins = cached_out_probs[py, px, :]
         except Exception:
             obins = np.zeros((NUM_BINS,), dtype=np.float32)
-        # 概率直方图 y 轴固定到 1.0（概率范围）
         out_hist_img = _render_histogram_bgr(
             obins, w=HIST_W, h=HIST_H, max_bins=NUM_BINS, title="OUT_HIST", fixed_vmax=1.0
         )
