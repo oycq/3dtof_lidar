@@ -397,12 +397,13 @@ def export_all_scenes_to_train_data(envs: List[Path], calib: Dict[str, np.ndarra
     导出所有场景到 train_data：
     - input_00001.npy: ToF 原始直方图 (H,W,C) float32
     - output_00001.npy: 聚合后的 LiDAR 距离图 (H,W) float32，单位米，无点为 0
+    - raw_00001.raw: ToF 直方图正文（去掉头部 header 后的原始字节）
 
     说明：
     - 场景顺序：按 envs 列表顺序（已按目录名排序）
-    - 每个场景都会产出一对文件；若某文件缺失，则写入全 0 占位
+    - 每个场景都会产出三份文件；若某文件缺失，则写入占位（npy 为全 0，raw 为空文件）
     """
-    # 先删再建
+    # 先删再建：导出前清空旧 train_data
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -412,6 +413,7 @@ def export_all_scenes_to_train_data(envs: List[Path], calib: Dict[str, np.ndarra
     empty_out = np.zeros((TOF_H, TOF_W), dtype=np.float32)
 
     total = len(envs)
+    raw_header_bytes = int(ToF3DParams().header_bytes)
     for i, env in enumerate(envs, start=1):
         # ToF input
         tof_path = env / "tof.raw"
@@ -437,8 +439,15 @@ def export_all_scenes_to_train_data(envs: List[Path], calib: Dict[str, np.ndarra
 
         in_path = out_dir / f"input_{i:05d}.npy"
         out_path = out_dir / f"output_{i:05d}.npy"
+        raw_path = out_dir / f"raw_{i:05d}.raw"
         np.save(str(in_path), hists.astype(np.float32, copy=False))
         np.save(str(out_path), dmap.astype(np.float32, copy=False))
+        if tof_path.exists():
+            with tof_path.open("rb") as f_src, raw_path.open("wb") as f_dst:
+                f_src.seek(raw_header_bytes, 0)
+                shutil.copyfileobj(f_src, f_dst)
+        else:
+            raw_path.write_bytes(b"")
 
         # 控制台进度（导出多场景时可见）
         if (i == 1) or (i == total) or (i % 25 == 0):
