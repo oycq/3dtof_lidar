@@ -47,6 +47,7 @@ TOF_SHOW_W = 300
 TOF_SHOW_H = 400
 TOF_MIN_PEAK = 100  # 峰值低于该值认为置信度不足（标黑/深度置 0）
 TOF_VALID_BINS = int(ToF3DParams().valid_bin_num)  # 峰值/质心的有效 bin 数（与 tof3d.py 对齐）
+TOF_HIST_SHOW_BINS = 62  # TOF_HIST 仅显示/统计前 62 个 bin
 
 # TOF 距离补偿（标定公式）
 # 约定：x/y 为毫米（mm），最终显示仍用米（m）
@@ -75,9 +76,10 @@ def _make_hist_image(hist: np.ndarray, x: int, y: int, depth_m: float, *, low_co
     cv2.rectangle(img, (left, top), (right, bottom), (70, 70, 70), 1)
 
     hist = np.asarray(hist, dtype=np.float32).reshape(-1)
-    n = int(hist.size)
+    n = int(min(hist.size, TOF_HIST_SHOW_BINS))
     if n <= 1:
         return img
+    hist = hist[:n]
 
     # 需求：直方图上限固定为 1024（便于不同像素对比）
     y_max = 1024.0
