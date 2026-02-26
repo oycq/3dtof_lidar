@@ -8,7 +8,7 @@ nn/realtime.py
 运行深度学习模型并实时显示 3 张图：
 - INPUT: ToF 强度（直方图求和）
 - PRED: 预测深度（伪彩）
-- PROB: 预测置信度图（top1 区间概率）
+- PROB: 预测置信度图（conf 分支输出）
 
 交互：
 - 鼠标悬停：显示 pred/bin_range/prob
@@ -33,10 +33,11 @@ NUM_BINS = 64
 VALID_BINS = 63
 INVALID_BIN = 63
 MAX_VALID_M = 35.0
-LOG_BASE = 1.05
+LOG_BASE = 1.06
 
-SHOW_W = 400
-SHOW_H = 300
+# 与 check.py 对齐：显示方向使用 rot90CW + flipH（等价转置），单图按 3:4 竖屏显示
+SHOW_W = 390
+SHOW_H = 520
 HEADER_H = 32
 
 EPS = 1e-6
@@ -45,24 +46,23 @@ DEPTH_FAR_M = 10.0
 
 
 def _disp_xy_to_pixel(dx: int, dy: int, show_w: int, show_h: int) -> Tuple[int, int]:
-    """显示坐标 -> ToF 像素坐标（显示做了 flipV，因此这里需要还原）。"""
+    """显示坐标 -> ToF 像素坐标（显示做了 rot90CW + flipH）。"""
     sw = max(int(show_w), 1)
     sh = max(int(show_h), 1)
-    px = int(np.clip(dx * TOF_W / sw, 0, TOF_W - 1))
-    py_disp = int(np.clip(dy * TOF_H / sh, 0, TOF_H - 1))
-    py = (TOF_H - 1) - py_disp
+    # 与 check.py 一致：该组合等价于转置，display x -> 原始 py，display y -> 原始 px
+    py = int(np.clip(dx * TOF_H / sw, 0, TOF_H - 1))
+    px = int(np.clip(dy * TOF_W / sh, 0, TOF_W - 1))
     return px, py
 
 
 def _pixel_to_disp_xy(px: int, py: int, show_w: int, show_h: int) -> Tuple[int, int]:
-    """ToF 像素坐标 -> 显示坐标（显示做了 flipV）。"""
+    """ToF 像素坐标 -> 显示坐标（显示做了 rot90CW + flipH）。"""
     sw = max(int(show_w), 1)
     sh = max(int(show_h), 1)
     px_i = int(np.clip(px, 0, TOF_W - 1))
     py_i = int(np.clip(py, 0, TOF_H - 1))
-    py_disp = (TOF_H - 1) - py_i
-    dx = int(np.clip((px_i + 0.5) * sw / TOF_W, 0, sw - 1))
-    dy = int(np.clip((py_disp + 0.5) * sh / TOF_H, 0, sh - 1))
+    dx = int(np.clip((py_i + 0.5) * sw / TOF_H, 0, sw - 1))
+    dy = int(np.clip((px_i + 0.5) * sh / TOF_W, 0, sh - 1))
     return dx, dy
 
 
@@ -132,26 +132,19 @@ def _run_infer(net, device, hists: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """hist (H,W,64) -> pred_depth, prob (H,W)."""
     import torch
 
-    ln_base = float(np.log(LOG_BASE))
-    if (not np.isfinite(ln_base)) or ln_base <= 0.0:
-        raise ValueError(f"bad LOG_BASE={LOG_BASE}")
-
-    with torch.no_grad():
+    with torch.inference_mode():
         inp = torch.from_numpy(hists).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
-        probs_t = net(inp)  # (1,NUM_BINS,H,W) probabilities
-        top_prob_t, top_idx_t = torch.max(probs_t, dim=1)  # (1,H,W)
+        dist_t, conf_t = net(inp)  # (1,1,H,W), (1,1,H,W)
+        pred_depth = dist_t[:, 0, :, :].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+        prob = conf_t[:, 0, :, :].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
 
-        # pred depth:
-        # - bin63 => invalid => depth=0
-        # - bin k(0..62) => depth ~= base**k
-        idx_f = top_idx_t.to(dtype=torch.float32)
-        pred_depth_t = torch.where(
-            top_idx_t == int(INVALID_BIN),
-            torch.zeros_like(idx_f),
-            torch.exp(idx_f * float(ln_base)),
-        )  # (1,H,W)
-        pred_depth = pred_depth_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
-        prob = top_prob_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+    # 与训练时有效深度定义对齐：超出 MAX_VALID_M 的分类 bin 视作无效显示
+    invalid = (~np.isfinite(pred_depth)) | (pred_depth <= 0.0) | (pred_depth > float(MAX_VALID_M))
+    if np.any(invalid):
+        pred_depth = pred_depth.copy()
+        prob = prob.copy()
+        pred_depth[invalid] = 0.0
+        prob[invalid] = 0.0
 
     return pred_depth, prob
 
@@ -181,7 +174,7 @@ def main() -> int:
     ckpt_path = nn_dir / "model_last.pt"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = Network(in_channels=TOF_C, out_bins=NUM_BINS).to(device)
+    net = Network(in_channels=TOF_C).to(device)
     net.eval()
 
     if ckpt_path.exists():
@@ -239,8 +232,9 @@ def main() -> int:
 
             # INPUT intensity
             inten_u8 = _render_input_intensity_u8(cached_in)
-            in_big = cv2.resize(inten_u8, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
-            in_big = cv2.flip(in_big, 0)
+            in_u8 = cv2.rotate(inten_u8, cv2.ROTATE_90_CLOCKWISE)
+            in_u8 = cv2.flip(in_u8, 1)
+            in_big = cv2.resize(in_u8, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
             in_bgr = cv2.cvtColor(in_big, cv2.COLOR_GRAY2BGR)
 
             # PRED depth
@@ -249,12 +243,14 @@ def main() -> int:
             if np.any(~conf_mask):
                 pred_bgr = pred_bgr.copy()
                 pred_bgr[~conf_mask] = (0, 0, 0)
-            pred_big = cv2.flip(cv2.resize(pred_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST), 0)
+            pred_bgr = cv2.flip(cv2.rotate(pred_bgr, cv2.ROTATE_90_CLOCKWISE), 1)
+            pred_big = cv2.resize(pred_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
 
             # PROB
             valid = cached_pred_depth > 0
             prob_bgr = _colorize_prob(cached_prob, valid)
-            prob_big = cv2.flip(cv2.resize(prob_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST), 0)
+            prob_bgr = cv2.flip(cv2.rotate(prob_bgr, cv2.ROTATE_90_CLOCKWISE), 1)
+            prob_big = cv2.resize(prob_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
 
             # hover info（单行）
             mx = int(np.clip(mouse.get("x", 0), 0, SHOW_W * 3 - 1))
