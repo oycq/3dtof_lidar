@@ -25,4 +25,4 @@ train_data
 
 network.onnx
 
-trapezoids.svg
+factory/*.svg
