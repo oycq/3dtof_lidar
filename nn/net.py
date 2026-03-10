@@ -15,7 +15,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-KERNEL_SIZE = 1
+KERNEL_SIZE = 3
 PADDING = KERNEL_SIZE // 2
 
 class Network(nn.Module):
