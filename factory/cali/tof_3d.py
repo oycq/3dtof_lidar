@@ -15,13 +15,12 @@ tof_3d.py
 
 from __future__ import annotations
 
+import sys
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
-
-from tof3d import ToF3DParams, tof_distance_matrix_from_u16, tof_histograms_from_u16, tof_reflectance_mean3_max
-from tof_server import ToFRealtimeServer
 
 TOF_W = 40
 TOF_H = 30
@@ -40,6 +39,23 @@ SHOW_W = ROI_H * SHOW_SCALE
 SHOW_H = ROI_W * SHOW_SCALE
 HIST_SHOW_BINS = 62
 MIN_PEAK = 100
+
+
+def _import_runtime_deps():
+    try:
+        from tof3d import ToF3DParams, tof_distance_matrix_from_u16, tof_histograms_from_u16, tof_reflectance_mean3_max
+        from tof_server import ToFRealtimeServer
+    except ModuleNotFoundError as exc:
+        # 允许在 factory/cali 目录下直接运行：把项目根目录加入搜索路径后重试。
+        if exc.name not in {"tof3d", "tof_server"}:
+            raise
+        project_root = Path(__file__).resolve().parents[2]
+        root_s = str(project_root)
+        if root_s not in sys.path:
+            sys.path.insert(0, root_s)
+        from tof3d import ToF3DParams, tof_distance_matrix_from_u16, tof_histograms_from_u16, tof_reflectance_mean3_max
+        from tof_server import ToFRealtimeServer
+    return ToF3DParams, tof_distance_matrix_from_u16, tof_histograms_from_u16, tof_reflectance_mean3_max, ToFRealtimeServer
 
 
 def _tof_intensity_to_u8(intensity_sum: np.ndarray, *, gamma: float = 2.2, target_mean: float = 0.18) -> np.ndarray:
@@ -192,6 +208,14 @@ def _make_hist_image(hist: np.ndarray, px: int, py: int, depth_m: float, *, low_
 
 
 def main() -> int:
+    (
+        ToF3DParams,
+        tof_distance_matrix_from_u16,
+        tof_histograms_from_u16,
+        tof_reflectance_mean3_max,
+        ToFRealtimeServer,
+    ) = _import_runtime_deps()
+
     cv2.namedWindow("TOF_PREVIEW", cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow("TOF_HIST", cv2.WINDOW_AUTOSIZE)
 
