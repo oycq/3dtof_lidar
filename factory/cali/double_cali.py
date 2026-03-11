@@ -9,17 +9,16 @@ import numpy as np
 IMG_W = 20
 IMG_H = 20
 
-# 平面到相机原点的固定距离（米）。
-PLANE_DISTANCE_M = 1.053
-
 # 固定配置：直接运行脚本即可，不需要命令行参数
-DATA_FILE = "data.npy"
+DATA_FILE_1 = "data1.npy"
+DATA_FILE_2 = "data2.npy"
 
 # ===== 待优化参数初值（宏定义）=====
 F_INIT = 27.5
 BIAS_INIT_M = 1.0
 AX_INIT_DEG = 0.0
 AY_INIT_DEG = 0.0
+D_INIT_M = 1.0
 
 # ===== 待优化参数范围（宏定义）=====
 F_MIN = 5.0
@@ -30,6 +29,8 @@ AX_MIN_DEG = -40.0
 AX_MAX_DEG = 40.0
 AY_MIN_DEG = -40.0
 AY_MAX_DEG = 40.0
+D_MIN_M = 0.2
+D_MAX_M = 3.0
 
 # ===== 优化器参数（宏定义）=====
 POWELL_MAXITER = 4000
@@ -92,10 +93,9 @@ def _residuals(
     v_flat: np.ndarray,
     cx_fixed: float,
     cy_fixed: float,
-    plane_distance_m: float,
 ) -> np.ndarray:
     # 计算每个像素点到目标平面的带符号误差。
-    f, bias, ax_deg, ay_deg = [float(v) for v in params]
+    f, bias, ax_deg, ay_deg, plane_distance_m = [float(v) for v in params]
     pts = _points_from_depth(depth_flat_m, u_flat, v_flat, f, cx_fixed, cy_fixed, bias)
     n = _plane_normal_from_angles(ax_deg, ay_deg)
     # 点到平面的有符号距离：n·p - d
@@ -159,16 +159,18 @@ def _draw_3d_plot(
     points: np.ndarray,
     residuals: np.ndarray,
     normal: np.ndarray,
+    plane_distance_m: float,
+    title: str,
 ) -> None:
     # 在给定坐标轴上绘制3D点云和平面。
-    px, py, pz = _make_plane_mesh(points, normal, PLANE_DISTANCE_M)
+    px, py, pz = _make_plane_mesh(points, normal, plane_distance_m)
     ax.scatter(points[:, 0], points[:, 1], points[:, 2], c=residuals, cmap="coolwarm", s=18, alpha=0.9)
     ax.plot_surface(px, py, pz, alpha=0.35, color="tab:green", linewidth=0, antialiased=True)
     ax.scatter([0.0], [0.0], [0.0], c="k", s=40, marker="x")
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
     ax.set_zlabel("Z (m)")
-    ax.set_title("ToF points and calibrated plane")
+    ax.set_title(title)
     ax.set_box_aspect((1.0, 1.0, 1.0))
 
 
@@ -204,14 +206,27 @@ def _draw_error_distribution_hist(
     )
 
 
-def _show_two_plots(residuals_m: np.ndarray, points: np.ndarray, normal: np.ndarray) -> None:
-    # 在一个窗口里同时显示误差直方图和3D图。
-    fig = plt.figure(figsize=(14, 6))
-    ax_hist = fig.add_subplot(1, 2, 1)
-    ax_3d = fig.add_subplot(1, 2, 2, projection="3d")
+def _show_four_plots(
+    residuals_1_m: np.ndarray,
+    points_1: np.ndarray,
+    normal_1: np.ndarray,
+    distance_1_m: float,
+    residuals_2_m: np.ndarray,
+    points_2: np.ndarray,
+    normal_2: np.ndarray,
+    distance_2_m: float,
+) -> None:
+    # 在一个窗口里同时展示两组数据的误差分布和3D图。
+    fig = plt.figure(figsize=(16, 10))
+    ax_hist_1 = fig.add_subplot(2, 2, 1)
+    ax_3d_1 = fig.add_subplot(2, 2, 2, projection="3d")
+    ax_hist_2 = fig.add_subplot(2, 2, 3)
+    ax_3d_2 = fig.add_subplot(2, 2, 4, projection="3d")
 
-    _draw_error_distribution_hist(ax_hist, residuals_m)
-    _draw_3d_plot(ax_3d, points, residuals_m, normal)
+    _draw_error_distribution_hist(ax_hist_1, residuals_1_m)
+    _draw_3d_plot(ax_3d_1, points_1, residuals_1_m, normal_1, distance_1_m, "data1: points and calibrated plane")
+    _draw_error_distribution_hist(ax_hist_2, residuals_2_m)
+    _draw_3d_plot(ax_3d_2, points_2, residuals_2_m, normal_2, distance_2_m, "data2: points and calibrated plane")
 
     fig.tight_layout()
     plt.show()
@@ -221,21 +236,28 @@ def _show_two_plots(residuals_m: np.ndarray, points: np.ndarray, normal: np.ndar
 
 if __name__ == "__main__":
     # 执行标定、保存结果并显示可视化。
-    depth_map = _load_depth_map(DATA_FILE)
-    depth_flat = depth_map.reshape(-1)
+    depth_map_1 = _load_depth_map(DATA_FILE_1)
+    depth_map_2 = _load_depth_map(DATA_FILE_2)
+    depth_flat_1 = depth_map_1.reshape(-1)
+    depth_flat_2 = depth_map_2.reshape(-1)
     u_flat, v_flat = _build_roi_uv()
 
     # 光心固定在20x20图像中心。
     cx0 = (IMG_W - 1) / 2.0
     cy0 = (IMG_H - 1) / 2.0
 
-    # 参数顺序: [f, bias, ax, ay]，cx/cy 固定在图像中心。
+    # 参数顺序:
+    # [f, bias, ax1, ay1, d1, ax2, ay2, d2]，其中 f/bias 共享，两个平面姿态与距离独立。
     x0 = np.array(
         [
             F_INIT,
             BIAS_INIT_M,
             AX_INIT_DEG,
             AY_INIT_DEG,
+            D_INIT_M,
+            AX_INIT_DEG,
+            AY_INIT_DEG,
+            D_INIT_M,
         ],
         dtype=np.float64,
     )
@@ -245,12 +267,32 @@ if __name__ == "__main__":
         (BIAS_MIN_M, BIAS_MAX_M),
         (AX_MIN_DEG, AX_MAX_DEG),
         (AY_MIN_DEG, AY_MAX_DEG),
+        (D_MIN_M, D_MAX_M),
+        (AX_MIN_DEG, AX_MAX_DEG),
+        (AY_MIN_DEG, AY_MAX_DEG),
+        (D_MIN_M, D_MAX_M),
     ]
 
     def objective_rms(p: np.ndarray) -> float:
-        # 优化目标：最小化所有像素点到平面的RMS误差。
-        r = _residuals(p, depth_flat, u_flat, v_flat, cx0, cy0, PLANE_DISTANCE_M)
-        return _rms(r)
+        # 优化目标：最小化两次采集整体的RMS误差。
+        f, bias, ax1, ay1, d1, ax2, ay2, d2 = [float(v) for v in p]
+        r1 = _residuals(
+            np.array([f, bias, ax1, ay1, d1], dtype=np.float64),
+            depth_flat_1,
+            u_flat,
+            v_flat,
+            cx0,
+            cy0,
+        )
+        r2 = _residuals(
+            np.array([f, bias, ax2, ay2, d2], dtype=np.float64),
+            depth_flat_2,
+            u_flat,
+            v_flat,
+            cx0,
+            cy0,
+        )
+        return _rms(np.concatenate([r1, r2], axis=0))
 
     # Powell：不需要梯度，适合这个小维度问题快速试参。
     pw_res = minimize(
@@ -266,32 +308,61 @@ if __name__ == "__main__":
         },
     )
 
-    # 取出优化后的最优参数，并重新计算全量残差与RMS。
+    # 取出优化后的最优参数，并重新计算两组残差。
     x_opt = np.asarray(pw_res.x, dtype=np.float64)
-    r_opt = _residuals(x_opt, depth_flat, u_flat, v_flat, cx0, cy0, PLANE_DISTANCE_M)
-    rms_m = _rms(r_opt)
+    f, bias, ax1_deg, ay1_deg, d1_m, ax2_deg, ay2_deg, d2_m = [float(v) for v in x_opt]
+    r_opt_1 = _residuals(
+        np.array([f, bias, ax1_deg, ay1_deg, d1_m], dtype=np.float64),
+        depth_flat_1,
+        u_flat,
+        v_flat,
+        cx0,
+        cy0,
+    )
+    r_opt_2 = _residuals(
+        np.array([f, bias, ax2_deg, ay2_deg, d2_m], dtype=np.float64),
+        depth_flat_2,
+        u_flat,
+        v_flat,
+        cx0,
+        cy0,
+    )
+    rms_all_m = _rms(np.concatenate([r_opt_1, r_opt_2], axis=0))
+    rms_1_m = _rms(r_opt_1)
+    rms_2_m = _rms(r_opt_2)
 
     # 解包参数并转换角度单位，便于打印阅读。
-    f, bias, ax_deg, ay_deg = [float(v) for v in x_opt]
     cx = float(cx0)
     cy = float(cy0)
-    normal = _plane_normal_from_angles(ax_deg, ay_deg)
+    normal_1 = _plane_normal_from_angles(ax1_deg, ay1_deg)
+    normal_2 = _plane_normal_from_angles(ax2_deg, ay2_deg)
 
-    # 用最优参数重建点云，并统计有效点数。
-    pts_opt = _points_from_depth(depth_flat, u_flat, v_flat, f, cx, cy, bias)
-    n_total = int(depth_flat.size)
-    n_valid = n_total
-    residual_valid = r_opt
+    # 用最优参数重建两组点云。
+    pts_opt_1 = _points_from_depth(depth_flat_1, u_flat, v_flat, f, cx, cy, bias)
+    pts_opt_2 = _points_from_depth(depth_flat_2, u_flat, v_flat, f, cx, cy, bias)
 
     # 打印标定结果（不写json，直接看终端）。
     print("=== cali_tof result ===")
     print(f"f              : {f:.6f} px")
     print(f"cx, cy         : ({cx:.6f}, {cy:.6f}) px (fixed center)")
     print(f"bias           : {bias:.6f} m")
-    print(f"ax, ay         : ({ax_deg:.6f}°, {ay_deg:.6f}°)")
-    print(f"rms            : {rms_m:.6f} m")
-    print(f"plane distance : {PLANE_DISTANCE_M:.6f} m (fixed)")
+    print(f"[data1] ax, ay  : ({ax1_deg:.6f}°, {ay1_deg:.6f}°)")
+    print(f"[data1] dist    : {d1_m:.6f} m")
+    print(f"[data1] rms     : {rms_1_m:.6f} m")
+    print(f"[data2] ax, ay  : ({ax2_deg:.6f}°, {ay2_deg:.6f}°)")
+    print(f"[data2] dist    : {d2_m:.6f} m")
+    print(f"[data2] rms     : {rms_2_m:.6f} m")
+    print(f"[all]   rms     : {rms_all_m:.6f} m")
 
-    # 可视化：左误差分布，右3D点云+平面。
-    _show_two_plots(residual_valid, pts_opt, normal)
+    # 可视化：两组数据各自显示误差分布和3D点云+平面。
+    _show_four_plots(
+        r_opt_1,
+        pts_opt_1,
+        normal_1,
+        d1_m,
+        r_opt_2,
+        pts_opt_2,
+        normal_2,
+        d2_m,
+    )
 

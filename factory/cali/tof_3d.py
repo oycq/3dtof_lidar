@@ -10,6 +10,8 @@ tof_3d.py
 
 交互：
 - 鼠标移动/左键拖动：更新 hover 像素与直方图
+- 按键 1：保存 ROI centroid 距离图到 data1.npy
+- 按键 2：保存 ROI centroid 距离图到 data2.npy
 - ESC：退出
 """
 
@@ -240,6 +242,12 @@ def main() -> int:
     fps_show = 0.0
     t_prev = time.perf_counter()
 
+    def save_roi_centroid_dist(filename: str) -> None:
+        hists_roi = cached_hists[ROI_Y0:ROI_Y1, ROI_X0:ROI_X1, :]
+        dist_m = _centroid_distance_map_m(hists_roi, show_bins=HIST_SHOW_BINS, peak_divisor=10.0, r=4)
+        np.save(filename, dist_m.astype(np.float32, copy=False))
+        print(f"[tof_3d] saved {filename} shape={dist_m.shape} dtype={dist_m.dtype}")
+
     try:
         while True:
             frame = tof_srv.get_latest()
@@ -301,11 +309,12 @@ def main() -> int:
             cv2.imshow("TOF_HIST", hist_view)
 
             k = int(cv2.waitKey(1) & 0xFF)
-            if k == 32:  # SPACE
-                hists_roi = cached_hists[ROI_Y0:ROI_Y1, ROI_X0:ROI_X1, :]
-                dist_m = _centroid_distance_map_m(hists_roi, show_bins=HIST_SHOW_BINS, peak_divisor=10.0, r=4)
-                np.save("data.npy", dist_m.astype(np.float32, copy=False))
-                print(f"[tof_3d] saved data.npy shape={dist_m.shape} dtype={dist_m.dtype}")
+            if k == ord("1"):
+                save_roi_centroid_dist("data1.npy")
+            elif k == ord("2"):
+                save_roi_centroid_dist("data2.npy")
+            elif k == 32:  # SPACE (兼容旧行为)
+                save_roi_centroid_dist("data.npy")
             if k == 27:
                 break
     finally:

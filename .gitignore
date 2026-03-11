@@ -28,4 +28,5 @@ network.onnx
 factory/*.svg
 
 cali_tof_result.json
-data.npy
+data*.npy
+
