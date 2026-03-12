@@ -79,6 +79,7 @@ def _centroid_distance_map_m(
 ) -> np.ndarray:
     """
     逐点计算 ROI 内 centroid，并输出距离图（米）：
+    先找峰值 bin，再用峰值 ±r（含端点）窗口做加权重心。
     distance = centroid * 0.15
     """
     h = np.asarray(hists_roi, dtype=np.float32)
@@ -99,16 +100,11 @@ def _centroid_distance_map_m(
             if peak_v <= 0.0:
                 continue
             s = max(0, peak_bin - int(r))
-            e = min(use_bins, peak_bin + int(r))
-            if e <= s + 1:
+            e = min(use_bins, peak_bin + int(r) + 1)
+            if e <= s:
                 continue
             wts = v[s:e].astype(np.float32, copy=False)
             bins = np.arange(s, e, dtype=np.float32)
-            keep = wts >= (peak_v / float(max(peak_divisor, 1e-6)))
-            if not np.any(keep):
-                continue
-            wts = wts[keep]
-            bins = bins[keep]
             denom = float(np.sum(wts))
             if denom <= 0.0:
                 continue
@@ -169,14 +165,10 @@ def _make_hist_image(hist: np.ndarray, px: int, py: int, depth_m: float, *, low_
         if peak_v > 0.0:
             r = 4
             s = max(0, min(peak_bin, valid_n - 1) - r)
-            e = min(valid_n, min(peak_bin, valid_n - 1) + r)
-            if e > s + 1:
+            e = min(valid_n, min(peak_bin, valid_n - 1) + r + 1)
+            if e > s:
                 wts = v[s:e].astype(np.float32, copy=False)
                 bins = np.arange(s, e, dtype=np.float32)
-                # 重心前先去掉低计数 bin：仅保留 >= 峰值 1/10 的点
-                keep = wts >= (peak_v / 10.0)
-                wts = wts[keep]
-                bins = bins[keep]
                 denom = float(np.sum(wts))
                 if denom > 0.0:
                     centroid = float(np.dot(bins, wts) / denom)
