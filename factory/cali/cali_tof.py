@@ -3,6 +3,7 @@
 
 import math
 from scipy.optimize import minimize
+from scipy.ndimage import uniform_filter
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -10,22 +11,19 @@ IMG_W = 20
 IMG_H = 20
 
 # 平面到相机原点的固定距离（米）。
-PLANE_DISTANCE_M = 1.053
+PLANE_DISTANCE_M = 0.867
 
 # 固定配置：直接运行脚本即可，不需要命令行参数
 DATA_FILE = "data.npy"
 
 # ===== 待优化参数初值（宏定义）=====
 F_INIT = 27.5
-BIAS_INIT_M = 1.0
 AX_INIT_DEG = 0.0
 AY_INIT_DEG = 0.0
 
 # ===== 待优化参数范围（宏定义）=====
 F_MIN = 5.0
 F_MAX = 120.0
-BIAS_MIN_M = -0.5
-BIAS_MAX_M = 2.5
 AX_MIN_DEG = -40.0
 AX_MAX_DEG = 40.0
 AY_MIN_DEG = -40.0
@@ -93,10 +91,11 @@ def _residuals(
     cx_fixed: float,
     cy_fixed: float,
     plane_distance_m: float,
+    bias_fixed_m: float,
 ) -> np.ndarray:
     # 计算每个像素点到目标平面的带符号误差。
-    f, bias, ax_deg, ay_deg = [float(v) for v in params]
-    pts = _points_from_depth(depth_flat_m, u_flat, v_flat, f, cx_fixed, cy_fixed, bias)
+    f, ax_deg, ay_deg = [float(v) for v in params]
+    pts = _points_from_depth(depth_flat_m, u_flat, v_flat, f, cx_fixed, cy_fixed, bias_fixed_m)
     n = _plane_normal_from_angles(ax_deg, ay_deg)
     # 点到平面的有符号距离：n·p - d
     dist = pts @ n - float(plane_distance_m)
@@ -117,6 +116,13 @@ def _load_depth_map(path: str) -> np.ndarray:
     if arr.shape != (IMG_H, IMG_W):
         raise ValueError(f"expect depth map shape {(IMG_H, IMG_W)}, got {arr.shape}")
     return arr
+
+
+def _compute_bias_from_depth(depth_map_m: np.ndarray, plane_distance_m: float) -> float:
+    # 先做 5x5 均值滤波，再用最近距离减固定平面距离得到 bias。
+    filtered = uniform_filter(np.asarray(depth_map_m, dtype=np.float64), size=5, mode="nearest")
+    nearest_m = float(np.min(filtered))
+    return nearest_m - float(plane_distance_m)
 
 
 def _make_plane_mesh(
@@ -222,6 +228,7 @@ def _show_two_plots(residuals_m: np.ndarray, points: np.ndarray, normal: np.ndar
 if __name__ == "__main__":
     # 执行标定、保存结果并显示可视化。
     depth_map = _load_depth_map(DATA_FILE)
+    bias_fixed = _compute_bias_from_depth(depth_map, PLANE_DISTANCE_M)
     depth_flat = depth_map.reshape(-1)
     u_flat, v_flat = _build_roi_uv()
 
@@ -229,11 +236,10 @@ if __name__ == "__main__":
     cx0 = (IMG_W - 1) / 2.0
     cy0 = (IMG_H - 1) / 2.0
 
-    # 参数顺序: [f, bias, ax, ay]，cx/cy 固定在图像中心。
+    # 参数顺序: [f, ax, ay]，cx/cy 固定在图像中心，bias 由数据计算固定。
     x0 = np.array(
         [
             F_INIT,
-            BIAS_INIT_M,
             AX_INIT_DEG,
             AY_INIT_DEG,
         ],
@@ -242,14 +248,13 @@ if __name__ == "__main__":
 
     bounds = [
         (F_MIN, F_MAX),
-        (BIAS_MIN_M, BIAS_MAX_M),
         (AX_MIN_DEG, AX_MAX_DEG),
         (AY_MIN_DEG, AY_MAX_DEG),
     ]
 
     def objective_rms(p: np.ndarray) -> float:
         # 优化目标：最小化所有像素点到平面的RMS误差。
-        r = _residuals(p, depth_flat, u_flat, v_flat, cx0, cy0, PLANE_DISTANCE_M)
+        r = _residuals(p, depth_flat, u_flat, v_flat, cx0, cy0, PLANE_DISTANCE_M, bias_fixed)
         return _rms(r)
 
     # Powell：不需要梯度，适合这个小维度问题快速试参。
@@ -268,11 +273,12 @@ if __name__ == "__main__":
 
     # 取出优化后的最优参数，并重新计算全量残差与RMS。
     x_opt = np.asarray(pw_res.x, dtype=np.float64)
-    r_opt = _residuals(x_opt, depth_flat, u_flat, v_flat, cx0, cy0, PLANE_DISTANCE_M)
+    r_opt = _residuals(x_opt, depth_flat, u_flat, v_flat, cx0, cy0, PLANE_DISTANCE_M, bias_fixed)
     rms_m = _rms(r_opt)
 
     # 解包参数并转换角度单位，便于打印阅读。
-    f, bias, ax_deg, ay_deg = [float(v) for v in x_opt]
+    f, ax_deg, ay_deg = [float(v) for v in x_opt]
+    bias = float(bias_fixed)
     cx = float(cx0)
     cy = float(cy0)
     normal = _plane_normal_from_angles(ax_deg, ay_deg)
