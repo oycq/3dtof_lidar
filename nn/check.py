@@ -538,9 +538,13 @@ def main() -> int:
         top = np.hstack([in_bgr, gt_big])
         bot = np.hstack([pred_big, prob_big])
         view = np.vstack([top, bot])
+        # 顶部标题栏：显示当前样本进度 + hover 文本
+        progress_txt = f"sample {idx + 1}/{len(pairs)}"
+        header_txt = f"{progress_txt}  |  {hover_txt}"
+
         # hover 行单独放到顶部标题栏，避免和 tile 内的 "INPUT/GT/..." 文本重叠
         header = np.zeros((HEADER_H, view.shape[1], 3), dtype=np.uint8)
-        header = _with_text(header, hover_txt)
+        header = _with_text(header, header_txt)
         view = np.vstack([header, view])
 
         cv2.imshow("CHECK_TRAIN", view)
