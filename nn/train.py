@@ -29,9 +29,9 @@ from net import Network
 
 
 # 固定配置（不从命令行读取）
-EPOCHS_STAGE1 = 10000
-EPOCHS_STAGE2 = 5000
-LR = 1e-3
+EPOCHS_STAGE1 = 1000
+EPOCHS_STAGE2 = 1000
+LR = 1e-4
 EPS = 1e-6
 SHUFFLE = False  # 全量 batch 下打乱只有“batch 内顺序变化”，对本网络通常无意义
 OK_RATIO = 0.1
@@ -39,6 +39,9 @@ OK_RATIO = 0.1
 NUM_BINS = 64
 MAX_VALID_M = 35.0
 LOG_BASE = 1.06
+
+# 最后 N 组数据留作测试集，不参与训练
+TEST_HOLDOUT = 40
 
 # 是否使用 CUDA（不从命令行读取）
 # - True: 若本机有可用 CUDA，则使用 GPU；否则自动回退到 CPU（会打印提示）
@@ -129,6 +132,75 @@ def stack_all_pairs(pairs: List[Tuple[Path, Path]], device: torch.device) -> Tup
     return inp, gt
 
 
+def eval_stage1(
+    net: Network,
+    inp: torch.Tensor,
+    gt: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """在给定 batch 上做一次 stage1 前向并计算 ce / ok@10%."""
+    net.eval()
+    with torch.no_grad():
+        out = net.forward_train(inp)
+        bin_logits = out["bin_logits"]  # (N,64,H,W)
+        dist_pred = out["dist"][:, 0, :, :]  # (N,H,W)
+        target, valid = depth_to_bin_index_and_mask(gt)
+        d = gt[:, 0, :, :]
+
+        valid_n = int(valid.sum().detach().cpu().item())
+        if valid_n <= 0:
+            return torch.zeros((), device=inp.device), torch.zeros((), device=inp.device), 0
+
+        logits_flat = bin_logits.permute(0, 2, 3, 1).reshape(-1, NUM_BINS)
+        target_flat = target.reshape(-1)
+        valid_flat = valid.reshape(-1)
+        ce = F.cross_entropy(logits_flat[valid_flat], target_flat[valid_flat], reduction="mean")
+
+        abs_rel = torch.zeros_like(d, dtype=torch.float32)
+        abs_rel[valid] = torch.abs(dist_pred[valid] - d[valid]) / torch.clamp(d[valid], min=EPS)
+        ok10 = (abs_rel[valid] <= OK_RATIO).to(dtype=torch.float32).mean()
+
+    return ce, ok10, valid_n
+
+
+def eval_stage2(
+    net: Network,
+    inp: torch.Tensor,
+    gt: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """在给定 batch 上做一次 stage2 前向并计算 BCE / p>50% / acc|p>50%."""
+    net.eval()
+    with torch.no_grad():
+        out = net.forward_train(inp)
+        dist_pred = out["dist"][:, 0, :, :]  # (N,H,W), meter
+        conf_prob = out["conf"][:, 0, :, :]  # (N,H,W), sigmoid output
+
+        d = gt[:, 0, :, :]
+        valid_gt = torch.isfinite(d) & (d > 0.0) & (d <= float(MAX_VALID_M))
+
+        target_ok = torch.zeros_like(conf_prob, dtype=torch.float32)
+        abs_rel = torch.zeros_like(d, dtype=torch.float32)
+        abs_rel[valid_gt] = torch.abs(dist_pred[valid_gt] - d[valid_gt]) / torch.clamp(d[valid_gt], min=EPS)
+        target_ok[valid_gt] = (abs_rel[valid_gt] <= OK_RATIO).to(dtype=torch.float32)
+        loss = F.binary_cross_entropy(conf_prob, target_ok, reduction="mean")
+
+        valid_n = int(valid_gt.sum().detach().cpu().item())
+        if valid_n <= 0:
+            zero = torch.zeros((), dtype=torch.float32, device=conf_prob.device)
+            return loss, zero, zero, 0
+
+        conf_valid = conf_prob[valid_gt]
+        target_valid = target_ok[valid_gt] > 0.5
+        pred_pos = conf_valid >= 0.5
+        pos_ratio = pred_pos.to(dtype=torch.float32).mean()
+
+        if bool(pred_pos.any().detach().cpu().item()):
+            pos_acc = (target_valid[pred_pos]).to(dtype=torch.float32).mean()
+        else:
+            pos_acc = torch.zeros((), dtype=torch.float32, device=conf_prob.device)
+
+    return loss, pos_ratio, pos_acc, valid_n
+
+
 def main() -> int:
     here = Path(__file__).resolve().parent
     train_dir = here / "train_data"
@@ -139,26 +211,30 @@ def main() -> int:
     if not pairs:
         raise FileNotFoundError(f"no input/output pairs found under: {train_dir}")
 
+    # 最后 TEST_HOLDOUT 组作为测试集，不参与训练
+    n_holdout = min(TEST_HOLDOUT, max(0, len(pairs) - 1))
+    train_pairs = pairs[: len(pairs) - n_holdout]
+    test_pairs = pairs[len(pairs) - n_holdout :]
+    if n_holdout == 0:
+        print("[data] 全部数据用于训练（未留测试集）")
+    else:
+        print(f"[data] 训练集 {len(train_pairs)} 组, 测试集（仅评估）{len(test_pairs)} 组")
+
     cuda_ok = torch.cuda.is_available()
     if USE_CUDA and not cuda_ok:
         print("[device] USE_CUDA=True but torch.cuda.is_available()=False, fallback to CPU.")
     device = torch.device("cuda" if (USE_CUDA and cuda_ok) else "cpu")
     print(f"[device] {device}")
-    print(f"[data] {train_dir}  pairs={len(pairs)}")
+    print(f"[data] {train_dir}  总 pairs={len(pairs)}  训练用={len(train_pairs)}")
 
     net = Network(in_channels=C).to(device)
 
-    # 全量 batch：一次性加载并堆叠
-    t_load0 = time.time()
-    try:
-        inp_all, gt_all = stack_all_pairs(pairs, device)
-    except RuntimeError as e:
-        raise RuntimeError(
-            "Failed to stack all training data into one big batch (possibly OOM). "
-            "Try: run on CPU or reduce files under nn/train_data."
-        ) from e
-    dt_load = time.time() - t_load0
-    print(f"[batch] inp={tuple(inp_all.shape)} gt={tuple(gt_all.shape)}  (load+stack {dt_load:.2f}s)")
+    # 全量 batch：加载训练集，并（若有）加载测试集用于评估
+    inp_train, gt_train = stack_all_pairs(train_pairs, device)
+    inp_test, gt_test = stack_all_pairs(test_pairs, device)
+
+    print(f"[batch] train_inp={tuple(inp_train.shape)} train_gt={tuple(gt_train.shape)}")
+    print(f"[batch] test_inp={tuple(inp_test.shape)} test_gt={tuple(gt_test.shape)}")
 
     t0 = time.time()
 
@@ -166,20 +242,19 @@ def main() -> int:
     set_trainable(net, True)
     opt1 = torch.optim.Adam(net.parameters(), lr=LR)
     for ep in range(EPOCHS_STAGE1):
-        if SHUFFLE and inp_all.shape[0] > 1:
-            perm = torch.randperm(inp_all.shape[0], device=inp_all.device)
-            inp = inp_all[perm]
-            gt = gt_all[perm]
+        if SHUFFLE and inp_train.shape[0] > 1:
+            perm = torch.randperm(inp_train.shape[0], device=inp_train.device)
+            inp = inp_train[perm]
+            gt = gt_train[perm]
         else:
-            inp = inp_all
-            gt = gt_all
+            inp = inp_train
+            gt = gt_train
 
+        # 训练一步
         net.train()
         out = net.forward_train(inp)
         bin_logits = out["bin_logits"]  # (N,64,H,W), raw logits
-        dist_pred = out["dist"][:, 0, :, :]  # (N,H,W), meter
         target, valid = depth_to_bin_index_and_mask(gt)  # (N,H,W), (N,H,W)
-        d = gt[:, 0, :, :]
 
         valid_n = int(valid.sum().detach().cpu().item())
         if valid_n <= 0:
@@ -190,69 +265,79 @@ def main() -> int:
         valid_flat = valid.reshape(-1)
         loss = F.cross_entropy(logits_flat[valid_flat], target_flat[valid_flat], reduction="mean")
 
-        with torch.no_grad():
-            abs_rel = torch.zeros_like(d, dtype=torch.float32)
-            abs_rel[valid] = torch.abs(dist_pred[valid] - d[valid]) / torch.clamp(d[valid], min=EPS)
-            ok10 = (abs_rel[valid] <= OK_RATIO).to(dtype=torch.float32).mean()
-
         opt1.zero_grad(set_to_none=True)
         loss.backward()
         opt1.step()
 
+        # 统一用 eval_stage1 做评估（训练集 + 测试集）
+        train_ce, train_ok10, _ = eval_stage1(net, inp_train, gt_train)
+        test_ce, test_ok10, _ = eval_stage1(net, inp_test, gt_test)
+
         dt = time.time() - t0
-        print(
-            f"[stage1 {ep+1:05d}/{EPOCHS_STAGE1}] "
-            f"ce={loss.item():.6f}  "
-            f"ok@10%={float(ok10.detach().cpu().item()):.3f}  "
-            f"({dt:.1f}s)"
-        )
+        if test_ce is not None and test_ok10 is not None:
+            print(
+                f"[stage1 {ep+1:05d}/{EPOCHS_STAGE1}] "
+                f"train_ce={float(train_ce.detach().cpu().item()):.6f}  "
+                f"train_ok@10%={float(train_ok10.detach().cpu().item()):.3f}  "
+                f"test_ce={float(test_ce.detach().cpu().item()):.6f}  "
+                f"test_ok@10%={float(test_ok10.detach().cpu().item()):.3f}  "
+                f"({dt:.1f}s)"
+            )
+        else:
+            print(
+                f"[stage1 {ep+1:05d}/{EPOCHS_STAGE1}] "
+                f"ce={loss.item():.6f}  "  # 这里保留一次 loss 打印
+                f"({dt:.1f}s)"
+            )
 
     # ===== stage 2: train probability branch only =====
     set_trainable(net, False)
     set_trainable(net.prob, True)
     opt2 = torch.optim.Adam(net.prob.parameters(), lr=LR)
     for ep in range(EPOCHS_STAGE2):
-        inp = inp_all
-        gt = gt_all
-        d = gt[:, 0, :, :]
-        valid_gt = torch.isfinite(d) & (d > 0.0) & (d <= float(MAX_VALID_M))
+        inp = inp_train
+        gt = gt_train
 
+        # 训练一步
         net.train()
         out = net.forward_train(inp)
         dist_pred = out["dist"][:, 0, :, :]  # (N,H,W), meter
         conf_prob = out["conf"][:, 0, :, :]  # (N,H,W), sigmoid output
 
-        # 所有点都参与 BCE：
-        # - valid_gt: 按 ±10% 判定 target(1/0)
-        # - 超阈值/无效点: target 固定 0
+        # 与 eval_stage2 中一致：按 ±10% 生成 target_ok
+        d = gt[:, 0, :, :]
+        valid_gt = torch.isfinite(d) & (d > 0.0) & (d <= float(MAX_VALID_M))
         target_ok = torch.zeros_like(conf_prob, dtype=torch.float32)
         abs_rel = torch.zeros_like(d, dtype=torch.float32)
         abs_rel[valid_gt] = torch.abs(dist_pred[valid_gt] - d[valid_gt]) / torch.clamp(d[valid_gt], min=EPS)
         target_ok[valid_gt] = (abs_rel[valid_gt] <= OK_RATIO).to(dtype=torch.float32)
         loss = F.binary_cross_entropy(conf_prob, target_ok, reduction="mean")
 
-        with torch.no_grad():
-            conf_valid = conf_prob[valid_gt]
-            target_valid = target_ok[valid_gt] > 0.5
-            pred_pos = conf_valid >= 0.5
-            pos_ratio = pred_pos.to(dtype=torch.float32).mean()
-
-            if bool(pred_pos.any().detach().cpu().item()):
-                pos_acc = (target_valid[pred_pos]).to(dtype=torch.float32).mean()
-            else:
-                pos_acc = torch.zeros((), dtype=torch.float32, device=conf_prob.device)
-
         opt2.zero_grad(set_to_none=True)
         loss.backward()
         opt2.step()
 
+        # 统一用 eval_stage2 做评估（训练集 + 测试集）
+        train_loss2, train_pos_ratio, train_pos_acc, _ = eval_stage2(net, inp_train, gt_train)
+        test_loss2, test_pos_ratio, test_pos_acc, _ = eval_stage2(net, inp_test, gt_test)
+
         dt = time.time() - t0
-        print(
-            f"[stage2 {ep+1:05d}/{EPOCHS_STAGE2}] "
-            f"loss={loss.item():.6f}  "
-            f"p>50%={float(pos_ratio.detach().cpu().item()):.3f}  "
-            f"acc|p>50%={float(pos_acc.detach().cpu().item()):.3f}  ({dt:.1f}s)"
-        )
+        if test_loss2 is not None and test_pos_ratio is not None and test_pos_acc is not None:
+            print(
+                f"[stage2 {ep+1:05d}/{EPOCHS_STAGE2}] "
+                f"train_loss={float(train_loss2.detach().cpu().item()):.6f}  "
+                f"train_p>50%={float(train_pos_ratio.detach().cpu().item()):.3f}  "
+                f"train_acc|p>50%={float(train_pos_acc.detach().cpu().item()):.3f}  "
+                f"test_loss={float(test_loss2.detach().cpu().item()):.6f}  "
+                f"test_p>50%={float(test_pos_ratio.detach().cpu().item()):.3f}  "
+                f"test_acc|p>50%={float(test_pos_acc.detach().cpu().item()):.3f}  "
+                f"({dt:.1f}s)"
+            )
+        else:
+            print(
+                f"[stage2 {ep+1:05d}/{EPOCHS_STAGE2}] "
+                f"loss={loss.item():.6f}  ({dt:.1f}s)"
+            )
 
     # 训练完保存一份
     ckpt = here / "model_last.pt"

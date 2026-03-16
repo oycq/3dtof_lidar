@@ -13,7 +13,7 @@ check_train_effect.py
 - cv2.imshow
 - 4/6 切换样本，ESC 退出
 - ToF 强度与深度图做 resize + (rot90CW + flipH) 以对齐项目里的显示习惯（同 cali/check.py）
-- 鼠标悬停显示：pred/gt/bin/prob（单行 ASCII，避免 cv2 putText 乱码）
+- 鼠标悬停显示：pred/gt/bin_range/prob（单行 ASCII，避免 cv2 putText 乱码）
 
 模型输出语义（见 nn/net.py）：
 - bin_logits: 64-bin 分类输出
@@ -39,6 +39,8 @@ NUM_BINS = 64
 VALID_BINS = 63
 INVALID_BIN = 63
 MAX_VALID_M = 35.0
+MAX_GT_SHOW_M = 30.0
+LOG_BASE = 1.06
 
 # 显示方向使用 rot90CW + flipH 后，原始 (H,W)=(30,40) 会变成 (40,30)，
 # 因此显示的宽高比例应为 W:H = 30:40 = 3:4（竖屏）。
@@ -53,8 +55,7 @@ HIST_W = 620
 HIST_H = 260
 
 EPS = 1e-6
-# 显示用 gamma（宏定义/全局常量）
-INPUT_GAMMA = 2.2
+# 显示用 gamma（宏定义/全局常量）：用于反射率/概率等灰度映射的视觉增强
 DISP_GAMMA = 1.2
 
 
@@ -187,23 +188,33 @@ def _render_histogram_bgr(
 
 
 def _render_input_intensity_u8(hists: np.ndarray) -> np.ndarray:
-    """(H,W,64) -> (H,W) uint8 peak intensity.
+    """(H,W,64) -> (H,W) uint8 intensity/reflectance.
 
-    显示映射（按需求）：
-    - 峰值 = 64 个 bin 的最大值
-    - 归一化：0 -> 0，1023 -> 1
-    - 再做 gamma=2.2（显示用，使用 pow(x, 1/gamma)）
+    反射率用“所有返回光子数”表征：对 64 个 bin 全部求和。
+    显示映射：
+    - 以反射率分布的 5%~95% 百分位做拉伸：p5 -> 0, p95 -> 255（抑制离群点）
+    - 再做 gamma=DISP_GAMMA（提升暗部层次）
     """
-    # 峰值强度（每个像素在 64bin 上取最大值）
+    # 只用前 62 个 bin（0~61）的返回光子求和作为反射率/强度
     h = hists.astype(np.float32, copy=False)
-    peak = np.max(h, axis=2)
-    if not peak.size:
+    inten = np.sum(h[:, :, :HIST_BINS], axis=2)
+    if not inten.size:
         return np.zeros((TOF_H, TOF_W), dtype=np.uint8)
 
-    # 归一到 0~1：峰值 0 -> 0, 峰值 1023 -> 1
-    norm = np.clip(peak / 1023.0, 0.0, 1.0)
+    m = np.isfinite(inten)
+    if not np.any(m):
+        return np.zeros((TOF_H, TOF_W), dtype=np.uint8)
+
+    # 用百分位范围做对比度拉伸（更稳）
+    vmin = float(np.percentile(inten[m], 5))
+    vmax = float(np.percentile(inten[m], 95))
+    if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or vmax <= vmin:
+        return np.zeros((TOF_H, TOF_W), dtype=np.uint8)
+
+    # 归一到 0~1：最小反射率 -> 0，最大反射率 -> 1
+    norm = np.clip((inten - vmin) / (vmax - vmin), 0.0, 1.0)
     # gamma（显示用，常规做法是 pow(x, 1/gamma)）
-    gamma = float(INPUT_GAMMA)
+    gamma = float(DISP_GAMMA)
     if np.isfinite(gamma) and gamma > 0 and abs(gamma - 1.0) > 1e-6:
         norm = np.power(norm, 1.0 / gamma)
 
@@ -403,12 +414,18 @@ def main() -> int:
     cached_prob: np.ndarray | None = None
     cached_out_probs: np.ndarray | None = None  # (H,W,NUM_BINS) float32
 
+    ln_base = float(np.log(LOG_BASE))
+    if (not np.isfinite(ln_base)) or ln_base <= 0.0:
+        raise ValueError(f"bad LOG_BASE={LOG_BASE}")
+
     while True:
         ip, op = pairs[idx]
         if cached_idx != idx:
             x, gt = _load_pair(ip, op)
             # 与训练对齐的 GT 有效性（用于显示/hover 文案）
-            valid_gt = np.isfinite(gt) & (gt > 0.0) & (gt <= float(MAX_VALID_M))
+            # 注意：显示时希望“真值图不显示距离大于 MAX_GT_SHOW_M 米的部分”，
+            # 因此这里把 GT>MAX_GT_SHOW_M 视作无效
+            valid_gt = np.isfinite(gt) & (gt > 0.0) & (gt <= float(MAX_GT_SHOW_M))
 
             # run net
             with torch.no_grad():
@@ -435,7 +452,8 @@ def main() -> int:
             and cached_out_probs is not None
         )
 
-        valid_gt = np.isfinite(cached_gt) & (cached_gt > 0.0) & (cached_gt <= float(MAX_VALID_M))
+        # 显示时的真值有效区域：仅保留距离不超过 MAX_GT_SHOW_M 米的部分
+        valid_gt = np.isfinite(cached_gt) & (cached_gt > 0.0) & (cached_gt <= float(MAX_GT_SHOW_M))
         p_thr = float(cv2.getTrackbarPos("pThr%", "CHECK_TRAIN")) / 100.0
         # INPUT intensity
         inten_u8 = _render_input_intensity_u8(cached_in)
@@ -446,14 +464,21 @@ def main() -> int:
         in_bgr = cv2.cvtColor(in_big, cv2.COLOR_GRAY2BGR)
 
         # GT / PRED / P_OK(±7%)
-        # 关键：以 GT 的动态范围建立“距离→颜色”映射系统，PRED 跟随同一套映射
-        inv_range = _inv_depth_range_from_depth(cached_gt)
+        # 关键：以“裁剪后(>MAX_GT_SHOW_M 置为 0)”的 GT 动态范围建立“距离→颜色”映射系统，
+        # PRED 跟随同一套映射；这样真值图中不会显示距离大于 MAX_GT_SHOW_M 米的区域
+        gt_for_disp = np.where(
+            np.isfinite(cached_gt) & (cached_gt > 0.0) & (cached_gt <= float(MAX_GT_SHOW_M)),
+            cached_gt,
+            0.0,
+        )
+        inv_range = _inv_depth_range_from_depth(gt_for_disp)
         if inv_range is None:
             gt_bgr = np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
             pred_bgr = np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
         else:
             inv_vmin, inv_vmax = inv_range
-            gt_bgr = _colorize_depth_with_range(cached_gt, inv_vmin, inv_vmax)
+            # 真值显示时只画出 <=MAX_GT_SHOW_M 的部分，其余为 0/黑
+            gt_bgr = _colorize_depth_with_range(gt_for_disp, inv_vmin, inv_vmax)
             pred_bgr = _colorize_depth_with_range(cached_pred_depth, inv_vmin, inv_vmax)
 
         # 概率过滤：低概率像素不显示（置黑）
@@ -484,17 +509,32 @@ def main() -> int:
         gt_v = float(cached_gt[py, px])
         pr_v = float(cached_pred_depth[py, px])
         pb_v = float(np.clip(cached_prob[py, px], 0.0, 1.0))
-        peak_v = float(np.max(cached_in[py, px, :]))
+        refl_v = float(np.sum(cached_in[py, px, :HIST_BINS], dtype=np.float32))
 
-        # hover 文本不显示 bin，仅保留 pred/gt/p7/peak
-        hover_txt = (
-            f"pred {pr_v:.3f}m  gt {gt_v:.3f}m  p7 {pb_v:.2f}  peak {peak_v:.1f}"
-            if gt_v > 0
-            else f"pred {pr_v:.3f}m  gt --  p7 {pb_v:.2f}  peak {peak_v:.1f}"
-        )
+        # bin range（由网络输出概率直方图取 top1）
+        k_top = int(np.argmax(cached_out_probs[py, px, :]))
+        # 仅显示三项，且全 ASCII，避免 putText 乱码
+        if k_top == int(INVALID_BIN):
+            hover_txt = (
+                f"pred {pr_v:.3f}m  gt {gt_v:.3f}m  bin[{INVALID_BIN:02d}] INVALID  p7 {pb_v:.2f}  refl {refl_v:.1f}"
+                if gt_v > 0
+                else f"pred {pr_v:.3f}m  gt --  bin[{INVALID_BIN:02d}] INVALID  p7 {pb_v:.2f}  refl {refl_v:.1f}"
+            )
+        else:
+            # bin k 对应的 log 区间：log_b(d) in [k-0.5, k+0.5)
+            # => d in [b^(k-0.5), b^(k+0.5))
+            a_m = float(np.exp((float(k_top) - 0.5) * ln_base))
+            b_m = float(np.exp((float(k_top) + 0.5) * ln_base))
+            hover_txt = (
+                f"pred {pr_v:.3f}m  gt {gt_v:.3f}m  bin[{k_top:02d}] {a_m:.2f}-{b_m:.2f}m  p7 {pb_v:.2f}  refl {refl_v:.1f}"
+                if gt_v > 0
+                else f"pred {pr_v:.3f}m  gt --  bin[{k_top:02d}] {a_m:.2f}-{b_m:.2f}m  p7 {pb_v:.2f}  refl {refl_v:.1f}"
+            )
 
         # 单窗口拼图，更方便截图
-        in_bgr = _with_text(in_bgr, f"INPUT(peak/1023, gamma={INPUT_GAMMA:g})")
+        in_bgr = _with_text(
+            in_bgr, f"INPUT(refl=bins[0..{HIST_BINS-1}], p5-p95->0-255, gamma={DISP_GAMMA:g})"
+        )
         gt_big = _with_text(gt_big, "GT")
         pred_big = _with_text(pred_big, "PRED")
         prob_big = _with_text(prob_big, "P_OK(+-7%)")
