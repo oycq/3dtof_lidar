@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-按 GT 距离分桶统计（0m~29m，1m 一个桶）：
+按 GT 距离分桶统计（2m~29m，1m 一个桶）：
 - 准确率：conf>50% 且 |pred-gt|/gt<=ACC_REL_THR 的比例
 - 错误率：conf>50% 且 |pred-gt|/gt>ACC_REL_THR 的比例
 
@@ -28,10 +28,10 @@ TOF_H = 30
 TOF_W = 40
 TOF_C = 64
 
-DIST_MIN_M = 0
+DIST_MIN_M = 2
 DIST_MAX_M = 29
 # 宏定义：conf 大于该阈值（百分比）才参与“准确率/错误率”统计。
-CONF_POS_PCT = 50.0
+CONF_POS_PCT = 70.0
 ACC_REL_THR = 0.07
 EPS = 1e-6
 
@@ -83,6 +83,18 @@ def get_chinese_font() -> tuple[FontProperties | None, str]:
     return None, ""
 
 
+def get_title_font(base_font_prop: FontProperties | None) -> FontProperties | None:
+    """标题优先使用微软雅黑，若不可用则退回通用中文字体。"""
+    yahei_candidates = [
+        Path("C:/Windows/Fonts/msyh.ttc"),
+        Path("C:/Windows/Fonts/msyhbd.ttc"),
+    ]
+    for fp in yahei_candidates:
+        if fp.exists():
+            return FontProperties(fname=str(fp))
+    return base_font_prop
+
+
 def set_text_font(
     text_obj: object,
     font_prop: FontProperties | None,
@@ -109,55 +121,87 @@ def save_plot(
     dist_axis: np.ndarray,
     acc_rate: np.ndarray,
     err_rate: np.ndarray,
+    cnt: np.ndarray,
 ) -> None:
-    # 更简洁的双曲线风格：准确率 vs 错误率。
+    # 一个窗口上下两个子图：上方准确率/错误率，下方样本点数量。
     font_prop, font_name = get_chinese_font()
     plt.rcParams["axes.unicode_minus"] = False
     plt.style.use("seaborn-v0_8-whitegrid")
-    fig, ax = plt.subplots(figsize=FIG_SIZE, constrained_layout=True)
+    fig, (ax_top, ax_bottom) = plt.subplots(
+        nrows=2,
+        ncols=1,
+        figsize=(FIG_SIZE[0], 10.2),
+        constrained_layout=True,
+        sharex=True,
+    )
 
-    ax.plot(
+    ax_top.plot(
         dist_axis,
         acc_rate,
         color="#16a34a",
         linewidth=2.6,
         marker="o",
         markersize=5,
-        label=f"准确率（conf>{CONF_POS_PCT:.0f}% 且预测正确）",
+        label=f"准确率（conf>{CONF_POS_PCT:.0f}% 误差<={ACC_REL_THR*100:.1f}%）",
         zorder=3,
     )
-    ax.fill_between(dist_axis, 0.0, acc_rate, color="#22c55e", alpha=0.12, zorder=1)
+    ax_top.fill_between(dist_axis, 0.0, acc_rate, color="#22c55e", alpha=0.12, zorder=1)
 
-    ax.plot(
+    ax_top.plot(
         dist_axis,
         err_rate,
         color="#dc2626",
         linewidth=2.6,
         marker="o",
         markersize=5,
-        label=f"错误率（conf>{CONF_POS_PCT:.0f}% 且预测错误）",
+        label=f"错误率（conf>{CONF_POS_PCT:.0f}% 误差>{ACC_REL_THR*100:.1f}%）",
         zorder=3,
     )
-    ax.fill_between(dist_axis, 0.0, err_rate, color="#ef4444", alpha=0.10, zorder=1)
+    ax_top.fill_between(dist_axis, 0.0, err_rate, color="#ef4444", alpha=0.10, zorder=1)
 
-    title_obj = ax.set_title("不同距离检测准确率", pad=16)
-    set_text_font(title_obj, font_prop, size=20, weight="bold")
-    ax.set_xlabel("距离（米）", fontproperties=font_prop)
-    ax.set_ylabel("比例", fontproperties=font_prop)
-    set_text_font(ax.xaxis.label, font_prop, size=LABEL_SIZE)
-    set_text_font(ax.yaxis.label, font_prop, size=LABEL_SIZE)
-    ax.set_ylim(0.0, 1.0)
-    ax.set_xlim(float(dist_axis[0]) - 0.5, float(dist_axis[-1]) + 0.5)
-    ax.set_xticks(dist_axis)
-    ax.grid(axis="y", linestyle="--", alpha=0.35)
-    ax.grid(axis="x", linestyle=":", alpha=0.12)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    legend = ax.legend(loc="upper right", frameon=True, framealpha=0.9, prop=font_prop, fontsize=LEGEND_SIZE)
+    title_font = get_title_font(font_prop)
+    title_obj = ax_top.set_title("不同距离检测准确率", pad=10)
+    set_text_font(title_obj, title_font, size=16, weight="bold")
+    ax_top.set_xlabel("距离（米）", fontproperties=font_prop)
+    ax_top.set_ylabel("比例", fontproperties=font_prop)
+    set_text_font(ax_top.xaxis.label, font_prop, size=LABEL_SIZE)
+    set_text_font(ax_top.yaxis.label, font_prop, size=LABEL_SIZE)
+    ax_top.set_ylim(0.0, 1.0)
+    ax_top.set_xlim(float(dist_axis[0]) - 0.5, float(dist_axis[-1]) + 0.5)
+    ax_top.set_xticks(dist_axis)
+    ax_top.tick_params(axis="x", labelbottom=True)
+    ax_top.grid(axis="y", linestyle="--", alpha=0.35)
+    ax_top.grid(axis="x", linestyle=":", alpha=0.12)
+    ax_top.spines["top"].set_visible(False)
+    ax_top.spines["right"].set_visible(False)
+    legend = ax_top.legend(loc="upper right", frameon=True, framealpha=0.9, prop=font_prop, fontsize=LEGEND_SIZE)
     if legend is not None:
         for t in legend.get_texts():
             set_text_font(t, font_prop, size=LEGEND_SIZE)
-    apply_axis_font(ax, font_prop)
+    apply_axis_font(ax_top, font_prop)
+
+    ax_bottom.bar(
+        dist_axis,
+        cnt,
+        width=0.82,
+        color="#2563eb",
+        edgecolor="#1d4ed8",
+        alpha=0.88,
+        zorder=3,
+    )
+    title_obj = ax_bottom.set_title("不同距离下数据点数量", pad=10)
+    set_text_font(title_obj, title_font, size=16, weight="bold")
+    ax_bottom.set_xlabel("距离（米）", fontproperties=font_prop)
+    ax_bottom.set_ylabel("数据点数量", fontproperties=font_prop)
+    set_text_font(ax_bottom.xaxis.label, font_prop, size=LABEL_SIZE)
+    set_text_font(ax_bottom.yaxis.label, font_prop, size=LABEL_SIZE)
+    ax_bottom.set_xlim(float(dist_axis[0]) - 0.5, float(dist_axis[-1]) + 0.5)
+    ax_bottom.set_xticks(dist_axis)
+    ax_bottom.grid(axis="y", linestyle="--", alpha=0.35)
+    ax_bottom.grid(axis="x", linestyle=":", alpha=0.12)
+    ax_bottom.spines["top"].set_visible(False)
+    ax_bottom.spines["right"].set_visible(False)
+    apply_axis_font(ax_bottom, font_prop)
 
     if not font_name:
         print("[warn] 未找到中文字体文件，图表中文可能仍显示异常。")
@@ -167,7 +211,7 @@ def save_plot(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="统计 0~29m 各距离桶准确率/错误率，并绘图")
+    parser = argparse.ArgumentParser(description="统计 2~29m 各距离桶准确率/错误率，并绘图")
     parser.add_argument("--train-dir", type=str, default=None, help="训练数据目录，默认 nn/train_data")
     parser.add_argument("--ckpt", type=str, default=None, help="模型权重路径，默认 nn/model_last.pt")
     args = parser.parse_args()
@@ -215,7 +259,7 @@ def main() -> int:
             pred = out["dist"][0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
             conf = out["conf"][0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
 
-            valid = np.isfinite(gt) & (gt > 0.0) & (gt <= float(DIST_MAX_M))
+            valid = np.isfinite(gt) & (gt >= float(DIST_MIN_M)) & (gt <= float(DIST_MAX_M))
             if not np.any(valid):
                 continue
 
@@ -244,11 +288,12 @@ def main() -> int:
     nz = cnt > 0
     accuracy[nz] = acc_cnt[nz] / cnt[nz]
     error_rate[nz] = err_cnt[nz] / cnt[nz]
-    save_plot(dist_axis=dist_axis, acc_rate=accuracy, err_rate=error_rate)
+    save_plot(dist_axis=dist_axis, acc_rate=accuracy, err_rate=error_rate, cnt=cnt)
 
     print(f"[done] pairs={len(pairs)}")
     print("[done] plot shown on screen")
     print(f"[done] conf threshold: > {CONF_POS_PCT:.1f}%")
+    print(f"[done] correct criterion: |pred-gt|/gt <= {ACC_REL_THR*100:.1f}%")
     print("distance_bin_m,count,accuracy,error_rate")
     for d in range(DIST_MIN_M, DIST_MAX_M + 1):
         i = d - DIST_MIN_M
