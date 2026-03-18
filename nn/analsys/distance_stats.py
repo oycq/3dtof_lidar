@@ -31,8 +31,8 @@ TOF_C = 64
 DIST_MIN_M = 2
 DIST_MAX_M = 29
 # 宏定义：conf 大于该阈值（百分比）才参与“准确率/错误率”统计。
-CONF_POS_PCT = 70.0
-ACC_REL_THR = 0.07
+CONF_POS_PCT = 50.0
+ACC_REL_THR = 0.12
 EPS = 1e-6
 
 FIG_SIZE = (13.8, 7.2)
