@@ -17,13 +17,13 @@ TOF_H = 30
 TOF_W = 40
 TOF_C = 64
 TOTAL_PIXELS = TOF_H * TOF_W
-SHOW_W = 390
-SHOW_H = 520
+SHOW_W = 390 * 2
+SHOW_H = 520 * 2
 HEADER_H = 36
 
 # 固定配置（按需求不走命令行）
 CONF_THR = 0.5
-REL_ERR_THR = 0.07
+REL_ERR_THR = 0.12
 EPS = 1e-6
 DEPTH_NEAR_M = 1.0
 DEPTH_FAR_M = 30.0
@@ -155,6 +155,42 @@ def _wrong_mask_bgr(mask: np.ndarray) -> np.ndarray:
     return out
 
 
+def _wrong_mask_with_neighbor_gt(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    conf_pos: np.ndarray,
+    rel_err_thr: float,
+) -> np.ndarray:
+    """
+    投影存在轻微偏移时，允许与 3x3 邻域内任一 GT 匹配：
+    只要最小相对误差 <= rel_err_thr，就判定为对。
+    """
+    h, w = gt.shape
+    pred_f = np.asarray(pred, dtype=np.float32)
+    gt_f = np.asarray(gt, dtype=np.float32)
+    conf = np.asarray(conf_pos, dtype=bool)
+
+    min_rel_err = np.full((h, w), np.inf, dtype=np.float32)
+    has_neighbor = np.zeros((h, w), dtype=bool)
+
+    # 用 nan pad，便于统一切片，不引入边界伪值。
+    gt_pad = np.pad(gt_f, ((1, 1), (1, 1)), mode="constant", constant_values=np.nan)
+    valid_gt_pad = np.isfinite(gt_pad) & (gt_pad > 0.0)
+
+    # 3x3 邻域（含自身）
+    for dy in range(3):
+        for dx in range(3):
+            gt_nb = gt_pad[dy : dy + h, dx : dx + w]
+            valid_nb = valid_gt_pad[dy : dy + h, dx : dx + w]
+            rel = np.full((h, w), np.inf, dtype=np.float32)
+            rel[valid_nb] = np.abs(pred_f[valid_nb] - gt_nb[valid_nb]) / np.clip(np.abs(gt_nb[valid_nb]), EPS, np.inf)
+            min_rel_err = np.minimum(min_rel_err, rel)
+            has_neighbor |= valid_nb
+
+    wrong_mask = conf & has_neighbor & (min_rel_err > float(rel_err_thr))
+    return wrong_mask
+
+
 def save_scene_image(item: SceneStats, rank_idx: int, out_dir: Path) -> None:
     import cv2  # type: ignore
 
@@ -242,9 +278,12 @@ def main() -> int:
             total_valid = int(np.count_nonzero(valid))
             conf_pos = valid & (conf >= conf_thr)  # conf<50% 不参与统计
             abs_err_map = np.abs(pred - gt).astype(np.float32, copy=False)
-            rel_err_map = np.zeros_like(abs_err_map, dtype=np.float32)
-            rel_err_map[conf_pos] = abs_err_map[conf_pos] / np.clip(np.abs(gt[conf_pos]), EPS, np.inf)
-            wrong_mask = conf_pos & (rel_err_map > rel_err_thr)
+            wrong_mask = _wrong_mask_with_neighbor_gt(
+                pred=pred,
+                gt=gt,
+                conf_pos=conf_pos,
+                rel_err_thr=rel_err_thr,
+            )
             conf_count = int(np.count_nonzero(conf_pos))
             wrong_count = int(np.count_nonzero(wrong_mask))
             wrong_ratio = float(wrong_count) / float(TOTAL_PIXELS)
