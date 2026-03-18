@@ -20,6 +20,9 @@ TOTAL_PIXELS = TOF_H * TOF_W
 SHOW_W = 390 * 2
 SHOW_H = 520 * 2
 HEADER_H = 36
+# 交互预览窗口单面板尺寸（3x2 拼图），尽量保证一屏可见。
+PREVIEW_W = 300
+PREVIEW_H = 400
 
 # 固定配置（按需求不走命令行）
 CONF_THR = 0.5
@@ -28,6 +31,7 @@ EPS = 1e-6
 DEPTH_NEAR_M = 1.0
 DEPTH_FAR_M = 30.0
 DEPTH_GAMMA = 1.6
+LIDAR_FOV_DEG = 70.0
 
 
 @dataclass
@@ -44,6 +48,7 @@ class SceneStats:
     abs_err_mean: float
     gt_map: np.ndarray
     pred_map: np.ndarray
+    conf_map: np.ndarray
     conf_mask: np.ndarray
     wrong_mask: np.ndarray
 
@@ -127,6 +132,321 @@ def _draw_text(img: np.ndarray, s: str, color: tuple[int, int, int] = (255, 255,
     out = img.copy()
     cv2.putText(out, s, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
     return out
+
+
+def _draw_marker(img: np.ndarray, x: int, y: int) -> np.ndarray:
+    import cv2  # type: ignore
+
+    out = img.copy()
+    xx = int(np.clip(x, 0, out.shape[1] - 1))
+    yy = int(np.clip(y, 0, out.shape[0] - 1))
+    cv2.circle(out, (xx, yy), 3, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.circle(out, (xx, yy), 2, (255, 255, 255), 1, cv2.LINE_AA)
+    return out
+
+
+def _disp_xy_to_pixel(dx: int, dy: int, show_w: int, show_h: int) -> tuple[int, int]:
+    sw = max(int(show_w), 1)
+    sh = max(int(show_h), 1)
+    py = int(np.clip(dx * TOF_H / sw, 0, TOF_H - 1))
+    px = int(np.clip(dy * TOF_W / sh, 0, TOF_W - 1))
+    return px, py
+
+
+def _pixel_to_disp_xy(px: int, py: int, show_w: int, show_h: int) -> tuple[int, int]:
+    sw = max(int(show_w), 1)
+    sh = max(int(show_h), 1)
+    px_i = int(np.clip(px, 0, TOF_W - 1))
+    py_i = int(np.clip(py, 0, TOF_H - 1))
+    dx = int(np.clip((py_i + 0.5) * sw / TOF_H, 0, sw - 1))
+    dy = int(np.clip((px_i + 0.5) * sh / TOF_W, 0, sh - 1))
+    return dx, dy
+
+
+def _render_input_reflect_u8(hists: np.ndarray) -> np.ndarray:
+    h = np.asarray(hists, dtype=np.float32)
+    inten = np.sum(h[:, :, :62], axis=2)
+    if inten.size == 0:
+        return np.zeros((TOF_H, TOF_W), dtype=np.uint8)
+    m = np.isfinite(inten)
+    if not np.any(m):
+        return np.zeros((TOF_H, TOF_W), dtype=np.uint8)
+    vmin = float(np.percentile(inten[m], 5))
+    vmax = float(np.percentile(inten[m], 95))
+    if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or vmax <= vmin:
+        return np.zeros((TOF_H, TOF_W), dtype=np.uint8)
+    n = np.clip((inten - vmin) / (vmax - vmin), 0.0, 1.0)
+    n = np.power(n, 1.0 / 1.2)  # 显示 gamma
+    return np.clip(np.rint(n * 255.0), 0, 255).astype(np.uint8)
+
+
+def _render_histogram_bgr(
+    bins: np.ndarray,
+    w: int,
+    h: int,
+    title: str,
+    max_bins: int | None = None,
+    fixed_vmax: float | None = None,
+) -> np.ndarray:
+    import cv2  # type: ignore
+
+    b = np.asarray(bins, dtype=np.float32).reshape(-1)
+    if max_bins is not None:
+        b = b[: int(max(0, max_bins))]
+    sw = max(int(w), 1)
+    sh = max(int(h), 1)
+    img = np.zeros((sh, sw, 3), dtype=np.uint8)
+    if b.size <= 0:
+        return _draw_text(img, f"{title} empty")
+
+    top, left, right, bottom = 34, 14, 10, 18
+    x0, y0 = left, top
+    x1, y1 = sw - right, sh - bottom
+    if x1 <= x0 + 2 or y1 <= y0 + 2:
+        return img
+
+    if fixed_vmax is not None:
+        vmax = float(fixed_vmax)
+        if (not np.isfinite(vmax)) or vmax <= 0.0:
+            vmax = 1.0
+    else:
+        vmax = float(np.max(b))
+        if (not np.isfinite(vmax)) or vmax <= 0.0:
+            vmax = 1.0
+
+    cv2.rectangle(img, (x0, y0), (x1, y1), (80, 80, 80), 1, cv2.LINE_AA)
+    nb = int(b.size)
+    bar_w = max(int(max(x1 - x0, 1) / max(nb, 1)), 1)
+    for i in range(nb):
+        v = float(b[i])
+        if (not np.isfinite(v)) or v < 0.0:
+            v = 0.0
+        hh = int(np.clip(v / vmax, 0.0, 1.0) * (y1 - y0 - 1))
+        xl = x0 + i * bar_w
+        xr = min(xl + bar_w, x1)
+        if xr <= xl:
+            continue
+        yt = y1 - hh
+        cv2.rectangle(img, (xl, yt), (xr, y1), (255, 220, 0), -1)
+        cv2.rectangle(img, (xl, yt), (xr, y1), (30, 30, 30), 1)
+
+    step = max(1, nb // 6)
+    for k in range(0, nb, step):
+        xx = x0 + int(k * bar_w)
+        cv2.line(img, (xx, y1), (xx, y1 + 4), (120, 120, 120), 1, cv2.LINE_AA)
+        cv2.putText(img, str(k), (xx + 2, sh - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+    return _draw_text(img, f"{title}  max {vmax:.3f}")
+
+
+def _load_points_xyz(npz_path: Path) -> np.ndarray:
+    d = np.load(str(npz_path))
+    x = np.asarray(d["x"], dtype=np.float32)
+    y = np.asarray(d["y"], dtype=np.float32)
+    z = np.asarray(d["z"], dtype=np.float32)
+    if x.size == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    pts = np.column_stack([x, y, z]).astype(np.float32, copy=False)
+    finite = np.isfinite(pts).all(axis=1)
+    dist2 = np.sum(pts * pts, axis=1)
+    return pts[finite & (dist2 > 1e-12)]
+
+
+def _render_lidar_pointcloud_bgr(points_xyz: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
+    import cv2  # type: ignore
+
+    w = max(int(out_w), 1)
+    h = max(int(out_h), 1)
+    if points_xyz.shape[0] == 0:
+        return np.zeros((h, w, 3), dtype=np.uint8)
+
+    x, y, z = points_xyz.T
+    half_fov = float(np.deg2rad(LIDAR_FOV_DEG / 2.0))
+    yaw = np.arctan2(y, x)
+    pitch = np.arctan2(z, np.hypot(x, y))
+    mask = (x > 0) & (np.abs(yaw) <= half_fov) & (np.abs(pitch) <= half_fov)
+    if not np.any(mask):
+        return np.zeros((h, w, 3), dtype=np.uint8)
+
+    x_m, y_m, z_m = x[mask], y[mask], z[mask]
+    depth_m = np.sqrt(x_m * x_m + y_m * y_m + z_m * z_m)
+    depth_u8 = np.clip(np.rint(255.0 / np.clip(depth_m, EPS, np.inf)), 0, 255).astype(np.uint8)
+    col = ((half_fov - yaw[mask]) / (2 * half_fov) * (w - 1)).astype(np.int32)
+    row = ((half_fov - pitch[mask]) / (2 * half_fov) * (h - 1)).astype(np.int32)
+    col = np.clip(col, 0, w - 1)
+    row = np.clip(row, 0, h - 1)
+
+    gray = np.zeros((h, w), dtype=np.uint8)
+    np.maximum.at(gray, (row, col), depth_u8)
+    bgr = cv2.applyColorMap(gray, getattr(cv2, "COLORMAP_TURBO", cv2.COLORMAP_JET))
+    bgr[gray == 0] = (0, 0, 0)
+    return bgr
+
+
+def _render_lidar_panel_keep_aspect(points_xyz: np.ndarray, panel_w: int, panel_h: int) -> np.ndarray:
+    # LiDAR 视场在水平/竖直方向一致，按正方形渲染可避免圆形目标被拉伸成椭圆。
+    pw = max(int(panel_w), 1)
+    ph = max(int(panel_h), 1)
+    side = max(1, min(pw, ph))
+    square = _render_lidar_pointcloud_bgr(points_xyz, side, side)
+    canvas = np.zeros((ph, pw, 3), dtype=np.uint8)
+    x0 = (pw - side) // 2
+    y0 = (ph - side) // 2
+    canvas[y0 : y0 + side, x0 : x0 + side] = square
+    return canvas
+
+def _safe_index_from_scene_name(scene_name: str) -> int | None:
+    m = re.fullmatch(r"0*(\d+)", scene_name.strip())
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _find_lidar_npz_for_scene(scene_name: str, data_roots: list[Path]) -> Path | None:
+    # 优先按场景名精确匹配目录。
+    for root in data_roots:
+        if not root.exists():
+            continue
+        p = root / scene_name
+        if p.is_dir():
+            cands = sorted(p.glob("points_last*.npz"))
+            if cands:
+                return cands[0]
+
+    # 若 scene_name 是 00001 这类编号，则按目录排序做索引映射（导出 train_data 常见顺序）。
+    idx1 = _safe_index_from_scene_name(scene_name)
+    if idx1 is not None and idx1 > 0:
+        for root in data_roots:
+            if not root.exists():
+                continue
+            dirs = sorted([p for p in root.iterdir() if p.is_dir()], key=lambda p: p.name)
+            if idx1 <= len(dirs):
+                cands = sorted(dirs[idx1 - 1].glob("points_last*.npz"))
+                if cands:
+                    return cands[0]
+
+    # 最后尝试模糊匹配（避免命名带前后缀时完全找不到）。
+    sn = scene_name.lower()
+    for root in data_roots:
+        if not root.exists():
+            continue
+        for d in sorted([p for p in root.iterdir() if p.is_dir()], key=lambda p: p.name):
+            dn = d.name.lower()
+            if (sn in dn) or (dn in sn):
+                cands = sorted(d.glob("points_last*.npz"))
+                if cands:
+                    return cands[0]
+    return None
+
+
+def _load_scene_input_for_preview(item: SceneStats) -> np.ndarray:
+    x, _ = load_pair(item.input_path, item.output_path)
+    return x
+
+
+def show_rank_preview(rows: list[SceneStats], data_roots: list[Path]) -> None:
+    import cv2  # type: ignore
+
+    wnd = "SCENE_RANK_PREVIEW"
+    cv2.namedWindow(wnd, cv2.WINDOW_AUTOSIZE)
+    mouse = {"x": 0, "y": 0}
+
+    def on_mouse(event: int, x: int, y: int, flags: int, userdata: object) -> None:
+        if int(event) != int(cv2.EVENT_MOUSEMOVE):
+            return
+        mouse["x"] = int(x)
+        mouse["y"] = int(y)
+
+    cv2.setMouseCallback(wnd, on_mouse)
+
+    idx = 0
+    hover_px, hover_py = TOF_W // 2, TOF_H // 2
+    cache_idx = -1
+    cache_x: np.ndarray | None = None
+    cache_lidar_panel: np.ndarray | None = None
+
+    while True:
+        item = rows[idx]
+        if cache_idx != idx:
+            cache_x = _load_scene_input_for_preview(item=item)
+            npz_path = _find_lidar_npz_for_scene(item.scene_name, data_roots=data_roots)
+            if npz_path is not None and npz_path.exists():
+                pts = _load_points_xyz(npz_path)
+                cache_lidar_panel = _render_lidar_panel_keep_aspect(pts, PREVIEW_W, PREVIEW_H)
+            else:
+                miss = np.zeros((PREVIEW_H, PREVIEW_W, 3), dtype=np.uint8)
+                miss = _draw_text(miss, "LIDAR_POINTCLOUD missing")
+                cache_lidar_panel = miss
+            cache_idx = idx
+        assert cache_x is not None and cache_lidar_panel is not None
+
+        refl_u8 = _render_input_reflect_u8(cache_x)
+        refl_bgr = cv2.cvtColor(refl_u8, cv2.COLOR_GRAY2BGR)
+        gt_bgr = _color_depth(item.gt_map)  # LIDAR 投影真值图
+        pred_bgr = _color_depth(item.pred_map)
+        pred_bgr[item.conf_map < float(CONF_THR)] = (0, 0, 0)  # conf<50% 直接置黑
+        wrong_bgr = pred_bgr.copy()
+        wrong_bgr[item.wrong_mask] = (0, 0, 255)
+
+        refl_show = cv2.resize(_rotate_for_display(refl_bgr), (PREVIEW_W, PREVIEW_H), interpolation=cv2.INTER_NEAREST)
+        gt_show = cv2.resize(_rotate_for_display(gt_bgr), (PREVIEW_W, PREVIEW_H), interpolation=cv2.INTER_NEAREST)
+        lidar_show = cache_lidar_panel.copy()
+        pred_show = cv2.resize(_rotate_for_display(pred_bgr), (PREVIEW_W, PREVIEW_H), interpolation=cv2.INTER_NEAREST)
+        wrong_show = cv2.resize(_rotate_for_display(wrong_bgr), (PREVIEW_W, PREVIEW_H), interpolation=cv2.INTER_NEAREST)
+
+        mx = int(np.clip(mouse["x"], 0, PREVIEW_W * 3 - 1))
+        my = int(np.clip(mouse["y"] - HEADER_H, 0, PREVIEW_H * 2 - 1))
+        tile_col = mx // PREVIEW_W
+        tile_row = my // PREVIEW_H
+        if (tile_row, tile_col) in {(0, 0), (0, 1), (0, 2), (1, 1)}:
+            local_x = int(mx - tile_col * PREVIEW_W)
+            local_y = int(my - tile_row * PREVIEW_H)
+            hover_px, hover_py = _disp_xy_to_pixel(local_x, local_y, PREVIEW_W, PREVIEW_H)
+        hover_px = int(np.clip(hover_px, 0, TOF_W - 1))
+        hover_py = int(np.clip(hover_py, 0, TOF_H - 1))
+
+        dx, dy = _pixel_to_disp_xy(hover_px, hover_py, PREVIEW_W, PREVIEW_H)
+        refl_show = _draw_marker(refl_show, dx, dy)
+        gt_show = _draw_marker(gt_show, dx, dy)
+        pred_show = _draw_marker(pred_show, dx, dy)
+        wrong_show = _draw_marker(wrong_show, dx, dy)
+
+        in_hist = _render_histogram_bgr(cache_x[hover_py, hover_px, :], PREVIEW_W, PREVIEW_H, "HIST", max_bins=62)
+
+        refl_show = _draw_text(refl_show, "TOF_REFLECT")
+        gt_show = _draw_text(gt_show, "LIDAR_GT")
+        lidar_show = _draw_text(lidar_show, "LIDAR_POINTCLOUD")
+        pred_show = _draw_text(pred_show, "PRED")
+        wrong_show = _draw_text(wrong_show, "ERROR_ANNOTATION")
+
+        # 2x3 固定布局：
+        # 1,1=GT  1,2=PRED  1,3=ERROR
+        # 2,1=LIDAR  2,2=REFLECT  2,3=HIST
+        top = np.hstack([gt_show, pred_show, wrong_show])
+        bot = np.hstack([lidar_show, refl_show, in_hist])
+        view = np.vstack([top, bot])
+
+        pred_v = float(item.pred_map[hover_py, hover_px])
+        gt_v = float(item.gt_map[hover_py, hover_px])
+        header_text = (
+            f"rank {idx + 1}/{len(rows)} bad->good  scene {item.scene_name}  "
+            f"wrong {item.wrong_ratio * 100.0:.2f}% ({item.wrong_count}/{TOTAL_PIXELS})  "
+            f"pred {pred_v:.3f}m  gt {gt_v:.3f}m"
+        )
+        header = _draw_text(np.zeros((HEADER_H, view.shape[1], 3), dtype=np.uint8), header_text)
+        cv2.imshow(wnd, np.vstack([header, view]))
+
+        key = int(cv2.waitKey(30) & 0xFF)
+        if key == 27:  # ESC
+            break
+        if key == ord("4"):
+            idx = (idx - 1) % len(rows)
+        elif key == ord("6"):
+            idx = (idx + 1) % len(rows)
+
+    cv2.destroyWindow(wnd)
 
 
 def _color_depth(depth: np.ndarray) -> np.ndarray:
@@ -231,18 +551,22 @@ def show_error_rate_hist(rows: list[SceneStats]) -> None:
     except Exception as e:
         raise RuntimeError("missing dependency matplotlib, run: py -m pip install matplotlib") from e
 
+    # 兼容 Windows 常见中文字体，避免中文乱码；并修复负号显示为方块的问题。
+    plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "Arial Unicode MS"]
+    plt.rcParams["axes.unicode_minus"] = False
+
     err_pct = np.array([100.0 * float(r.wrong_ratio) for r in rows], dtype=np.float32)
     # 聚焦低错误率区间，便于比较接近的场景。
-    err_pct = np.clip(err_pct, 0.0, 20.0)
+    err_pct = np.clip(err_pct, 0.0, 40.0)
 
     plt.figure(figsize=(10, 6))
-    # 0~20% 细分为 100 格，每格 0.2%
-    bins = np.linspace(0.0, 20.0, 101)
+    # 0~40% 每 1% 一个 bin。
+    bins = np.arange(0.0, 41.0, 1.0)
     plt.hist(err_pct, bins=bins, color="#4C78A8", edgecolor="black", alpha=0.85)
-    plt.title("Scene Error Rate Histogram")
-    plt.xlabel("Error Rate (%)")
-    plt.ylabel("Count")
-    plt.xlim(0.0, 20.0)
+    plt.title("各场景错误率分布直方图")
+    plt.xlabel("错误率（%）")
+    plt.ylabel("场景数量")
+    plt.xlim(0.0, 40.0)
     plt.grid(axis="y", linestyle="--", alpha=0.35)
     plt.tight_layout()
     plt.show()
@@ -331,6 +655,7 @@ def main() -> int:
                     abs_err_mean=float(np.mean(err_v)) if err_v.size else float("nan"),
                     gt_map=gt,
                     pred_map=pred,
+                    conf_map=conf,
                     conf_mask=conf_pos,
                     wrong_mask=wrong_mask,
                 )
@@ -402,6 +727,9 @@ def main() -> int:
     print(f"[done] conf threshold: >= {conf_thr:.2f}")
     print(f"[done] wrong criterion: |pred-gt|/gt > {rel_err_thr * 100.0:.2f}%")
     print(f"[done] wrong ratio definition: wrong_count/{TOTAL_PIXELS}")
+    project_root = nn_dir.parent
+    data_roots = [project_root / "data", project_root / "cali" / "data"]
+    show_rank_preview(rows, data_roots=data_roots)
     show_error_rate_hist(rows)
     return 0
 
