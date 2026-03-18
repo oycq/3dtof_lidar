@@ -225,6 +225,29 @@ def save_scene_image(item: SceneStats, rank_idx: int, out_dir: Path) -> None:
         raise RuntimeError(f"failed to write image: {out_path}")
 
 
+def show_error_rate_hist(rows: list[SceneStats]) -> None:
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception as e:
+        raise RuntimeError("missing dependency matplotlib, run: py -m pip install matplotlib") from e
+
+    err_pct = np.array([100.0 * float(r.wrong_ratio) for r in rows], dtype=np.float32)
+    # 聚焦低错误率区间，便于比较接近的场景。
+    err_pct = np.clip(err_pct, 0.0, 20.0)
+
+    plt.figure(figsize=(10, 6))
+    # 0~20% 细分为 100 格，每格 0.2%
+    bins = np.linspace(0.0, 20.0, 101)
+    plt.hist(err_pct, bins=bins, color="#4C78A8", edgecolor="black", alpha=0.85)
+    plt.title("Scene Error Rate Histogram")
+    plt.xlabel("Error Rate (%)")
+    plt.ylabel("Count")
+    plt.xlim(0.0, 20.0)
+    plt.grid(axis="y", linestyle="--", alpha=0.35)
+    plt.tight_layout()
+    plt.show()
+
+
 def main() -> int:
     try:
         import cv2  # type: ignore  # noqa: F401
@@ -379,6 +402,7 @@ def main() -> int:
     print(f"[done] conf threshold: >= {conf_thr:.2f}")
     print(f"[done] wrong criterion: |pred-gt|/gt > {rel_err_thr * 100.0:.2f}%")
     print(f"[done] wrong ratio definition: wrong_count/{TOTAL_PIXELS}")
+    show_error_rate_hist(rows)
     return 0
 
 
