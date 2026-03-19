@@ -17,7 +17,6 @@ MAX_GT_SHOW_M = 30.0
 EPS = 1e-6
 DISP_GAMMA = 1.2
 DEPTH_GAMMA = 1.6
-CONF_MEAN_BIAS = 20.0
 BIN_TO_DIST_M = 0.6
 DIST_OFFSET_M = 0.5
 DEPTH_NEAR_M = 1.0
@@ -74,11 +73,14 @@ def _depth_from_peak3_centroid(hists: np.ndarray) -> np.ndarray:
 
 def _conf_from_input(hists: np.ndarray) -> np.ndarray:
     b = np.asarray(hists[:, :, :HIST_BINS], dtype=np.float32)
+    k = np.argmax(b, axis=2).astype(np.int32)
     y = np.max(b, axis=2)
-    x = np.mean(b, axis=2) + float(CONF_MEAN_BIAS)
+    x = np.mean(b, axis=2)
     conf = np.zeros((TOF_H, TOF_W), dtype=np.float32)
     m = y > 0.0
     conf[m] = 1.0 - (x[m] / y[m])
+    low_peak = ((k < 15) & (y < 40.0)) | ((k >= 15) & (y < 20.0))
+    conf[low_peak] = 0.0
     return np.clip(conf, 0.0, 1.0)
 
 
@@ -214,7 +216,7 @@ def main() -> int:
         in_bgr = draw_text(in_bgr, f"INPUT(refl=bins[0..{HIST_BINS-1}], gamma={DISP_GAMMA:g})")
         gt_bgr = draw_text(gt_bgr, "GT")
         pred_bgr = draw_text(pred_bgr, f"PRED(inv-depth+turbo, {DEPTH_NEAR_M:g}-{DEPTH_FAR_M:g}m, gamma={DEPTH_GAMMA:g})")
-        conf_bgr = draw_text(conf_bgr, "CONF(1-(mean+bias)/max)")
+        conf_bgr = draw_text(conf_bgr, "CONF(1-mean/max, k<15:y<40->0 else y<20->0)")
         dx, dy = _pixel_to_disp_xy(px, py, SHOW_W, SHOW_H)
         in_bgr, gt_bgr, pred_bgr, conf_bgr = draw_marker(in_bgr, dx, dy), draw_marker(gt_bgr, dx, dy), draw_marker(pred_bgr, dx, dy), draw_marker(conf_bgr, dx, dy)
 
@@ -223,7 +225,7 @@ def main() -> int:
         view = np.vstack([top, bot])
         header = draw_text(np.zeros((HEADER_H, view.shape[1], 3), dtype=np.uint8), f"sample {idx + 1}/{len(pairs)}  |  {hover}")
         cv2.imshow("CHECK_TRADITIONAL", np.vstack([header, view]))
-        cv2.imshow("HIST", render_raw_histogram(x[py, px, :]))
+        cv2.imshow("HIST", render_raw_histogram(x[py, px, :HIST_BINS]))
 
         key = int(cv2.waitKey(30) & 0xFF)
         if key == 27:
