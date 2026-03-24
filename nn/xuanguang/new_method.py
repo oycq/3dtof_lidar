@@ -40,6 +40,7 @@ REFLECT_SAT_SCALE = 50000.0
 REFLECT_DENOM = 156250.0
 REFLECT_THRESH = 0.025
 REFLECT_SHOW_GAMMA = 2.2
+BIN_TO_DIST_M = 0.6
 
 LIDAR_W = 700
 LIDAR_H = 700
@@ -60,6 +61,9 @@ class SceneState:
     out_probs: np.ndarray
     snr: np.ndarray
     conf_mask: np.ndarray
+    reflect_depth: np.ndarray
+    reflect_bin: np.ndarray
+    reflect_snr: np.ndarray
     reflect_peak: np.ndarray
     reflectance: np.ndarray
     reflect_valid_mask: np.ndarray
@@ -243,22 +247,120 @@ def _adjust_reflect_peak(peak: np.ndarray | float, bin_63: np.ndarray | float, b
     return adjusted.astype(np.float32, copy=False)
 
 
-def _compute_reflectance(hists: np.ndarray, depth_m: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _centroid_from_peak_1d(hist_1d: np.ndarray, peak_idx: int) -> float:
+    h = np.asarray(hist_1d, dtype=np.float32).reshape(-1)
+    if h.size <= 0:
+        return float(peak_idx)
+    pk = int(np.clip(int(peak_idx), 0, h.size - 1))
+    lo = max(pk - 2, 0)
+    hi = min(pk + 3, h.size)
+    vals = h[lo:hi]
+    idxs = np.arange(lo, hi, dtype=np.float32)
+    w_sum = float(np.sum(vals, dtype=np.float32))
+    if w_sum <= float(EPS):
+        return float(pk)
+    return float(np.sum(idxs * vals, dtype=np.float32) / w_sum)
+
+
+def _compute_snr_from_tail_1d(hist_1d: np.ndarray, start_bin: int) -> float:
+    h = np.asarray(hist_1d, dtype=np.float32).reshape(-1)
+    st = int(np.clip(int(start_bin), 0, h.size))
+    tail = h[st:]
+    if tail.size <= 0:
+        return 0.0
+    vmax = float(np.max(tail))
+    vsum = float(np.sum(tail, dtype=np.float32))
+    mean = float(np.mean(tail, dtype=np.float32))
+    std = float(np.std(tail, dtype=np.float32))
+    snr = float((vmax - mean) / max(std, 1e-6))
+    if vsum > float(SUM_GATE_MAX):
+        snr = snr / float(max(SUM_GATE_SNR_DIV, 1.0))
+    if vmax < float(PEAK_GATE_MIN):
+        snr = 0.0
+    return float(snr)
+
+
+def _snr_threshold_for_depth(depth_m: np.ndarray | float) -> np.ndarray:
+    d = np.asarray(depth_m, dtype=np.float32)
+    thr = np.full(d.shape, float(SNR_GATE_GT8M), dtype=np.float32)
+    thr = np.where(d <= 8.0, float(SNR_GATE_5TO8M), thr)
+    thr = np.where(d <= 5.0, float(SNR_GATE_3TO5M), thr)
+    thr = np.where(d <= 3.0, float(SNR_GATE_LE3M), thr)
+    return thr
+
+
+def _compute_reflectance(
+    hists: np.ndarray, depth_m: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     src = np.asarray(hists[:, :, :HIST_BINS], dtype=np.float32)
     depth = np.asarray(depth_m, dtype=np.float32)
-    peak = np.max(src, axis=2)
-    bin_63 = np.asarray(hists[:, :, HIST_BINS], dtype=np.float32) if hists.shape[2] > HIST_BINS else np.zeros_like(peak, dtype=np.float32)
+    bin_63 = np.asarray(hists[:, :, HIST_BINS], dtype=np.float32) if hists.shape[2] > HIST_BINS else np.zeros_like(depth, dtype=np.float32)
     bin_64 = (
         np.asarray(hists[:, :, HIST_BINS + 1], dtype=np.float32)
         if hists.shape[2] > (HIST_BINS + 1)
-        else np.zeros_like(peak, dtype=np.float32)
+        else np.zeros_like(depth, dtype=np.float32)
     )
-    peak = _adjust_reflect_peak(peak, bin_63, bin_64)
-    valid = np.isfinite(depth) & (depth > 0.0) & np.isfinite(peak) & (peak >= 0.0)
+    reflect_depth = depth.copy()
+    reflect_bin = np.full(depth.shape, -1, dtype=np.int16)
+    reflect_snr = np.full(depth.shape, np.nan, dtype=np.float32)
+    reflect_peak = np.full(depth.shape, np.nan, dtype=np.float32)
     reflectance = np.full(depth.shape, np.nan, dtype=np.float32)
-    reflectance[valid] = peak[valid] * depth[valid] * depth[valid] / float(REFLECT_DENOM)
-    black_mask = valid & (reflectance < float(REFLECT_THRESH))
-    return peak.astype(np.float32, copy=False), reflectance, black_mask
+    black_mask = np.zeros(depth.shape, dtype=bool)
+
+    for py in range(src.shape[0]):
+        for px in range(src.shape[1]):
+            base_depth = float(depth[py, px])
+            if (not np.isfinite(base_depth)) or base_depth <= 0.0:
+                continue
+
+            hist_1d = src[py, px, :]
+            if hist_1d.size <= 0:
+                continue
+
+            base_bin = int(np.argmax(hist_1d))
+            cur_bin = int(base_bin)
+            base_centroid = _centroid_from_peak_1d(hist_1d, base_bin)
+            cur_depth = float(base_depth)
+
+            while True:
+                cur_peak_raw = float(hist_1d[cur_bin])
+                cur_peak = float(_adjust_reflect_peak(cur_peak_raw, bin_63[py, px], bin_64[py, px]))
+                cur_snr = float(_compute_snr_from_tail_1d(hist_1d, cur_bin))
+                cur_snr_thr = float(_snr_threshold_for_depth(cur_depth))
+                cur_refl = float("nan")
+                if np.isfinite(cur_peak) and cur_peak >= 0.0 and np.isfinite(cur_depth) and cur_depth > 0.0:
+                    cur_refl = float(cur_peak * cur_depth * cur_depth / float(REFLECT_DENOM))
+
+                reflect_depth[py, px] = np.float32(cur_depth)
+                reflect_bin[py, px] = np.int16(cur_bin)
+                reflect_snr[py, px] = np.float32(cur_snr)
+                reflect_peak[py, px] = np.float32(cur_peak)
+                reflectance[py, px] = np.float32(cur_refl)
+
+                if np.isfinite(cur_refl) and cur_refl >= float(REFLECT_THRESH) and cur_snr > cur_snr_thr:
+                    break
+
+                next_start = cur_bin + 1
+                if next_start >= HIST_BINS:
+                    black_mask[py, px] = True
+                    break
+
+                tail = hist_1d[next_start:HIST_BINS]
+                if tail.size <= 0:
+                    black_mask[py, px] = True
+                    break
+
+                next_bin = int(next_start + int(np.argmax(tail)))
+                next_peak_raw = float(hist_1d[next_bin])
+                if (not np.isfinite(next_peak_raw)) or next_peak_raw <= 0.0:
+                    black_mask[py, px] = True
+                    break
+
+                next_centroid = _centroid_from_peak_1d(hist_1d, next_bin)
+                cur_depth = float(base_depth + (next_centroid - base_centroid) * float(BIN_TO_DIST_M))
+                cur_bin = int(next_bin)
+
+    return reflect_depth, reflect_bin, reflect_snr, reflect_peak, reflectance, black_mask
 
 
 def _colorize_reflectance(reflectance: np.ndarray, valid: np.ndarray) -> np.ndarray:
@@ -277,10 +379,7 @@ def _make_range_snr_mask(depth_m: np.ndarray, snr: np.ndarray) -> np.ndarray:
     d = np.asarray(depth_m, dtype=np.float32)
     s = np.asarray(snr, dtype=np.float32)
     valid = np.isfinite(d) & np.isfinite(s) & (d > 0.0)
-    thr = np.full(d.shape, float(SNR_GATE_GT8M), dtype=np.float32)
-    thr = np.where(d <= 8.0, float(SNR_GATE_5TO8M), thr)
-    thr = np.where(d <= 5.0, float(SNR_GATE_3TO5M), thr)
-    thr = np.where(d <= 3.0, float(SNR_GATE_LE3M), thr)
+    thr = _snr_threshold_for_depth(d)
     return valid & (s > thr)
 
 
@@ -450,7 +549,7 @@ def _build_scene_state(scene_dir: Path, net, device) -> SceneState:
     pred_depth, out_probs = _run_infer(net, device, hists)
     snr = _compute_snr_from_input(hists)
     conf_mask = _make_range_snr_mask(pred_depth, snr)
-    reflect_peak, reflectance, reflect_black_mask = _compute_reflectance(hists, pred_depth)
+    reflect_depth, reflect_bin, reflect_snr, reflect_peak, reflectance, reflect_black_mask = _compute_reflectance(hists, pred_depth)
     reflect_valid_mask = np.isfinite(reflectance)
     conf_mask_after_reflect = conf_mask & (~reflect_black_mask)
 
@@ -470,6 +569,9 @@ def _build_scene_state(scene_dir: Path, net, device) -> SceneState:
         out_probs=out_probs,
         snr=snr,
         conf_mask=conf_mask,
+        reflect_depth=reflect_depth,
+        reflect_bin=reflect_bin,
+        reflect_snr=reflect_snr,
         reflect_peak=reflect_peak,
         reflectance=reflectance,
         reflect_valid_mask=reflect_valid_mask,
@@ -569,7 +671,7 @@ def main() -> int:
             interpolation=cv2.INTER_NEAREST,
         )
 
-        pred_after_bgr = _colorize_depth(cur.pred_depth)
+        pred_after_bgr = _colorize_depth(cur.reflect_depth)
         pred_after_bgr = pred_after_bgr.copy()
         pred_after_bgr[~cur.conf_mask_after_reflect] = (0, 0, 0)
         pred_after_big_base = cv2.resize(
@@ -607,7 +709,10 @@ def main() -> int:
         py = int(np.clip(picked["py"], 0, TOF_H - 1))
 
         pr_v = float(state.pred_depth[py, px])
+        pr_new_v = float(state.reflect_depth[py, px])
         snr_v = float(state.snr[py, px])
+        snr_new_v = float(state.reflect_snr[py, px])
+        peak_bin_v = int(state.reflect_bin[py, px])
         peak_v = float(state.reflect_peak[py, px])
         hbins_hover = state.hists[py, px, :]
         bin_63_v = float(hbins_hover[HIST_BINS]) if hbins_hover.shape[0] > HIST_BINS else 0.0
@@ -619,18 +724,18 @@ def main() -> int:
         refl_black_v = bool(state.reflect_black_mask[py, px])
         if pr_v <= 0.0 or (not np.isfinite(pr_v)):
             hover_txt = (
-                f"pred --  snr {snr_v:.2f}  peak {peak_v:.1f}  sat {sat_v:.1f}  refl --  "
+                f"dist --  snr {snr_v:.2f}->{snr_new_v:.2f}  pick[{peak_bin_v}] {peak_v:.1f}  sat {sat_v:.1f}  refl --  "
                 f"keep {int(keep_before_v)}->{int(keep_after_v)}  black={int(refl_black_v)}  px=({px},{py})"
             )
         else:
             refl_txt = f"{refl_v * 100.0:.3f}%" if np.isfinite(refl_v) else "--"
             hover_txt = (
-                f"pred {pr_v:.3f}m  snr {snr_v:.2f}  peak {peak_v:.1f}  sat {sat_v:.1f}  refl {refl_txt}  "
+                f"dist {pr_v:.3f}->{pr_new_v:.3f}m  snr {snr_v:.2f}->{snr_new_v:.2f}  pick[{peak_bin_v}] {peak_v:.1f}  sat {sat_v:.1f}  refl {refl_txt}  "
                 f"keep {int(keep_before_v)}->{int(keep_after_v)}  black={int(refl_black_v)}  px=({px},{py})"
             )
 
         pred_before_big = _with_text(pred_before_big_base, "DEPTH_OLD (range-SNR gated)")
-        pred_after_big = _with_text(pred_after_big_base, f"DEPTH_NEW (refl>={REFLECT_THRESH * 100.0:.1f}% keep)")
+        pred_after_big = _with_text(pred_after_big_base, f"DEPTH_NEW (retry bins until refl>={REFLECT_THRESH * 100.0:.1f}%)")
         reflect_big = _with_text(reflect_big_base, f"REFLECTANCE (0..1, gamma {REFLECT_SHOW_GAMMA:.1f})")
 
         dx_m, dy_m = _pixel_to_disp_xy(px, py, SHOW_W, SHOW_H)
@@ -643,8 +748,8 @@ def main() -> int:
         hist_img = _render_histogram_bgr(hbins, w=HIST_W, h=HIST_H, max_bins=HIST_BINS, title="HIST")
         hsrc = np.asarray(hbins[:HIST_BINS], dtype=np.float32)
         if hsrc.size:
-            h_peak_idx = int(np.argmax(hsrc))
-            h_max_raw = float(hsrc[h_peak_idx])
+            h_raw_peak_idx = int(np.argmax(hsrc))
+            h_max_raw = float(hsrc[h_raw_peak_idx])
             h_bin_63 = float(hbins[HIST_BINS]) if hbins.shape[0] > HIST_BINS else 0.0
             h_bin_64 = float(hbins[HIST_BINS + 1]) if hbins.shape[0] > (HIST_BINS + 1) else 0.0
             h_sat = float(h_bin_64 * float(REFLECT_SAT_VALUE) + h_bin_63)
@@ -652,24 +757,33 @@ def main() -> int:
             h_mean = float(np.mean(hsrc, dtype=np.float32))
             h_std = float(np.std(hsrc, dtype=np.float32))
             h_snr = float((h_max - h_mean) / max(h_std, 1e-6))
-            h_refl = float(h_max * pr_v * pr_v / float(REFLECT_DENOM)) if np.isfinite(pr_v) and pr_v > 0.0 else float("nan")
+            h_pick_idx = int(state.reflect_bin[py, px])
+            h_pick_snr = float(state.reflect_snr[py, px])
+            h_pick_peak = float(state.reflect_peak[py, px])
+            h_pick_depth = float(state.reflect_depth[py, px])
+            h_refl = float(state.reflectance[py, px]) if bool(state.reflect_valid_mask[py, px]) else float("nan")
         else:
-            h_peak_idx = 0
+            h_raw_peak_idx = 0
             h_max = 0.0
             h_mean = 0.0
             h_std = 0.0
             h_snr = 0.0
+            h_pick_idx = -1
+            h_pick_snr = float("nan")
+            h_pick_peak = 0.0
+            h_pick_depth = float("nan")
             h_refl = float("nan")
             h_sat = 0.0
         cv2.putText(hist_img, "snr = (max - mean) / std, using bins[0..61]", (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1, cv2.LINE_AA)
-        cv2.putText(hist_img, f"max[{h_peak_idx}]={h_max:.3f}  mean={h_mean:.3f}  std={h_std:.3f}  snr={h_snr:.4f}", (10, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1, cv2.LINE_AA)
-        cv2.putText(hist_img, f"sat=bin64*1023+bin63 = {h_sat:.3f}", (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1, cv2.LINE_AA)
+        cv2.putText(hist_img, f"raw_max[{h_raw_peak_idx}]={h_max:.3f}  mean={h_mean:.3f}  std={h_std:.3f}  snr={h_snr:.4f}", (10, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1, cv2.LINE_AA)
+        cv2.putText(hist_img, f"pick[{h_pick_idx}]={h_pick_peak:.3f}  dist={h_pick_depth:.3f}m  snr={h_pick_snr:.4f}", (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1, cv2.LINE_AA)
+        cv2.putText(hist_img, f"sat=bin64*1023+bin63 = {h_sat:.3f}", (10, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1, cv2.LINE_AA)
         refl_hist_txt = (
             f"reflect={h_refl * 100.0:.4f}%"
             if np.isfinite(h_refl)
-            else "reflect=-- (pred invalid)"
+            else "reflect=-- (dist invalid)"
         )
-        cv2.putText(hist_img, refl_hist_txt, (10, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1, cv2.LINE_AA)
+        cv2.putText(hist_img, refl_hist_txt, (10, 128), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1, cv2.LINE_AA)
         bottom_row = np.zeros((HIST_H, top_row.shape[1], 3), dtype=np.uint8)
         hist_x0 = max((top_row.shape[1] - HIST_W) // 2, 0)
         bottom_row[:, hist_x0 : hist_x0 + HIST_W] = hist_img
