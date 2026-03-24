@@ -31,3 +31,5 @@ cali_tof_result.json
 data*.npy
 
 rank
+
+nn/xuanguang/data
