@@ -18,7 +18,13 @@ check_train_effect.py
 模型输出语义（见 nn/net.py）：
 - bin_logits: 64-bin 分类输出
 - dist: 距离输出（米，argmax(bin) 还原）
-- conf: 置信输出，表示“预测误差在 ±7% 内”的概率
+- conf: 固定 SNR（非学习）
+  peak=max(bin[0..61]), mean=mean(bin[0..61]), std=std(bin[0..61])
+  snr=(peak-mean)/std
+  本可视化输出两种卡控图：
+  1) snr > 4
+  2) 分段阈值（基于 pred 距离）：<=3m 用 snr>5.5，3~5m 用 snr>5，
+     5~8m 用 snr>4.5，8m+ 用 snr>4
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ NUM_BINS = 64
 VALID_BINS = 63
 INVALID_BIN = 63
 MAX_VALID_M = 35.0
+MIN_SHOW_M = 1.0
 MAX_GT_SHOW_M = 30.0
 LOG_BASE = 1.06
 
@@ -57,6 +64,15 @@ HIST_H = 260
 EPS = 1e-6
 # 显示用 gamma（宏定义/全局常量）：用于反射率/概率等灰度映射的视觉增强
 DISP_GAMMA = 1.2
+SUM_GATE_MAX = 20000.0
+SUM_GATE_SNR_DIV = 3.0
+PEAK_GATE_MIN = 30.0
+SNR_GATE_FIXED = 4.0
+SNR_GATE_LE3M = 5.5      # <=3m
+SNR_GATE_3TO5M = 5.0     # (3,5]m
+SNR_GATE_5TO8M = 4.5     # (5,8]m
+SNR_GATE_GT8M = 4.0      # >8m
+SNR_SHOW_MAX = 10.0
 
 
 def _disp_xy_to_pixel(dx: int, dy: int, show_w: int, show_h: int) -> Tuple[int, int]:
@@ -101,7 +117,7 @@ def _with_text(img_bgr: np.ndarray, text: str) -> np.ndarray:
     import cv2  # type: ignore
 
     out = img_bgr.copy()
-    cv2.putText(out, text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
     return out
 
 
@@ -133,7 +149,7 @@ def _render_histogram_bgr(
     img = np.zeros((sh, sw, 3), dtype=np.uint8)
 
     # 画图区（留边距给文字和坐标）
-    top = 34
+    top = 76
     left = 14
     right = 10
     bottom = 18
@@ -221,8 +237,29 @@ def _render_input_intensity_u8(hists: np.ndarray) -> np.ndarray:
     return np.clip(np.rint(norm * 255.0), 0, 255).astype(np.uint8)
 
 
+def _compute_snr_from_input(hists: np.ndarray) -> np.ndarray:
+    """按输入前 62 个 bin 计算 SNR 图：snr=(max-mean)/std。"""
+    h = np.asarray(hists, dtype=np.float32)
+    if h.shape != (TOF_H, TOF_W, TOF_C):
+        raise ValueError(f"bad hists shape: {h.shape}")
+
+    src = h[:, :, :HIST_BINS]
+    vmax = np.max(src, axis=2)
+    vsum = np.sum(src, axis=2, dtype=np.float32)
+    mean = np.mean(src, axis=2, dtype=np.float32)
+    std = np.std(src, axis=2, dtype=np.float32)
+    snr = (vmax - mean) / np.maximum(std, 1e-6)
+
+    div = float(max(SUM_GATE_SNR_DIV, 1.0))
+    # SUM 超限时不直接置 0，而是降为 snr / div（div 可调）。
+    snr = np.where(vsum > float(SUM_GATE_MAX), snr / div, snr)
+    # 峰值过低时直接判为低置信度。
+    snr = np.where(vmax < float(PEAK_GATE_MIN), 0.0, snr)
+    return snr.astype(np.float32, copy=False)
+
+
 def _colorize_depth(depth_m: np.ndarray) -> np.ndarray:
-    """(H,W) depth(m) -> BGR (near red, far blue), 0 为黑。
+    """(H,W) depth(m) -> BGR (TURBO), <1m/无效为黑。
 
     注意：这个函数会“自适应”本张图的动态范围（vmin/vmax），因此如果要让
     GT 和 PRED 使用同一套色彩映射，请改用 `_colorize_depth_with_range`，
@@ -231,7 +268,7 @@ def _colorize_depth(depth_m: np.ndarray) -> np.ndarray:
     import cv2  # type: ignore
 
     d = np.asarray(depth_m, dtype=np.float32)
-    valid = d > 0
+    valid = np.isfinite(d) & (d >= float(MIN_SHOW_M))
     if not np.any(valid):
         return np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
 
@@ -245,7 +282,7 @@ def _colorize_depth(depth_m: np.ndarray) -> np.ndarray:
 
     u8 = np.zeros((TOF_H, TOF_W), dtype=np.uint8)
     u8[valid] = np.clip(np.rint((inv[valid] - vmin) / (vmax - vmin) * 255.0), 0, 255).astype(np.uint8)
-    bgr = cv2.applyColorMap(u8, cv2.COLORMAP_JET)
+    bgr = cv2.applyColorMap(u8, cv2.COLORMAP_TURBO)
     bgr[~valid] = (0, 0, 0)
     return bgr
 
@@ -253,7 +290,7 @@ def _colorize_depth(depth_m: np.ndarray) -> np.ndarray:
 def _inv_depth_range_from_depth(depth_m: np.ndarray) -> tuple[float, float] | None:
     """从 depth(m) 计算 inv_depth 的 (vmin,vmax)；无有效像素返回 None。"""
     d = np.asarray(depth_m, dtype=np.float32)
-    valid = d > 0
+    valid = np.isfinite(d) & (d >= float(MIN_SHOW_M))
     if not np.any(valid):
         return None
     inv_v = 1.0 / np.clip(d[valid], EPS, np.inf)
@@ -269,7 +306,7 @@ def _colorize_depth_with_range(depth_m: np.ndarray, inv_vmin: float, inv_vmax: f
     import cv2  # type: ignore
 
     d = np.asarray(depth_m, dtype=np.float32)
-    valid = d > 0
+    valid = np.isfinite(d) & (d >= float(MIN_SHOW_M))
     if not np.any(valid):
         return np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
 
@@ -283,7 +320,7 @@ def _colorize_depth_with_range(depth_m: np.ndarray, inv_vmin: float, inv_vmax: f
 
     u8 = np.zeros((TOF_H, TOF_W), dtype=np.uint8)
     u8[valid] = np.clip(np.rint((inv[valid] - vmin) / (vmax - vmin) * 255.0), 0, 255).astype(np.uint8)
-    bgr = cv2.applyColorMap(u8, cv2.COLORMAP_JET)
+    bgr = cv2.applyColorMap(u8, cv2.COLORMAP_TURBO)
     bgr[~valid] = (0, 0, 0)
     return bgr
 
@@ -307,22 +344,40 @@ def _colorize_error(err_m: np.ndarray, valid: np.ndarray) -> np.ndarray:
 
 
 def _colorize_prob(prob: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    """0~1 的标量图 -> 灰度 BGR（gamma=DISP_GAMMA），invalid 为黑。
+    """SNR 标量图 -> 灰度 BGR（gamma=DISP_GAMMA），invalid 为黑。
 
-    历史上这里用于显示 top1 prob；现在用于显示 “P(|pred-gt|<=7%)” 的概率图。
+    显示映射：snr=10 对应白色（先做 snr/10 再 clamp 到 0~1）。
     """
-    p = np.asarray(prob, dtype=np.float32)
+    s = np.asarray(prob, dtype=np.float32)
     m = valid.astype(bool)
 
-    # 仅用于显示：先 clamp 到 0~1，再做 gamma 映射（更易观察低值层次）
+    # 仅用于显示：snr 先归一到 [0,1]（10 对应 1），再做 gamma 映射。
     gamma = float(DISP_GAMMA)
     disp = np.zeros((TOF_H, TOF_W), dtype=np.float32)
-    disp[m] = np.power(np.clip(p[m], 0.0, 1.0), 1.0 / gamma)
+    disp[m] = np.power(np.clip(s[m] / float(SNR_SHOW_MAX), 0.0, 1.0), 1.0 / gamma)
 
     u8 = np.clip(np.rint(disp * 255.0), 0, 255).astype(np.uint8)
     bgr = np.stack([u8, u8, u8], axis=2)
     bgr[~m] = (0, 0, 0)
     return bgr
+
+
+def _make_range_snr_mask(depth_m: np.ndarray, snr: np.ndarray) -> np.ndarray:
+    """按 pred 距离段应用 SNR 阈值：
+
+    - <=3m:   snr > 5.5
+    - 3~5m:   snr > 5
+    - 5~8m:   snr > 4.5
+    - >8m:    snr > 4
+    """
+    d = np.asarray(depth_m, dtype=np.float32)
+    s = np.asarray(snr, dtype=np.float32)
+    valid = np.isfinite(d) & np.isfinite(s) & (d >= float(MIN_SHOW_M))
+    thr = np.full(d.shape, float(SNR_GATE_GT8M), dtype=np.float32)
+    thr = np.where(d <= 8.0, float(SNR_GATE_5TO8M), thr)
+    thr = np.where(d <= 5.0, float(SNR_GATE_3TO5M), thr)
+    thr = np.where(d <= 3.0, float(SNR_GATE_LE3M), thr)
+    return valid & (s > thr)
 
 
 def _find_pairs(train_dir: Path) -> List[Tuple[Path, Path]]:
@@ -384,7 +439,7 @@ def main() -> int:
         except TypeError:
             ckpt = torch.load(str(ckpt_path), map_location="cpu")
         sd = ckpt.get("state_dict", ckpt)
-        net.load_state_dict(sd, strict=True)
+        net.load_state_dict(sd, strict=False)
         print(f"[load] {ckpt_path}")
     else:
         print(f"[warn] missing checkpoint: {ckpt_path} (use random weights)")
@@ -392,9 +447,6 @@ def main() -> int:
     cv2.namedWindow("CHECK_TRAIN", cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow("HIST", cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow("OUT_HIST", cv2.WINDOW_AUTOSIZE)
-    # 概率阈值滑动条：低于该阈值的像素，PRED 直接置黑不显示
-    # 概率 = 置信输出 conf（P(|pred-gt|<=7%)）
-    cv2.createTrackbar("pThr%", "CHECK_TRAIN", 50, 100, lambda _: None)
 
     mouse = {"x": 0, "y": 0}
 
@@ -411,21 +463,17 @@ def main() -> int:
     cached_in: np.ndarray | None = None
     cached_gt: np.ndarray | None = None
     cached_pred_depth: np.ndarray | None = None
-    cached_prob: np.ndarray | None = None
+    cached_base_depth: np.ndarray | None = None
+    cached_bias: np.ndarray | None = None
+    cached_snr: np.ndarray | None = None
     cached_out_probs: np.ndarray | None = None  # (H,W,NUM_BINS) float32
-
-    ln_base = float(np.log(LOG_BASE))
-    if (not np.isfinite(ln_base)) or ln_base <= 0.0:
-        raise ValueError(f"bad LOG_BASE={LOG_BASE}")
 
     while True:
         ip, op = pairs[idx]
         if cached_idx != idx:
             x, gt = _load_pair(ip, op)
-            # 与训练对齐的 GT 有效性（用于显示/hover 文案）
-            # 注意：显示时希望“真值图不显示距离大于 MAX_GT_SHOW_M 米的部分”，
-            # 因此这里把 GT>MAX_GT_SHOW_M 视作无效
-            valid_gt = np.isfinite(gt) & (gt > 0.0) & (gt <= float(MAX_GT_SHOW_M))
+            # 显示用 GT 有效性：仅保留 [MIN_SHOW_M, MAX_GT_SHOW_M]。
+            valid_gt = np.isfinite(gt) & (gt >= float(MIN_SHOW_M)) & (gt <= float(MAX_GT_SHOW_M))
 
             # run net
             with torch.no_grad():
@@ -433,28 +481,34 @@ def main() -> int:
                 out_t = net.forward_train(inp)
                 logits_t = out_t["bin_logits"]  # (1,NUM_BINS,H,W)
                 probs_t = torch.softmax(logits_t, dim=1)
+                base_t = out_t["dist_raw"][:, 0, :, :]  # (1,H,W), 重心*0.6
+                bias_t = out_t["bias"][:, 0, :, :]  # (1,H,W), 米
                 dist_t = out_t["dist"][:, 0, :, :]  # (1,H,W), 直接为米
-                conf_t = out_t["conf"][:, 0, :, :]  # (1,H,W)
 
+                base_depth = base_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)  # (H,W)
+                bias_map = bias_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)  # (H,W)
                 pred_depth = dist_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)  # (H,W)
-                prob = conf_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)  # (H,W)
                 out_probs = probs_t.squeeze(0).permute(1, 2, 0).detach().cpu().numpy().astype(np.float32, copy=False)
 
             cached_in, cached_gt = x, gt
-            cached_pred_depth, cached_prob, cached_out_probs = pred_depth, prob, out_probs
+            cached_base_depth = base_depth
+            cached_bias = bias_map
+            cached_pred_depth, cached_snr, cached_out_probs = pred_depth, np.zeros((TOF_H, TOF_W), np.float32), out_probs
             cached_idx = idx
 
         assert (
             cached_in is not None
             and cached_gt is not None
             and cached_pred_depth is not None
-            and cached_prob is not None
+            and cached_base_depth is not None
+            and cached_bias is not None
+            and cached_snr is not None
             and cached_out_probs is not None
         )
 
-        # 显示时的真值有效区域：仅保留距离不超过 MAX_GT_SHOW_M 米的部分
-        valid_gt = np.isfinite(cached_gt) & (cached_gt > 0.0) & (cached_gt <= float(MAX_GT_SHOW_M))
-        p_thr = float(cv2.getTrackbarPos("pThr%", "CHECK_TRAIN")) / 100.0
+        # 显示时的真值有效区域：仅保留 [MIN_SHOW_M, MAX_GT_SHOW_M]。
+        valid_gt = np.isfinite(cached_gt) & (cached_gt >= float(MIN_SHOW_M)) & (cached_gt <= float(MAX_GT_SHOW_M))
+        cached_snr = _compute_snr_from_input(cached_in)
         # INPUT intensity
         inten_u8 = _render_input_intensity_u8(cached_in)
         # 显示方向对齐 cali/check.py：向右旋转90° + 水平翻转
@@ -463,11 +517,11 @@ def main() -> int:
         in_big = cv2.resize(inten_u8, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
         in_bgr = cv2.cvtColor(in_big, cv2.COLOR_GRAY2BGR)
 
-        # GT / PRED / P_OK(±7%)
-        # 关键：以“裁剪后(>MAX_GT_SHOW_M 置为 0)”的 GT 动态范围建立“距离→颜色”映射系统，
+        # GT / PRED / CONF
+        # 关键：以“裁剪后(不在 [MIN_SHOW_M, MAX_GT_SHOW_M] 置为 0)”的 GT 动态范围建立“距离→颜色”映射系统，
         # PRED 跟随同一套映射；这样真值图中不会显示距离大于 MAX_GT_SHOW_M 米的区域
         gt_for_disp = np.where(
-            np.isfinite(cached_gt) & (cached_gt > 0.0) & (cached_gt <= float(MAX_GT_SHOW_M)),
+            np.isfinite(cached_gt) & (cached_gt >= float(MIN_SHOW_M)) & (cached_gt <= float(MAX_GT_SHOW_M)),
             cached_gt,
             0.0,
         )
@@ -481,23 +535,24 @@ def main() -> int:
             gt_bgr = _colorize_depth_with_range(gt_for_disp, inv_vmin, inv_vmax)
             pred_bgr = _colorize_depth_with_range(cached_pred_depth, inv_vmin, inv_vmax)
 
-        # 概率过滤：低概率像素不显示（置黑）
-        conf_mask = cached_prob >= p_thr
-        if np.any(~conf_mask):
-            pred_bgr = pred_bgr.copy()
-            pred_bgr[~conf_mask] = (0, 0, 0)
+        # 两种 SNR 卡控结果图：
+        # 1) 固定阈值 SNR > 4
+        pred_bgr_fix4 = pred_bgr.copy()
+        snr_mask_fix4 = cached_snr > float(SNR_GATE_FIXED)
+        pred_bgr_fix4[~snr_mask_fix4] = (0, 0, 0)
 
-        # PROB 图：显示置信头输出（不依赖 GT）
-        valid_all = np.ones((TOF_H, TOF_W), dtype=bool)
-        prob_bgr = _colorize_prob(cached_prob, valid_all)
+        # 2) 分段阈值（基于 pred 距离）：<=3m >5.5，3~5m >5，5~8m >4.5，8m+ >4
+        pred_bgr_range = pred_bgr.copy()
+        snr_mask_range = _make_range_snr_mask(cached_pred_depth, cached_snr)
+        pred_bgr_range[~snr_mask_range] = (0, 0, 0)
 
         gt_bgr = cv2.flip(cv2.rotate(gt_bgr, cv2.ROTATE_90_CLOCKWISE), 1)
-        pred_bgr = cv2.flip(cv2.rotate(pred_bgr, cv2.ROTATE_90_CLOCKWISE), 1)
-        prob_bgr = cv2.flip(cv2.rotate(prob_bgr, cv2.ROTATE_90_CLOCKWISE), 1)
+        pred_bgr_fix4 = cv2.flip(cv2.rotate(pred_bgr_fix4, cv2.ROTATE_90_CLOCKWISE), 1)
+        pred_bgr_range = cv2.flip(cv2.rotate(pred_bgr_range, cv2.ROTATE_90_CLOCKWISE), 1)
 
         gt_big = cv2.resize(gt_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
-        pred_big = cv2.resize(pred_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
-        prob_big = cv2.resize(prob_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
+        pred_fix4_big = cv2.resize(pred_bgr_fix4, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
+        pred_range_big = cv2.resize(pred_bgr_range, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
 
         # hover info（单窗口拼图：2x2 + 顶部 header，需要先扣掉 header 高度）
         mx = int(np.clip(mouse.get("x", 0), 0, SHOW_W * 2 - 1))
@@ -507,47 +562,32 @@ def main() -> int:
         tile_y0 = 0 if my < SHOW_H else SHOW_H
         px, py = _disp_xy_to_pixel(mx - tile_x0, my - tile_y0, SHOW_W, SHOW_H)
         gt_v = float(cached_gt[py, px])
+        base_v = float(cached_base_depth[py, px])
+        bias_v = float(cached_bias[py, px])
         pr_v = float(cached_pred_depth[py, px])
-        pb_v = float(np.clip(cached_prob[py, px], 0.0, 1.0))
-        refl_v = float(np.sum(cached_in[py, px, :HIST_BINS], dtype=np.float32))
-
-        # bin range（由网络输出概率直方图取 top1）
-        k_top = int(np.argmax(cached_out_probs[py, px, :]))
-        # 仅显示三项，且全 ASCII，避免 putText 乱码
-        if k_top == int(INVALID_BIN):
-            hover_txt = (
-                f"pred {pr_v:.3f}m  gt {gt_v:.3f}m  bin[{INVALID_BIN:02d}] INVALID  p7 {pb_v:.2f}  refl {refl_v:.1f}"
-                if gt_v > 0
-                else f"pred {pr_v:.3f}m  gt --  bin[{INVALID_BIN:02d}] INVALID  p7 {pb_v:.2f}  refl {refl_v:.1f}"
-            )
-        else:
-            # bin k 对应的 log 区间：log_b(d) in [k-0.5, k+0.5)
-            # => d in [b^(k-0.5), b^(k+0.5))
-            a_m = float(np.exp((float(k_top) - 0.5) * ln_base))
-            b_m = float(np.exp((float(k_top) + 0.5) * ln_base))
-            hover_txt = (
-                f"pred {pr_v:.3f}m  gt {gt_v:.3f}m  bin[{k_top:02d}] {a_m:.2f}-{b_m:.2f}m  p7 {pb_v:.2f}  refl {refl_v:.1f}"
-                if gt_v > 0
-                else f"pred {pr_v:.3f}m  gt --  bin[{k_top:02d}] {a_m:.2f}-{b_m:.2f}m  p7 {pb_v:.2f}  refl {refl_v:.1f}"
-            )
+        hover_txt = (
+            f"pred {pr_v:.3f}m  gt {gt_v:.3f}m  base {base_v:.3f}m  bias {bias_v:.3f}m"
+            if gt_v >= float(MIN_SHOW_M)
+            else f"pred {pr_v:.3f}m  gt --  base {base_v:.3f}m  bias {bias_v:.3f}m"
+        )
 
         # 单窗口拼图，更方便截图
         in_bgr = _with_text(
             in_bgr, f"INPUT(refl=bins[0..{HIST_BINS-1}], p5-p95->0-255, gamma={DISP_GAMMA:g})"
         )
         gt_big = _with_text(gt_big, "GT")
-        pred_big = _with_text(pred_big, "PRED")
-        prob_big = _with_text(prob_big, "P_OK(+-7%)")
+        pred_fix4_big = _with_text(pred_fix4_big, "PRED (SNR > 4)")
+        pred_range_big = _with_text(pred_range_big, "PRED (<=3m>5.5, 3-5m>5, 5-8m>4.5, 8m+>4)")
 
         # 四张图同步绘制鼠标指向的点
         dx_m, dy_m = _pixel_to_disp_xy(px, py, SHOW_W, SHOW_H)
         in_bgr = _draw_marker(in_bgr, dx_m, dy_m)
         gt_big = _draw_marker(gt_big, dx_m, dy_m)
-        pred_big = _draw_marker(pred_big, dx_m, dy_m)
-        prob_big = _draw_marker(prob_big, dx_m, dy_m)
+        pred_fix4_big = _draw_marker(pred_fix4_big, dx_m, dy_m)
+        pred_range_big = _draw_marker(pred_range_big, dx_m, dy_m)
 
         top = np.hstack([in_bgr, gt_big])
-        bot = np.hstack([pred_big, prob_big])
+        bot = np.hstack([pred_fix4_big, pred_range_big])
         view = np.vstack([top, bot])
         # 顶部标题栏：显示当前样本进度 + hover 文本
         progress_txt = f"sample {idx + 1}/{len(pairs)}"
@@ -566,6 +606,39 @@ def main() -> int:
         except Exception:
             hbins = np.zeros((TOF_C,), dtype=np.float32)
         hist_img = _render_histogram_bgr(hbins, w=HIST_W, h=HIST_H, max_bins=HIST_BINS, title="IN_HIST")
+        hsrc = np.asarray(hbins[:HIST_BINS], dtype=np.float32)
+        if hsrc.size:
+            h_peak_idx = int(np.argmax(hsrc))
+            h_max = float(hsrc[h_peak_idx])
+            h_mean = float(np.mean(hsrc, dtype=np.float32))
+            h_std = float(np.std(hsrc, dtype=np.float32))
+            h_snr = float((h_max - h_mean) / max(h_std, 1e-6))
+        else:
+            h_peak_idx = 0
+            h_max = 0.0
+            h_mean = 0.0
+            h_std = 0.0
+            h_snr = 0.0
+        cv2.putText(
+            hist_img,
+            "snr = (max - mean) / std, using bins[0..61]",
+            (10, 48),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (230, 230, 230),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            hist_img,
+            f"max[{h_peak_idx}]={h_max:.3f}  mean={h_mean:.3f}  std={h_std:.3f}  snr={h_snr:.4f}",
+            (10, 68),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (230, 230, 230),
+            1,
+            cv2.LINE_AA,
+        )
         cv2.imshow("HIST", hist_img)
 
         # hovered point output histogram（网络输出 NUM_BINS 个概率）

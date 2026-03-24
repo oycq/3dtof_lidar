@@ -17,7 +17,11 @@ def main() -> int:
     net = Network(in_channels=C)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     sd = ckpt.get("state_dict", ckpt)
-    net.load_state_dict(sd, strict=True)
+    try:
+        net.load_state_dict(sd, strict=True)
+    except RuntimeError as e:
+        print(f"[warn] strict load failed, fallback strict=False: {e}")
+        net.load_state_dict(sd, strict=False)
     net.eval()
 
     dummy = torch.randn(1, C, H, W, dtype=torch.float32)
