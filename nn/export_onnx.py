@@ -12,7 +12,7 @@ from net import Network
 
 def main() -> int:
     c, h, w = 64, 30, 40
-    opset = 13
+    opset = 11
     out_path = Path(__file__).resolve().parent / "network.onnx"
 
     net = Network()

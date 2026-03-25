@@ -11,10 +11,10 @@ nn/net.py
 - conf: 置信度（0/1）
 
 流程：
-1) 先计算最后两个 bin 的饱和值：
+1) 先拆分前 62 个有效 bin 与最后两个饱和 bin：
    sat_value = bin64 * 1024 + bin63
-   若 sat_value == 0，则赋值为 50000
-2) 将最后两个 bin 置 0 后，基于 64 个 bin 计算：
+   若 sat_value <= 0，则赋值为 50000
+2) 仅基于前 62 个有效 bin 计算：
    mean / std / max / argmax
 3) argmax clip 到 [1, 60]
 4) 距离 = argmax[-1, 0, 1] 三个 bin 的重心 * 0.6m
@@ -43,41 +43,40 @@ class Network(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def _caculate_sat_value(self, x):
-        raw_bin_63 = x[:, -2:-1, :, :]
-        raw_bin_64 = x[:, -1:, :, :]
-        sat_value = raw_bin_64 * TAIL_BASE + raw_bin_63
-        sat_value[sat_value == 0] = PULSES
-        return sat_value
+    def _split_hist_and_tail(self, x):
+        hist, raw_bin_63, raw_bin_64 = torch.split(x, [62, 1, 1], dim=1)
+        return hist, raw_bin_63, raw_bin_64
 
-    def _delete_tail(self, x):
-        x[:,:, -2:] = 0
-        return x
+    def _caculate_sat_value(self, raw_bin_63, raw_bin_64):
+        sat_value = raw_bin_64 * TAIL_BASE + raw_bin_63
+        sat_value = torch.where(sat_value > 0, sat_value, torch.full_like(sat_value, PULSES))
+        return sat_value
 
     def _distance(self, x):
         peak_idx = torch.argmax(x, dim=1, keepdim=True)
         peak_idx = torch.clamp(peak_idx, min=ARGMAX_CLIP_MIN, max=ARGMAX_CLIP_MAX)
 
         a = torch.gather(x, dim=1, index=peak_idx - 1)
-        b = torch.gather(x, dim=1, index=peak_idx + 0)
+        b = torch.gather(x, dim=1, index=peak_idx)
         c = torch.gather(x, dim=1, index=peak_idx + 1)
 
-        centroid = (-1 * a + 0 * b + 1 * c) / (a + b + c) + peak_idx
+        centroid = (c - a) / (a + b + c) + peak_idx
         dist = centroid * DIST_SCALE_M
         dist = dist + DIST_BIAS
         return dist
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        sat_value = self._caculate_sat_value(x)
-        x = self._delete_tail(x)
-        dist = self._distance(x)
-        mean = torch.mean(x, dim=1, keepdim=True)
-        std = torch.std(x, dim=1, keepdim=True, unbiased=False)
-        vmax = torch.max(x, dim=1, keepdim=True).values
-
-        snr = (vmax - mean) / std
-        reflectance = dist * dist * vmax / REFLECT_K * PULSES / sat_value
-        conf = ((snr > float(SNR_THRESH)) & (reflectance > float(REFLECT_THRESH))).to(dtype=x.dtype)
+        hist, raw_bin_63, raw_bin_64 = self._split_hist_and_tail(x)
+        sat_value = self._caculate_sat_value(raw_bin_63, raw_bin_64)
+        dist = self._distance(hist)
+        mean = torch.mean(hist, dim=1, keepdim=True)
+        std = torch.std(hist, dim=1, keepdim=True, unbiased=False)
+        vmax = torch.max(hist, dim=1, keepdim=True).values
+        signal = vmax - mean
+        
+        snr = signal / std
+        reflectance = dist * dist * signal / REFLECT_K * PULSES / sat_value
+        conf = ((snr > SNR_THRESH) & (reflectance > REFLECT_THRESH))
         return dist, snr, reflectance, conf
 
 
