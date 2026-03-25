@@ -54,7 +54,7 @@ LOG_BASE = 1.06
 # 与 cali/check.py 对齐：300x400
 SHOW_W = 390
 SHOW_H = 520
-HEADER_H = 32
+HEADER_H = 56
 
 # 直方图显示：展示输入的前 62 个 bin（0~61），去掉最后两个 bin（通常为特殊/保留）
 HIST_BINS = 62
@@ -64,6 +64,10 @@ HIST_H = 260
 EPS = 1e-6
 # 显示用 gamma（宏定义/全局常量）：用于反射率/概率等灰度映射的视觉增强
 DISP_GAMMA = 1.2
+REFLECT_SAT_VALUE = 1023.0
+REFLECT_SAT_SCALE = 50000.0
+REFLECT_DENOM = 156250.0
+REFLECT_THRESH = 0.025
 SUM_GATE_MAX = 20000.0
 SUM_GATE_SNR_DIV = 3.0
 PEAK_GATE_MIN = 30.0
@@ -113,11 +117,11 @@ def _draw_marker(img_bgr: np.ndarray, x: int, y: int) -> np.ndarray:
     return out
 
 
-def _with_text(img_bgr: np.ndarray, text: str) -> np.ndarray:
+def _with_text(img_bgr: np.ndarray, text: str, y: int = 24) -> np.ndarray:
     import cv2  # type: ignore
 
     out = img_bgr.copy()
-    cv2.putText(out, text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(out, text, (10, int(y)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
     return out
 
 
@@ -203,38 +207,57 @@ def _render_histogram_bgr(
     return img
 
 
-def _render_input_intensity_u8(hists: np.ndarray) -> np.ndarray:
-    """(H,W,64) -> (H,W) uint8 intensity/reflectance.
+def _adjust_reflect_peak(peak: np.ndarray, bin_63: np.ndarray, bin_64: np.ndarray) -> np.ndarray:
+    peak_arr = np.asarray(peak, dtype=np.float32)
+    bin_63_arr = np.asarray(bin_63, dtype=np.float32)
+    bin_64_arr = np.asarray(bin_64, dtype=np.float32)
+    denom = bin_64_arr * float(REFLECT_SAT_VALUE) + bin_63_arr
+    sat_mask = np.isfinite(peak_arr) & (peak_arr == float(REFLECT_SAT_VALUE))
+    valid_mask = sat_mask & np.isfinite(denom) & (denom > 0.0)
+    adjusted = np.where(
+        valid_mask,
+        float(REFLECT_SAT_VALUE) * float(REFLECT_SAT_SCALE) / denom,
+        peak_arr,
+    )
+    return adjusted.astype(np.float32, copy=False)
 
-    反射率用“所有返回光子数”表征：对 64 个 bin 全部求和。
-    显示映射：
-    - 以反射率分布的 5%~95% 百分位做拉伸：p5 -> 0, p95 -> 255（抑制离群点）
-    - 再做 gamma=DISP_GAMMA（提升暗部层次）
+
+def _compute_input_reflectance(hists: np.ndarray, depth_m: np.ndarray) -> np.ndarray:
+    """(H,W,64) + (H,W) depth(m) -> (H,W) reflectance in [0, +inf).
+
+    参考 `nn/xuanguang/new_method.py` 的反射率定义：
+    - 只在 bins[0..61] 里找一次首个 max
+    - 不做 retry，不重新找后续峰
+    - 用 (max - mean) 作为信号
+    - reflectance = max(max - mean, 0) * depth^2 / REFLECT_DENOM
     """
-    # 只用前 62 个 bin（0~61）的返回光子求和作为反射率/强度
-    h = hists.astype(np.float32, copy=False)
-    inten = np.sum(h[:, :, :HIST_BINS], axis=2)
-    if not inten.size:
-        return np.zeros((TOF_H, TOF_W), dtype=np.uint8)
+    h = np.asarray(hists, dtype=np.float32)
+    d = np.asarray(depth_m, dtype=np.float32)
+    src = h[:, :, :HIST_BINS]
+    if not src.size:
+        return np.zeros((TOF_H, TOF_W), dtype=np.float32)
 
-    m = np.isfinite(inten)
+    peak = np.max(src, axis=2)
+    mean = np.mean(src, axis=2, dtype=np.float32)
+    bin_63 = h[:, :, HIST_BINS] if h.shape[2] > HIST_BINS else np.zeros((TOF_H, TOF_W), dtype=np.float32)
+    bin_64 = h[:, :, HIST_BINS + 1] if h.shape[2] > (HIST_BINS + 1) else np.zeros((TOF_H, TOF_W), dtype=np.float32)
+    peak = _adjust_reflect_peak(peak, bin_63, bin_64)
+    signal = np.maximum(peak - mean, 0.0)
+
+    refl = np.zeros((TOF_H, TOF_W), dtype=np.float32)
+    m = np.isfinite(signal) & np.isfinite(d) & (signal >= 0.0) & (d > 0.0)
     if not np.any(m):
-        return np.zeros((TOF_H, TOF_W), dtype=np.uint8)
+        return refl
 
-    # 用百分位范围做对比度拉伸（更稳）
-    vmin = float(np.percentile(inten[m], 5))
-    vmax = float(np.percentile(inten[m], 95))
-    if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or vmax <= vmin:
-        return np.zeros((TOF_H, TOF_W), dtype=np.uint8)
+    refl[m] = signal[m] * d[m] * d[m] / float(REFLECT_DENOM)
+    return refl
 
-    # 归一到 0~1：最小反射率 -> 0，最大反射率 -> 1
-    norm = np.clip((inten - vmin) / (vmax - vmin), 0.0, 1.0)
-    # gamma（显示用，常规做法是 pow(x, 1/gamma)）
-    gamma = float(DISP_GAMMA)
-    if np.isfinite(gamma) and gamma > 0 and abs(gamma - 1.0) > 1e-6:
-        norm = np.power(norm, 1.0 / gamma)
 
-    return np.clip(np.rint(norm * 255.0), 0, 255).astype(np.uint8)
+def _render_input_reflectance_u8(reflectance: np.ndarray) -> np.ndarray:
+    """把反射率线性映射成灰度：0% -> 0, 100% -> 255。"""
+    r = np.asarray(reflectance, dtype=np.float32)
+    disp = np.clip(r, 0.0, 1.0)
+    return np.clip(np.rint(disp * 255.0), 0, 255).astype(np.uint8)
 
 
 def _compute_snr_from_input(hists: np.ndarray) -> np.ndarray:
@@ -446,8 +469,6 @@ def main() -> int:
 
     cv2.namedWindow("CHECK_TRAIN", cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow("HIST", cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow("OUT_HIST", cv2.WINDOW_AUTOSIZE)
-
     mouse = {"x": 0, "y": 0}
 
     def on_mouse(event: int, x: int, y: int, flags: int, userdata: object) -> None:
@@ -466,8 +487,6 @@ def main() -> int:
     cached_base_depth: np.ndarray | None = None
     cached_bias: np.ndarray | None = None
     cached_snr: np.ndarray | None = None
-    cached_out_probs: np.ndarray | None = None  # (H,W,NUM_BINS) float32
-
     while True:
         ip, op = pairs[idx]
         if cached_idx != idx:
@@ -479,8 +498,6 @@ def main() -> int:
             with torch.no_grad():
                 inp = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
                 out_t = net.forward_train(inp)
-                logits_t = out_t["bin_logits"]  # (1,NUM_BINS,H,W)
-                probs_t = torch.softmax(logits_t, dim=1)
                 base_t = out_t["dist_raw"][:, 0, :, :]  # (1,H,W), 重心*0.6
                 bias_t = out_t["bias"][:, 0, :, :]  # (1,H,W), 米
                 dist_t = out_t["dist"][:, 0, :, :]  # (1,H,W), 直接为米
@@ -488,12 +505,11 @@ def main() -> int:
                 base_depth = base_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)  # (H,W)
                 bias_map = bias_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)  # (H,W)
                 pred_depth = dist_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)  # (H,W)
-                out_probs = probs_t.squeeze(0).permute(1, 2, 0).detach().cpu().numpy().astype(np.float32, copy=False)
 
             cached_in, cached_gt = x, gt
             cached_base_depth = base_depth
             cached_bias = bias_map
-            cached_pred_depth, cached_snr, cached_out_probs = pred_depth, np.zeros((TOF_H, TOF_W), np.float32), out_probs
+            cached_pred_depth, cached_snr = pred_depth, np.zeros((TOF_H, TOF_W), np.float32)
             cached_idx = idx
 
         assert (
@@ -503,14 +519,14 @@ def main() -> int:
             and cached_base_depth is not None
             and cached_bias is not None
             and cached_snr is not None
-            and cached_out_probs is not None
         )
 
         # 显示时的真值有效区域：仅保留 [MIN_SHOW_M, MAX_GT_SHOW_M]。
         valid_gt = np.isfinite(cached_gt) & (cached_gt >= float(MIN_SHOW_M)) & (cached_gt <= float(MAX_GT_SHOW_M))
         cached_snr = _compute_snr_from_input(cached_in)
-        # INPUT intensity
-        inten_u8 = _render_input_intensity_u8(cached_in)
+        # INPUT reflectance：参考 xuanguang/new_method.py，但这里只取首个 max，只计算一次
+        input_reflectance = _compute_input_reflectance(cached_in, cached_pred_depth)
+        inten_u8 = _render_input_reflectance_u8(input_reflectance)
         # 显示方向对齐 cali/check.py：向右旋转90° + 水平翻转
         inten_u8 = cv2.rotate(inten_u8, cv2.ROTATE_90_CLOCKWISE)
         inten_u8 = cv2.flip(inten_u8, 1)
@@ -541,9 +557,16 @@ def main() -> int:
         snr_mask_fix4 = cached_snr > float(SNR_GATE_FIXED)
         pred_bgr_fix4[~snr_mask_fix4] = (0, 0, 0)
 
-        # 2) 分段阈值（基于 pred 距离）：<=3m >5.5，3~5m >5，5~8m >4.5，8m+ >4
+        # 2) 双条件卡控：SNR > 4 且 reflectance > 2.5%
         pred_bgr_range = pred_bgr.copy()
-        snr_mask_range = _make_range_snr_mask(cached_pred_depth, cached_snr)
+        snr_mask_range = (
+            np.isfinite(cached_pred_depth)
+            & (cached_pred_depth >= float(MIN_SHOW_M))
+            & np.isfinite(cached_snr)
+            & (cached_snr > float(SNR_GATE_FIXED))
+            & np.isfinite(input_reflectance)
+            & (input_reflectance > float(REFLECT_THRESH))
+        )
         pred_bgr_range[~snr_mask_range] = (0, 0, 0)
 
         gt_bgr = cv2.flip(cv2.rotate(gt_bgr, cv2.ROTATE_90_CLOCKWISE), 1)
@@ -565,19 +588,30 @@ def main() -> int:
         base_v = float(cached_base_depth[py, px])
         bias_v = float(cached_bias[py, px])
         pr_v = float(cached_pred_depth[py, px])
+        refl_v = float(input_reflectance[py, px])
+        refl_txt = f"{refl_v * 100.0:.3f}%"
+        hover_hbins = np.asarray(cached_in[py, px, :], dtype=np.float32)
+        hover_src = np.asarray(hover_hbins[:HIST_BINS], dtype=np.float32)
+        hover_mean = float(np.mean(hover_src, dtype=np.float32)) if hover_src.size else 0.0
+        hover_raw_max = float(np.max(hover_src)) if hover_src.size else 0.0
+        hover_bin_63 = float(hover_hbins[HIST_BINS]) if hover_hbins.shape[0] > HIST_BINS else 0.0
+        hover_bin_64 = float(hover_hbins[HIST_BINS + 1]) if hover_hbins.shape[0] > (HIST_BINS + 1) else 0.0
+        hover_tail = float(hover_bin_64 * float(REFLECT_SAT_VALUE) + hover_bin_63)
+        hover_eq_max = float(_adjust_reflect_peak(np.array([[hover_raw_max]], dtype=np.float32), np.array([[hover_bin_63]], dtype=np.float32), np.array([[hover_bin_64]], dtype=np.float32))[0, 0])
         hover_txt = (
-            f"pred {pr_v:.3f}m  gt {gt_v:.3f}m  base {base_v:.3f}m  bias {bias_v:.3f}m"
+            f"pred {pr_v:.3f}m  gt {gt_v:.3f}m  base {base_v:.3f}m  bias {bias_v:.3f}m  refl {refl_txt}"
             if gt_v >= float(MIN_SHOW_M)
-            else f"pred {pr_v:.3f}m  gt --  base {base_v:.3f}m  bias {bias_v:.3f}m"
+            else f"pred {pr_v:.3f}m  gt --  base {base_v:.3f}m  bias {bias_v:.3f}m  refl {refl_txt}"
+        )
+        hover_txt2 = (
+            f"tail={hover_tail:.3f}  eq_max={hover_eq_max:.3f}  "
+            f"signal={max(hover_eq_max - hover_mean, 0.0):.3f}  refl={refl_txt}"
         )
 
         # 单窗口拼图，更方便截图
-        in_bgr = _with_text(
-            in_bgr, f"INPUT(refl=bins[0..{HIST_BINS-1}], p5-p95->0-255, gamma={DISP_GAMMA:g})"
-        )
         gt_big = _with_text(gt_big, "GT")
         pred_fix4_big = _with_text(pred_fix4_big, "PRED (SNR > 4)")
-        pred_range_big = _with_text(pred_range_big, "PRED (<=3m>5.5, 3-5m>5, 5-8m>4.5, 8m+>4)")
+        pred_range_big = _with_text(pred_range_big, "PRED (SNR > 4 and refl > 2.5%)")
 
         # 四张图同步绘制鼠标指向的点
         dx_m, dy_m = _pixel_to_disp_xy(px, py, SHOW_W, SHOW_H)
@@ -595,7 +629,8 @@ def main() -> int:
 
         # hover 行单独放到顶部标题栏，避免和 tile 内的 "INPUT/GT/..." 文本重叠
         header = np.zeros((HEADER_H, view.shape[1], 3), dtype=np.uint8)
-        header = _with_text(header, header_txt)
+        header = _with_text(header, header_txt, y=22)
+        header = _with_text(header, hover_txt2, y=46)
         view = np.vstack([header, view])
 
         cv2.imshow("CHECK_TRAIN", view)
@@ -640,16 +675,6 @@ def main() -> int:
             cv2.LINE_AA,
         )
         cv2.imshow("HIST", hist_img)
-
-        # hovered point output histogram（网络输出 NUM_BINS 个概率）
-        try:
-            obins = cached_out_probs[py, px, :]
-        except Exception:
-            obins = np.zeros((NUM_BINS,), dtype=np.float32)
-        out_hist_img = _render_histogram_bgr(
-            obins, w=HIST_W, h=HIST_H, max_bins=NUM_BINS, title="OUT_HIST", fixed_vmax=1.0
-        )
-        cv2.imshow("OUT_HIST", out_hist_img)
 
         k = int(cv2.waitKey(30) & 0xFF)
         if k == 27:  # ESC
