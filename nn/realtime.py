@@ -5,15 +5,14 @@
 nn/realtime.py
 
 实时读取 tof.raw（通过 tof_server.py 的 ToFRealtimeServer），
-运行深度学习模型并实时显示 3 张图：
+运行模型并实时显示 3 张图：
 - INPUT: ToF 强度（直方图求和）
 - PRED: 预测深度（伪彩）
-- PROB: 预测置信度图（conf 分支输出）
+- PROB: SNR 灰度图
 - HIST: 鼠标悬停点的输入直方图（实时刷新）
-- OUT_HIST: 鼠标悬停点的输出 bin 概率直方图（实时刷新）
 
 交互：
-- 鼠标悬停：显示 pred/bin_range/prob
+- 鼠标悬停：显示 pred/bin_range/snr/conf/reflectance
 - PRED 使用按 pred 距离分段 SNR 卡控：
   <=3m: snr>5.5, 3~5m: snr>5, 5~8m: snr>4.5, 8m+: snr>4
 - ESC 退出
@@ -41,12 +40,14 @@ LOG_BASE = 1.06
 # 与 check.py 对齐：显示方向使用 rot90CW + flipH（等价转置），单图按 3:4 竖屏显示
 SHOW_W = 390
 SHOW_H = 520
-HEADER_H = 32
+HEADER_H = 56
 HIST_BINS = 62
-HIST_W = 620
-HIST_H = 260
+HIST_W = 640
+HIST_H = 280
 
 EPS = 1e-6
+TAIL_BASE = 1024.0
+PULSES = 50000.0
 DEPTH_NEAR_M = 0.8
 DEPTH_FAR_M = 35.0
 DEPTH_MAP_CLIP_MIN = 1.5
@@ -95,11 +96,11 @@ def _draw_marker(img_bgr: np.ndarray, x: int, y: int) -> np.ndarray:
     return out
 
 
-def _with_text(img_bgr: np.ndarray, text: str) -> np.ndarray:
+def _with_text(img_bgr: np.ndarray, text: str, y: int = 24) -> np.ndarray:
     import cv2  # type: ignore
 
     out = img_bgr.copy()
-    cv2.putText(out, text, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, text, (10, int(y)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
     return out
 
 
@@ -107,69 +108,74 @@ def _render_histogram_bgr(
     bins: np.ndarray,
     w: int = HIST_W,
     h: int = HIST_H,
-    max_bins: int | None = None,
-    title: str = "HIST",
-    fixed_vmax: float | None = None,
 ) -> np.ndarray:
-    """把一维 bins 渲染成柱状直方图（BGR uint8）。"""
     import cv2  # type: ignore
 
-    b = np.asarray(bins, dtype=np.float32).reshape(-1)
-    if max_bins is None:
-        max_bins = int(HIST_BINS)
-    nb = int(min(int(max_bins), b.shape[0]))
-    if nb <= 0:
-        return np.zeros((max(int(h), 1), max(int(w), 1), 3), dtype=np.uint8)
-
-    b = b[:nb]
-    sw = max(int(w), 1)
-    sh = max(int(h), 1)
-    img = np.zeros((sh, sw, 3), dtype=np.uint8)
-
-    top = 76
-    left = 14
-    right = 10
-    bottom = 18
-    x0, y0 = left, top
-    x1, y1 = sw - right, sh - bottom
-    if x1 <= x0 + 2 or y1 <= y0 + 2:
+    b = np.asarray(bins, dtype=np.float32).reshape(-1)[:TOF_C]
+    img = np.zeros((max(int(h), 1), max(int(w), 1), 3), dtype=np.uint8)
+    if b.size <= 0:
         return img
+    b_draw = b[:62]
+    tail_63 = float(b[62]) if b.size > 62 else 0.0
+    tail_64 = float(b[63]) if b.size > 63 else 0.0
+    sat_value = tail_64 * TAIL_BASE + tail_63
+    if sat_value == 0.0:
+        sat_value = PULSES
+    vmax_raw = float(np.max(b_draw)) if b_draw.size > 0 else 0.0
+    vmax_eq_sat = vmax_raw * PULSES / sat_value
 
-    if fixed_vmax is not None:
-        vmax = float(fixed_vmax)
-        if (not np.isfinite(vmax)) or vmax <= 0.0:
-            vmax = 1.0
-    else:
-        vmax = float(np.max(b)) if b.size else 0.0
-        if (not np.isfinite(vmax)) or vmax <= 0.0:
-            vmax = 1.0
-
+    x0, y0 = 14, 128
+    x1, y1 = img.shape[1] - 10, img.shape[0] - 18
+    vmax = 1.0 if (not np.isfinite(vmax_raw) or vmax_raw <= 0.0) else vmax_raw
     cv2.rectangle(img, (x0, y0), (x1, y1), (80, 80, 80), 1, cv2.LINE_AA)
-
-    bar_area_w = max(x1 - x0, 1)
-    bar_w = max(int(bar_area_w / nb), 1)
-    for i in range(nb):
-        v = float(b[i])
-        if (not np.isfinite(v)) or v < 0.0:
-            v = 0.0
-        hh = int(np.clip(v / vmax, 0.0, 1.0) * (y1 - y0 - 1))
-        xL = x0 + i * bar_w
-        xR = min(xL + bar_w, x1)
-        if xR <= xL:
+    bar_w = max(int((x1 - x0) / max(b_draw.size, 1)), 1)
+    for i, v in enumerate(b_draw):
+        vv = float(v) if np.isfinite(v) and float(v) > 0.0 else 0.0
+        hh = int(np.clip(vv / vmax, 0.0, 1.0) * (y1 - y0 - 1))
+        xl = x0 + i * bar_w
+        xr = min(xl + bar_w, x1)
+        if xr <= xl:
             continue
-        yT = y1 - hh
-        cv2.rectangle(img, (xL, yT), (xR, y1), (255, 220, 0), -1)
-        cv2.rectangle(img, (xL, yT), (xR, y1), (30, 30, 30), 1)
-
-    step = 10
-    for k in range(0, nb, step):
-        xx = x0 + int(k * bar_w)
-        cv2.line(img, (xx, y1), (xx, y1 + 4), (120, 120, 120), 1, cv2.LINE_AA)
-        cv2.putText(img, str(k), (xx + 2, sh - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
-
-    ssum = float(np.sum(b))
-    img = _with_text(img, f"{title} bins[0..{nb-1}]  max {vmax:.3f}  sum {ssum:.3f}")
+        yt = y1 - hh
+        cv2.rectangle(img, (xl, yt), (xr, y1), (255, 220, 0), -1)
+        cv2.rectangle(img, (xl, yt), (xr, y1), (30, 30, 30), 1)
+    img = _with_text(img, "RAW_HIST (only 0-61 bins)", y=24)
+    img = _with_text(img, f"max={vmax_raw:.3f}", y=48)
+    img = _with_text(img, f"sat_value={sat_value:.3f}", y=72)
+    img = _with_text(img, f"max_eq_sat={vmax_eq_sat:.3f}", y=96)
     return img
+
+
+def _inv_depth_range_from_depth(depth_m: np.ndarray) -> Tuple[float, float] | None:
+    d = np.asarray(depth_m, dtype=np.float32)
+    valid = np.isfinite(d) & (d > 0.0)
+    if not np.any(valid):
+        return None
+    inv_v = 1.0 / np.clip(d[valid], EPS, np.inf)
+    vmin = float(np.min(inv_v))
+    vmax = float(np.max(inv_v))
+    return (vmin, vmax if vmax > vmin else vmin + 1e-6)
+
+
+def _colorize_depth_with_range(depth_m: np.ndarray, inv_vmin: float, inv_vmax: float) -> np.ndarray:
+    import cv2  # type: ignore
+
+    d = np.asarray(depth_m, dtype=np.float32)
+    valid = np.isfinite(d) & (d > 0.0)
+    if not np.any(valid):
+        return np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
+    inv = np.zeros_like(d, dtype=np.float32)
+    inv[valid] = 1.0 / np.clip(d[valid], EPS, np.inf)
+    u8 = np.zeros((TOF_H, TOF_W), dtype=np.uint8)
+    u8[valid] = np.clip(np.rint((inv[valid] - inv_vmin) / (inv_vmax - inv_vmin) * 255.0), 0, 255).astype(np.uint8)
+    bgr = cv2.applyColorMap(u8, cv2.COLORMAP_TURBO)
+    bgr[~valid] = (0, 0, 0)
+    return bgr
+
+
+def _colorize_gray01(x: np.ndarray) -> np.ndarray:
+    u8 = np.clip(np.rint(np.clip(np.asarray(x, dtype=np.float32), 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
+    return np.stack([u8, u8, u8], axis=2)
 
 
 def _render_input_intensity_u8(hists: np.ndarray) -> np.ndarray:
@@ -257,27 +263,31 @@ def _make_range_snr_mask(depth_m: np.ndarray, snr: np.ndarray) -> np.ndarray:
     return valid & (s > thr)
 
 
-def _run_infer(net, device, hists: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """hist (H,W,64) -> pred_depth, out_probs."""
+def _run_infer(net, device, hists: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """hist (H,W,64) -> pred_depth, snr, reflectance, conf."""
     import torch
 
+    h = np.array(hists, dtype=np.float32, copy=True)
     with torch.inference_mode():
-        inp = torch.from_numpy(hists).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
-        out = net.forward_train(inp)
-        logits_t = out["bin_logits"]  # (1,64,H,W)
-        probs_t = torch.softmax(logits_t, dim=1)
-        dist_t = out["dist"]  # (1,1,H,W)
-        pred_depth = dist_t[:, 0, :, :].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
-        out_probs = probs_t.squeeze(0).permute(1, 2, 0).detach().cpu().numpy().astype(np.float32, copy=False)
+        inp = torch.from_numpy(h).permute(2, 0, 1)[None].to(device=device, dtype=torch.float32)
+        dist_t, snr_t, reflectance_t, conf_t = net(inp)
+        pred_depth = dist_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+        snr = snr_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+        reflectance = reflectance_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+        conf = conf_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
 
     invalid = (~np.isfinite(pred_depth)) | (pred_depth <= 0.0)
     if np.any(invalid):
         pred_depth = pred_depth.copy()
-        out_probs = out_probs.copy()
+        snr = snr.copy()
+        reflectance = reflectance.copy()
+        conf = conf.copy()
         pred_depth[invalid] = 0.0
-        out_probs[invalid, :] = 0.0
+        snr[invalid] = 0.0
+        reflectance[invalid] = 0.0
+        conf[invalid] = 0.0
 
-    return pred_depth, out_probs
+    return pred_depth, snr, reflectance, conf
 
 
 def main() -> int:
@@ -305,7 +315,7 @@ def main() -> int:
     ckpt_path = nn_dir / "model_last.pt"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = Network(in_channels=TOF_C).to(device)
+    net = Network().to(device)
     net.eval()
 
     if ckpt_path.exists():
@@ -325,8 +335,6 @@ def main() -> int:
 
     cv2.namedWindow("NN_REALTIME", cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow("HIST", cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow("OUT_HIST", cv2.WINDOW_AUTOSIZE)
-
     mouse = {"x": 0, "y": 0}
 
     def on_mouse(event: int, x: int, y: int, flags: int, userdata: object) -> None:
@@ -344,7 +352,8 @@ def main() -> int:
     cached_in: np.ndarray | None = None
     cached_pred_depth: np.ndarray | None = None
     cached_snr: np.ndarray | None = None
-    cached_out_probs: np.ndarray | None = None
+    cached_reflectance: np.ndarray | None = None
+    cached_conf: np.ndarray | None = None
 
     try:
         while True:
@@ -353,118 +362,69 @@ def main() -> int:
                 raw_u16 = np.frombuffer(frame.raw_bytes, dtype=np.uint16)
                 hists = tof_histograms_from_u16(raw_u16)
                 if hists.shape == (TOF_H, TOF_W, TOF_C):
-                    pred_depth, out_probs = _run_infer(net, device, hists)
-                    snr = _compute_snr_from_input(hists)
+                    pred_depth, snr, reflectance, conf = _run_infer(net, device, hists)
                     cached_in = hists
                     cached_pred_depth = pred_depth
                     cached_snr = snr
-                    cached_out_probs = out_probs
+                    cached_reflectance = reflectance
+                    cached_conf = conf
                     last_ts = float(frame.ts)
 
-            if cached_in is None or cached_pred_depth is None or cached_snr is None or cached_out_probs is None:
+            if cached_in is None or cached_pred_depth is None or cached_snr is None or cached_reflectance is None or cached_conf is None:
                 k = int(cv2.waitKey(5) & 0xFF)
                 if k == 27:
                     break
                 continue
 
-            # INPUT intensity
-            inten_u8 = _render_input_intensity_u8(cached_in)
-            in_u8 = cv2.rotate(inten_u8, cv2.ROTATE_90_CLOCKWISE)
-            in_u8 = cv2.flip(in_u8, 1)
-            in_big = cv2.resize(in_u8, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
-            in_bgr = cv2.cvtColor(in_big, cv2.COLOR_GRAY2BGR)
+            refl_u8 = np.clip(np.rint(np.clip(cached_reflectance, 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
+            refl_bgr = cv2.cvtColor(
+                cv2.resize(cv2.flip(cv2.rotate(refl_u8, cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST),
+                cv2.COLOR_GRAY2BGR,
+            )
+            input_bgr = cv2.cvtColor(
+                cv2.resize(cv2.flip(cv2.rotate(_render_input_intensity_u8(cached_in), cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST),
+                cv2.COLOR_GRAY2BGR,
+            )
 
-            # PRED depth
-            pred_bgr = _colorize_depth(cached_pred_depth)
-            conf_mask = _make_range_snr_mask(cached_pred_depth, cached_snr)
-            if np.any(~conf_mask):
-                pred_bgr = pred_bgr.copy()
-                pred_bgr[~conf_mask] = (0, 0, 0)
-            pred_bgr = cv2.flip(cv2.rotate(pred_bgr, cv2.ROTATE_90_CLOCKWISE), 1)
-            pred_big = cv2.resize(pred_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
-
-            # PROB
-            valid = np.ones((TOF_H, TOF_W), dtype=bool)
-            prob_bgr = _colorize_prob(cached_snr, valid)
-            prob_bgr = cv2.flip(cv2.rotate(prob_bgr, cv2.ROTATE_90_CLOCKWISE), 1)
-            prob_big = cv2.resize(prob_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
-
-            # hover info（单行）
-            mx = int(np.clip(mouse.get("x", 0), 0, SHOW_W * 3 - 1))
-            my_view = int(mouse.get("y", 0)) - int(HEADER_H)
-            my = int(np.clip(my_view, 0, SHOW_H - 1))
-            tile_x0 = 0 if mx < SHOW_W else (SHOW_W if mx < SHOW_W * 2 else SHOW_W * 2)
-            px, py = _disp_xy_to_pixel(mx - tile_x0, my, SHOW_W, SHOW_H)
-
-            pr_v = float(cached_pred_depth[py, px])
-            pb_v = float(cached_snr[py, px])
-            if pr_v <= 0.0 or (not np.isfinite(pr_v)):
-                hover_txt = f"pred --  snr {pb_v:.2f}"
+            pred_for_disp = np.where(cached_conf > 0.5, cached_pred_depth, 0.0)
+            inv_range = _inv_depth_range_from_depth(cached_pred_depth)
+            if inv_range is None:
+                pred_src = np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
             else:
-                hover_txt = f"pred {pr_v:.3f}m  snr {pb_v:.2f}"
+                pred_src = _colorize_depth_with_range(pred_for_disp, inv_range[0], inv_range[1])
+            pred_big = cv2.resize(cv2.flip(cv2.rotate(pred_src, cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
+            conf_big = cv2.resize(cv2.flip(cv2.rotate(_colorize_gray01(cached_conf), cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
 
-            # 标题文字
-            in_bgr = _with_text(in_bgr, "INPUT")
-            pred_big = _with_text(pred_big, "PRED (<=3m>5.5, 3-5m>5, 5-8m>4.5, 8m+>4)")
-            prob_big = _with_text(prob_big, f"SNR(white@{SNR_SHOW_MAX:g})")
-
-            # 画 hover 点
+            mx = int(np.clip(mouse.get("x", 0), 0, SHOW_W * 2 - 1))
+            my = int(np.clip(int(mouse.get("y", 0)) - int(HEADER_H), 0, SHOW_H * 2 - 1))
+            tile_x0 = 0 if mx < SHOW_W else SHOW_W
+            tile_y0 = 0 if my < SHOW_H else SHOW_H
+            px, py = _disp_xy_to_pixel(mx - tile_x0, my - tile_y0, SHOW_W, SHOW_H)
             dx_m, dy_m = _pixel_to_disp_xy(px, py, SHOW_W, SHOW_H)
-            in_bgr = _draw_marker(in_bgr, dx_m, dy_m)
-            pred_big = _draw_marker(pred_big, dx_m, dy_m)
-            prob_big = _draw_marker(prob_big, dx_m, dy_m)
 
-            view = np.hstack([in_bgr, pred_big, prob_big])
-            header = np.zeros((HEADER_H, view.shape[1], 3), dtype=np.uint8)
-            header = _with_text(header, hover_txt)
-            view = np.vstack([header, view])
+            for img in [refl_bgr, input_bgr, pred_big, conf_big]:
+                marked = _draw_marker(img, dx_m, dy_m)
+                img[:] = marked
+
+            hover1 = f"pred {float(cached_pred_depth[py, px]):.3f}m  conf {float(cached_conf[py, px]):.0f}  snr {float(cached_snr[py, px]):.3f}"
+            hover2 = f"reflectance {float(cached_reflectance[py, px]) * 100.0:.3f}%"
+
+            refl_bgr = _with_text(refl_bgr, "REFLECTANCE")
+            input_bgr = _with_text(input_bgr, "INPUT")
+            pred_big = _with_text(pred_big, "PRED (conf==1)")
+            conf_big = _with_text(conf_big, "CONF")
+            view = np.vstack([
+                np.zeros((HEADER_H, SHOW_W * 2, 3), dtype=np.uint8),
+                np.hstack([refl_bgr, input_bgr]),
+                np.hstack([pred_big, conf_big]),
+            ])
+            view[:HEADER_H] = _with_text(view[:HEADER_H], hover1, y=22)
+            view[:HEADER_H] = _with_text(view[:HEADER_H], hover2, y=46)
 
             cv2.imshow("NN_REALTIME", view)
 
-            # hovered point histogram（输入前 62 个 bin）
             hbins = cached_in[py, px, :]
-            hist_img = _render_histogram_bgr(hbins, w=HIST_W, h=HIST_H, max_bins=HIST_BINS, title="IN_HIST")
-            hsrc = np.asarray(hbins[:HIST_BINS], dtype=np.float32)
-            if hsrc.size:
-                h_peak_idx = int(np.argmax(hsrc))
-                h_max = float(hsrc[h_peak_idx])
-                h_mean = float(np.mean(hsrc, dtype=np.float32))
-                h_std = float(np.std(hsrc, dtype=np.float32))
-                h_snr = float((h_max - h_mean) / max(h_std, 1e-6))
-            else:
-                h_peak_idx = 0
-                h_max = 0.0
-                h_mean = 0.0
-                h_std = 0.0
-                h_snr = 0.0
-            cv2.putText(
-                hist_img,
-                "snr = (max - mean) / std, using bins[0..61]",
-                (10, 48),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (230, 230, 230),
-                1,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                hist_img,
-                f"max[{h_peak_idx}]={h_max:.3f}  mean={h_mean:.3f}  std={h_std:.3f}  snr={h_snr:.4f}",
-                (10, 68),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (230, 230, 230),
-                1,
-                cv2.LINE_AA,
-            )
-            cv2.imshow("HIST", hist_img)
-
-            # hovered point output histogram（网络输出 NUM_BINS 个概率）
-            obins = cached_out_probs[py, px, :]
-            out_hist_img = _render_histogram_bgr(
-                obins, w=HIST_W, h=HIST_H, max_bins=NUM_BINS, title="OUT_HIST", fixed_vmax=1.0
-            )
-            cv2.imshow("OUT_HIST", out_hist_img)
+            cv2.imshow("HIST", _render_histogram_bgr(hbins))
 
             k = int(cv2.waitKey(1) & 0xFF)
             if k == 27:
