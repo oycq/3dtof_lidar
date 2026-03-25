@@ -15,7 +15,7 @@ def main() -> int:
     opset = 13
     out_path = Path(__file__).resolve().parent / "network.onnx"
 
-    net = Network(in_channels=c)
+    net = Network()
     net.eval()
 
     dummy = torch.randn(1, c, h, w, dtype=torch.float32)
@@ -28,7 +28,7 @@ def main() -> int:
             opset_version=opset,
             do_constant_folding=True,
             input_names=["input"],
-            output_names=["dist", "conf"],
+            output_names=["dist", "snr", "reflectance", "conf"],
         )
 
     print(f"[save] {out_path}")

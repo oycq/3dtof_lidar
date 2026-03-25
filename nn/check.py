@@ -1,11 +1,11 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 
@@ -13,16 +13,9 @@ import numpy as np
 TOF_H = 30
 TOF_W = 40
 TOF_C = 64
-DIST_SCALE_M = 0.6
 EPS = 1e-6
-ARGMAX_CLIP_MIN = 1
-ARGMAX_CLIP_MAX = 60
-REFLECT_SAT_VALUE = 1023.0
-REFLECT_SAT_SCALE = 50000.0
-REFLECT_SAT_BASE = 1024.0
-REFLECT_DENOM = 156250.0
-REFLECT_THRESH = 0.025
-SNR_THRESH = 4.0
+TAIL_BASE = 1024.0
+PULSES = 50000.0
 MIN_SHOW_M = 1.0
 MAX_GT_SHOW_M = 30.0
 SHOW_W = 390
@@ -70,13 +63,21 @@ def _render_histogram_bgr(bins: np.ndarray, w: int = HIST_W, h: int = HIST_H) ->
     img = np.zeros((max(int(h), 1), max(int(w), 1), 3), dtype=np.uint8)
     if b.size <= 0:
         return img
-    x0, y0 = 14, 76
+    b_draw = b[:62]
+    tail_63 = float(b[62]) if b.size > 62 else 0.0
+    tail_64 = float(b[63]) if b.size > 63 else 0.0
+    sat_value = tail_64 * TAIL_BASE + tail_63
+    if sat_value == 0.0:
+        sat_value = PULSES
+    vmax_raw = float(np.max(b_draw)) if b_draw.size > 0 else 0.0
+    vmax_eq_sat = vmax_raw * PULSES / sat_value
+
+    x0, y0 = 14, 128
     x1, y1 = img.shape[1] - 10, img.shape[0] - 18
-    vmax = float(np.max(b)) if np.size(b) else 1.0
-    vmax = 1.0 if (not np.isfinite(vmax) or vmax <= 0.0) else vmax
+    vmax = 1.0 if (not np.isfinite(vmax_raw) or vmax_raw <= 0.0) else vmax_raw
     cv2.rectangle(img, (x0, y0), (x1, y1), (80, 80, 80), 1, cv2.LINE_AA)
-    bar_w = max(int((x1 - x0) / max(b.size, 1)), 1)
-    for i, v in enumerate(b):
+    bar_w = max(int((x1 - x0) / max(b_draw.size, 1)), 1)
+    for i, v in enumerate(b_draw):
         vv = float(v) if np.isfinite(v) and float(v) > 0.0 else 0.0
         hh = int(np.clip(vv / vmax, 0.0, 1.0) * (y1 - y0 - 1))
         xl = x0 + i * bar_w
@@ -84,54 +85,13 @@ def _render_histogram_bgr(bins: np.ndarray, w: int = HIST_W, h: int = HIST_H) ->
         if xr <= xl:
             continue
         yt = y1 - hh
-        color = (0, 120, 255) if i >= 62 else (255, 220, 0)
-        cv2.rectangle(img, (xl, yt), (xr, y1), color, -1)
+        cv2.rectangle(img, (xl, yt), (xr, y1), (255, 220, 0), -1)
         cv2.rectangle(img, (xl, yt), (xr, y1), (30, 30, 30), 1)
-    return _with_text(img, "RAW_HIST (62,63 are tail bins)")
-
-
-def _prepare_rule_bins(hists: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    h = np.asarray(hists, dtype=np.float32)
-    if h.shape != (TOF_H, TOF_W, TOF_C):
-        raise ValueError(f"bad hists shape: {h.shape}")
-    bin_63 = h[:, :, 62]
-    bin_64 = h[:, :, 63]
-    denom = bin_64 * float(REFLECT_SAT_BASE) + bin_63
-    sat_coef = np.where(denom > float(EPS), float(REFLECT_SAT_SCALE) / denom, 1.0).astype(np.float32, copy=False)
-    work = h.copy()
-    work[:, :, 62:] = 0.0
-    return work, sat_coef
-
-
-def _compute_rule_maps(hists: np.ndarray) -> Dict[str, np.ndarray]:
-    work, sat_coef = _prepare_rule_bins(hists)
-    mean = np.mean(work, axis=2, dtype=np.float32)
-    std = np.maximum(np.std(work, axis=2, dtype=np.float32), float(EPS)).astype(np.float32, copy=False)
-    vmax = np.max(work, axis=2).astype(np.float32, copy=False)
-    argmax = np.argmax(work, axis=2).astype(np.int64, copy=False)
-    argmax_clip = np.clip(argmax, ARGMAX_CLIP_MIN, ARGMAX_CLIP_MAX)
-    idxs = np.stack([argmax_clip - 1, argmax_clip, argmax_clip + 1], axis=2).astype(np.int64, copy=False)
-    vals = np.take_along_axis(work, idxs, axis=2)
-    w_sum = np.sum(vals, axis=2, dtype=np.float32)
-    num = np.sum(vals * idxs.astype(np.float32), axis=2, dtype=np.float32)
-    centroid = np.where(w_sum > float(EPS), num / np.maximum(w_sum, float(EPS)), argmax_clip.astype(np.float32))
-    dist = (centroid * float(DIST_SCALE_M)).astype(np.float32, copy=False)
-    snr = ((vmax - mean) / std).astype(np.float32, copy=False)
-    reflectance = (dist * dist * vmax / float(REFLECT_DENOM)).astype(np.float32, copy=False)
-    reflectance = np.where(vmax == float(REFLECT_SAT_VALUE), reflectance * sat_coef, reflectance).astype(np.float32, copy=False)
-    conf = ((snr > float(SNR_THRESH)) & (reflectance > float(REFLECT_THRESH))).astype(np.float32, copy=False)
-    return {
-        "sat_coef": sat_coef,
-        "mean": mean.astype(np.float32, copy=False),
-        "std": std,
-        "max": vmax,
-        "argmax": argmax.astype(np.float32, copy=False),
-        "argmax_clip": argmax_clip.astype(np.float32, copy=False),
-        "dist": dist,
-        "snr": snr,
-        "reflectance": reflectance,
-        "conf": conf,
-    }
+    img = _with_text(img, "RAW_HIST (only 0-61 bins)", y=24)
+    img = _with_text(img, f"max={vmax_raw:.3f}", y=48)
+    img = _with_text(img, f"sat_value={sat_value:.3f}", y=72)
+    img = _with_text(img, f"max_eq_sat={vmax_eq_sat:.3f}", y=96)
+    return img
 
 
 def _inv_depth_range_from_depth(depth_m: np.ndarray) -> Tuple[float, float] | None:
@@ -207,7 +167,7 @@ def main() -> int:
     from net import Network  # noqa: E402
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = Network(in_channels=TOF_C).to(device)
+    net = Network().to(device)
     net.eval()
 
     cv2.namedWindow("CHECK_NET", cv2.WINDOW_AUTOSIZE)
@@ -225,11 +185,13 @@ def main() -> int:
     while True:
         ip, op = pairs[idx]
         x, gt = _load_pair(ip, op)
-        rule = _compute_rule_maps(x)
         with torch.no_grad():
             inp = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
-            pred_depth = net(inp)[0][0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
-            conf_map = net(inp)[1][0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+            pred_depth_t, snr_t, reflectance_t, conf_t = net(inp)
+            pred_depth = pred_depth_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+            snr_map = snr_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+            reflectance_map = reflectance_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+            conf_map = conf_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
 
         gt_for_disp = np.where(np.isfinite(gt) & (gt >= float(MIN_SHOW_M)) & (gt <= float(MAX_GT_SHOW_M)), gt, 0.0)
         inv_range = _inv_depth_range_from_depth(gt_for_disp)
@@ -242,7 +204,7 @@ def main() -> int:
         pred_bgr = pred_bgr.copy()
         pred_bgr[conf_map <= 0.5] = (0, 0, 0)
 
-        refl_bgr = cv2.cvtColor(cv2.resize(cv2.flip(cv2.rotate(np.clip(np.rint(np.clip(rule["reflectance"], 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8), cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR)
+        refl_bgr = cv2.cvtColor(cv2.resize(cv2.flip(cv2.rotate(np.clip(np.rint(np.clip(reflectance_map, 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8), cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR)
         gt_big = cv2.resize(cv2.flip(cv2.rotate(gt_bgr, cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
         pred_big = cv2.resize(cv2.flip(cv2.rotate(pred_bgr, cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
         conf_big = cv2.resize(cv2.flip(cv2.rotate(_colorize_gray01(conf_map), cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
@@ -258,8 +220,8 @@ def main() -> int:
             marked = _draw_marker(img, dx, dy)
             img[:] = marked
 
-        hover1 = f"pred {float(pred_depth[py, px]):.3f}m  gt {float(gt[py, px]):.3f}m  conf {float(conf_map[py, px]):.0f}  snr {float(rule['snr'][py, px]):.3f}"
-        hover2 = f"mean {float(rule['mean'][py, px]):.3f}  std {float(rule['std'][py, px]):.3f}  max {float(rule['max'][py, px]):.3f}  argmax {int(rule['argmax'][py, px])}->{int(rule['argmax_clip'][py, px])}"
+        hover1 = f"pred {float(pred_depth[py, px]):.3f}m  gt {float(gt[py, px]):.3f}m  conf {float(conf_map[py, px]):.0f}  snr {float(snr_map[py, px]):.3f}"
+        hover2 = f"reflectance {float(reflectance_map[py, px]) * 100.0:.3f}%"
 
         refl_bgr = _with_text(refl_bgr, "REFLECTANCE")
         gt_big = _with_text(gt_big, "GT")
@@ -271,8 +233,6 @@ def main() -> int:
         cv2.imshow("CHECK_NET", view)
 
         hist_img = _render_histogram_bgr(x[py, px, :])
-        hist_img = _with_text(hist_img, f"dist={float(pred_depth[py, px]):.3f}m conf={float(conf_map[py, px]):.0f} refl={float(rule['reflectance'][py, px]) * 100.0:.3f}%", y=48)
-        hist_img = _with_text(hist_img, f"sat_coef={float(rule['sat_coef'][py, px]):.3f} snr={float(rule['snr'][py, px]):.3f}", y=68)
         cv2.imshow("HIST", hist_img)
 
         k = int(cv2.waitKey(30) & 0xFF)
