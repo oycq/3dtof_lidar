@@ -1,37 +1,11 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-"""
-check_train_effect.py
-
-用途：检测 nn/train.py 训练后的效果
-- 输入：nn/train_data/input_*.npy  (30,40,64) float32
-- 真值：nn/train_data/output_*.npy (30,40) float32, 单位米；无效为 0 或 <=0
-- 模型：nn/model_last.pt
-
-可视化风格参考 cali/check.py：
-- cv2.imshow
-- 4/6 切换样本，ESC 退出
-- ToF 强度与深度图做 resize + (rot90CW + flipH) 以对齐项目里的显示习惯（同 cali/check.py）
-- 鼠标悬停显示：pred/gt/bin_range/prob（单行 ASCII，避免 cv2 putText 乱码）
-
-模型输出语义（见 nn/net.py）：
-- bin_logits: 64-bin 分类输出
-- dist: 距离输出（米，argmax(bin) 还原）
-- conf: 固定 SNR（非学习）
-  peak=max(bin[0..61]), mean=mean(bin[0..61]), std=std(bin[0..61])
-  snr=(peak-mean)/std
-  本可视化输出两种卡控图：
-  1) snr > 4
-  2) 分段阈值（基于 pred 距离）：<=3m 用 snr>5.5，3~5m 用 snr>5，
-     5~8m 用 snr>4.5，8m+ 用 snr>4
-"""
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -39,82 +13,35 @@ import numpy as np
 TOF_H = 30
 TOF_W = 40
 TOF_C = 64
-
-# 输出分类配置（与 train.py 对齐）
-NUM_BINS = 64
-VALID_BINS = 63
-INVALID_BIN = 63
-MAX_VALID_M = 35.0
+DIST_SCALE_M = 0.6
+EPS = 1e-6
+ARGMAX_CLIP_MIN = 1
+ARGMAX_CLIP_MAX = 60
+REFLECT_SAT_VALUE = 1023.0
+REFLECT_SAT_SCALE = 50000.0
+REFLECT_SAT_BASE = 1024.0
+REFLECT_DENOM = 156250.0
+REFLECT_THRESH = 0.025
+SNR_THRESH = 4.0
 MIN_SHOW_M = 1.0
 MAX_GT_SHOW_M = 30.0
-LOG_BASE = 1.06
-
-# 显示方向使用 rot90CW + flipH 后，原始 (H,W)=(30,40) 会变成 (40,30)，
-# 因此显示的宽高比例应为 W:H = 30:40 = 3:4（竖屏）。
-# 与 cali/check.py 对齐：300x400
 SHOW_W = 390
 SHOW_H = 520
 HEADER_H = 56
-
-# 直方图显示：展示输入的前 62 个 bin（0~61），去掉最后两个 bin（通常为特殊/保留）
-HIST_BINS = 62
-HIST_W = 620
-HIST_H = 260
-
-EPS = 1e-6
-# 显示用 gamma（宏定义/全局常量）：用于反射率/概率等灰度映射的视觉增强
-DISP_GAMMA = 1.2
-REFLECT_SAT_VALUE = 1023.0
-REFLECT_SAT_SCALE = 50000.0
-REFLECT_DENOM = 156250.0
-REFLECT_THRESH = 0.025
-SUM_GATE_MAX = 20000.0
-SUM_GATE_SNR_DIV = 3.0
-PEAK_GATE_MIN = 30.0
-SNR_GATE_FIXED = 4.0
-SNR_GATE_LE3M = 5.5      # <=3m
-SNR_GATE_3TO5M = 5.0     # (3,5]m
-SNR_GATE_5TO8M = 4.5     # (5,8]m
-SNR_GATE_GT8M = 4.0      # >8m
-SNR_SHOW_MAX = 10.0
+HIST_W = 640
+HIST_H = 280
 
 
 def _disp_xy_to_pixel(dx: int, dy: int, show_w: int, show_h: int) -> Tuple[int, int]:
-    """显示坐标 -> ToF 像素坐标。
-
-    显示方向对齐 cali/check.py：rot90CW + flipH。
-    该组合等价于转置：变换后 (row, col) = (px, py)。
-    因此 display 的 x 对应原始 py，display 的 y 对应原始 px。
-    """
-    sw = max(int(show_w), 1)
-    sh = max(int(show_h), 1)
-    py = int(np.clip(dx * TOF_H / sw, 0, TOF_H - 1))
-    px = int(np.clip(dy * TOF_W / sh, 0, TOF_W - 1))
+    py = int(np.clip(dx * TOF_H / max(int(show_w), 1), 0, TOF_H - 1))
+    px = int(np.clip(dy * TOF_W / max(int(show_h), 1), 0, TOF_W - 1))
     return px, py
 
 
 def _pixel_to_disp_xy(px: int, py: int, show_w: int, show_h: int) -> Tuple[int, int]:
-    """ToF 像素坐标 -> 显示坐标（显示做了 rot90CW + flipH）。"""
-    sw = max(int(show_w), 1)
-    sh = max(int(show_h), 1)
-    px_i = int(np.clip(px, 0, TOF_W - 1))
-    py_i = int(np.clip(py, 0, TOF_H - 1))
-    dx = int(np.clip((py_i + 0.5) * sw / TOF_H, 0, sw - 1))
-    dy = int(np.clip((px_i + 0.5) * sh / TOF_W, 0, sh - 1))
+    dx = int(np.clip((int(py) + 0.5) * max(int(show_w), 1) / TOF_H, 0, max(int(show_w), 1) - 1))
+    dy = int(np.clip((int(px) + 0.5) * max(int(show_h), 1) / TOF_W, 0, max(int(show_h), 1) - 1))
     return dx, dy
-
-
-def _draw_marker(img_bgr: np.ndarray, x: int, y: int) -> np.ndarray:
-    """在图上画一个小圆点（黑边白心），用于标记 hover 像素。"""
-    import cv2  # type: ignore
-
-    out = img_bgr.copy()
-    xx = int(np.clip(x, 0, out.shape[1] - 1))
-    yy = int(np.clip(y, 0, out.shape[0] - 1))
-    # 小号细圆环：尽量不遮挡单个像素
-    cv2.circle(out, (xx, yy), 3, (0, 0, 0), 1, cv2.LINE_AA)
-    cv2.circle(out, (xx, yy), 2, (255, 255, 255), 1, cv2.LINE_AA)
-    return out
 
 
 def _with_text(img_bgr: np.ndarray, text: str, y: int = 24) -> np.ndarray:
@@ -125,193 +52,89 @@ def _with_text(img_bgr: np.ndarray, text: str, y: int = 24) -> np.ndarray:
     return out
 
 
-def _render_histogram_bgr(
-    bins: np.ndarray,
-    w: int = HIST_W,
-    h: int = HIST_H,
-    max_bins: int | None = None,
-    title: str = "HIST",
-    fixed_vmax: float | None = None,
-) -> np.ndarray:
-    """把一维 bins 渲染成柱状直方图（BGR uint8）。
-
-    - 默认显示输入的前 HIST_BINS 个 bin（0~61），最后两个 bin 不显示
-    - 为了便于观察，按当前 bins 的最大值做线性归一化
-    """
+def _draw_marker(img_bgr: np.ndarray, x: int, y: int) -> np.ndarray:
     import cv2  # type: ignore
 
-    b = np.asarray(bins, dtype=np.float32).reshape(-1)
-    if max_bins is None:
-        max_bins = int(HIST_BINS)
-    nb = int(min(int(max_bins), b.shape[0]))
-    if nb <= 0:
-        return np.zeros((max(int(h), 1), max(int(w), 1), 3), dtype=np.uint8)
+    out = img_bgr.copy()
+    xx = int(np.clip(x, 0, out.shape[1] - 1))
+    yy = int(np.clip(y, 0, out.shape[0] - 1))
+    cv2.circle(out, (xx, yy), 3, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.circle(out, (xx, yy), 2, (255, 255, 255), 1, cv2.LINE_AA)
+    return out
 
-    b = b[:nb]
-    sw = max(int(w), 1)
-    sh = max(int(h), 1)
-    img = np.zeros((sh, sw, 3), dtype=np.uint8)
 
-    # 画图区（留边距给文字和坐标）
-    top = 76
-    left = 14
-    right = 10
-    bottom = 18
-    x0, y0 = left, top
-    x1, y1 = sw - right, sh - bottom
-    if x1 <= x0 + 2 or y1 <= y0 + 2:
+def _render_histogram_bgr(bins: np.ndarray, w: int = HIST_W, h: int = HIST_H) -> np.ndarray:
+    import cv2  # type: ignore
+
+    b = np.asarray(bins, dtype=np.float32).reshape(-1)[:TOF_C]
+    img = np.zeros((max(int(h), 1), max(int(w), 1), 3), dtype=np.uint8)
+    if b.size <= 0:
         return img
-
-    if fixed_vmax is not None:
-        vmax = float(fixed_vmax)
-        if (not np.isfinite(vmax)) or vmax <= 0.0:
-            vmax = 1.0
-    else:
-        vmax = float(np.max(b)) if b.size else 0.0
-        if not np.isfinite(vmax) or vmax <= 0.0:
-            vmax = 1.0
-
-    # 坐标框
+    x0, y0 = 14, 76
+    x1, y1 = img.shape[1] - 10, img.shape[0] - 18
+    vmax = float(np.max(b)) if np.size(b) else 1.0
+    vmax = 1.0 if (not np.isfinite(vmax) or vmax <= 0.0) else vmax
     cv2.rectangle(img, (x0, y0), (x1, y1), (80, 80, 80), 1, cv2.LINE_AA)
-
-    # 柱子宽度（至少 1px）
-    bar_area_w = max(x1 - x0, 1)
-    bar_w = max(int(bar_area_w / nb), 1)
-    gap = 0  # 可按需调成 1
-
-    for i in range(nb):
-        v = float(b[i])
-        if not np.isfinite(v) or v < 0:
-            v = 0.0
-        hh = int(np.clip(v / vmax, 0.0, 1.0) * (y1 - y0 - 1))
-        xL = x0 + i * bar_w
-        xR = min(xL + bar_w - gap, x1)
-        if xR <= xL:
+    bar_w = max(int((x1 - x0) / max(b.size, 1)), 1)
+    for i, v in enumerate(b):
+        vv = float(v) if np.isfinite(v) and float(v) > 0.0 else 0.0
+        hh = int(np.clip(vv / vmax, 0.0, 1.0) * (y1 - y0 - 1))
+        xl = x0 + i * bar_w
+        xr = min(xl + bar_w, x1)
+        if xr <= xl:
             continue
-        yT = y1 - hh
-        # 填充柱子（青色）+ 细边
-        cv2.rectangle(img, (xL, yT), (xR, y1), (255, 220, 0), -1)
-        cv2.rectangle(img, (xL, yT), (xR, y1), (30, 30, 30), 1)
-
-    # x 轴刻度（每 10 个 bin 一根）
-    step = 10
-    for k in range(0, nb, step):
-        xx = x0 + int(k * bar_w)
-        cv2.line(img, (xx, y1), (xx, y1 + 4), (120, 120, 120), 1, cv2.LINE_AA)
-        cv2.putText(img, str(k), (xx + 2, sh - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
-
-    # 标题（ASCII，避免乱码）
-    ssum = float(np.sum(b))
-    title2 = f"{title} bins[0..{nb-1}]  max {vmax:.3f}  sum {ssum:.3f}"
-    img = _with_text(img, title2)
-    return img
+        yt = y1 - hh
+        color = (0, 120, 255) if i >= 62 else (255, 220, 0)
+        cv2.rectangle(img, (xl, yt), (xr, y1), color, -1)
+        cv2.rectangle(img, (xl, yt), (xr, y1), (30, 30, 30), 1)
+    return _with_text(img, "RAW_HIST (62,63 are tail bins)")
 
 
-def _adjust_reflect_peak(peak: np.ndarray, bin_63: np.ndarray, bin_64: np.ndarray) -> np.ndarray:
-    peak_arr = np.asarray(peak, dtype=np.float32)
-    bin_63_arr = np.asarray(bin_63, dtype=np.float32)
-    bin_64_arr = np.asarray(bin_64, dtype=np.float32)
-    denom = bin_64_arr * float(REFLECT_SAT_VALUE) + bin_63_arr
-    sat_mask = np.isfinite(peak_arr) & (peak_arr == float(REFLECT_SAT_VALUE))
-    valid_mask = sat_mask & np.isfinite(denom) & (denom > 0.0)
-    adjusted = np.where(
-        valid_mask,
-        float(REFLECT_SAT_VALUE) * float(REFLECT_SAT_SCALE) / denom,
-        peak_arr,
-    )
-    return adjusted.astype(np.float32, copy=False)
-
-
-def _compute_input_reflectance(hists: np.ndarray, depth_m: np.ndarray) -> np.ndarray:
-    """(H,W,64) + (H,W) depth(m) -> (H,W) reflectance in [0, +inf).
-
-    参考 `nn/xuanguang/new_method.py` 的反射率定义：
-    - 只在 bins[0..61] 里找一次首个 max
-    - 不做 retry，不重新找后续峰
-    - 用 (max - mean) 作为信号
-    - reflectance = max(max - mean, 0) * depth^2 / REFLECT_DENOM
-    """
-    h = np.asarray(hists, dtype=np.float32)
-    d = np.asarray(depth_m, dtype=np.float32)
-    src = h[:, :, :HIST_BINS]
-    if not src.size:
-        return np.zeros((TOF_H, TOF_W), dtype=np.float32)
-
-    peak = np.max(src, axis=2)
-    mean = np.mean(src, axis=2, dtype=np.float32)
-    bin_63 = h[:, :, HIST_BINS] if h.shape[2] > HIST_BINS else np.zeros((TOF_H, TOF_W), dtype=np.float32)
-    bin_64 = h[:, :, HIST_BINS + 1] if h.shape[2] > (HIST_BINS + 1) else np.zeros((TOF_H, TOF_W), dtype=np.float32)
-    peak = _adjust_reflect_peak(peak, bin_63, bin_64)
-    signal = np.maximum(peak - mean, 0.0)
-
-    refl = np.zeros((TOF_H, TOF_W), dtype=np.float32)
-    m = np.isfinite(signal) & np.isfinite(d) & (signal >= 0.0) & (d > 0.0)
-    if not np.any(m):
-        return refl
-
-    refl[m] = signal[m] * d[m] * d[m] / float(REFLECT_DENOM)
-    return refl
-
-
-def _render_input_reflectance_u8(reflectance: np.ndarray) -> np.ndarray:
-    """把反射率线性映射成灰度：0% -> 0, 100% -> 255。"""
-    r = np.asarray(reflectance, dtype=np.float32)
-    disp = np.clip(r, 0.0, 1.0)
-    return np.clip(np.rint(disp * 255.0), 0, 255).astype(np.uint8)
-
-
-def _compute_snr_from_input(hists: np.ndarray) -> np.ndarray:
-    """按输入前 62 个 bin 计算 SNR 图：snr=(max-mean)/std。"""
+def _prepare_rule_bins(hists: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     h = np.asarray(hists, dtype=np.float32)
     if h.shape != (TOF_H, TOF_W, TOF_C):
         raise ValueError(f"bad hists shape: {h.shape}")
-
-    src = h[:, :, :HIST_BINS]
-    vmax = np.max(src, axis=2)
-    vsum = np.sum(src, axis=2, dtype=np.float32)
-    mean = np.mean(src, axis=2, dtype=np.float32)
-    std = np.std(src, axis=2, dtype=np.float32)
-    snr = (vmax - mean) / np.maximum(std, 1e-6)
-
-    div = float(max(SUM_GATE_SNR_DIV, 1.0))
-    # SUM 超限时不直接置 0，而是降为 snr / div（div 可调）。
-    snr = np.where(vsum > float(SUM_GATE_MAX), snr / div, snr)
-    # 峰值过低时直接判为低置信度。
-    snr = np.where(vmax < float(PEAK_GATE_MIN), 0.0, snr)
-    return snr.astype(np.float32, copy=False)
+    bin_63 = h[:, :, 62]
+    bin_64 = h[:, :, 63]
+    denom = bin_64 * float(REFLECT_SAT_BASE) + bin_63
+    sat_coef = np.where(denom > float(EPS), float(REFLECT_SAT_SCALE) / denom, 1.0).astype(np.float32, copy=False)
+    work = h.copy()
+    work[:, :, 62:] = 0.0
+    return work, sat_coef
 
 
-def _colorize_depth(depth_m: np.ndarray) -> np.ndarray:
-    """(H,W) depth(m) -> BGR (TURBO), <1m/无效为黑。
+def _compute_rule_maps(hists: np.ndarray) -> Dict[str, np.ndarray]:
+    work, sat_coef = _prepare_rule_bins(hists)
+    mean = np.mean(work, axis=2, dtype=np.float32)
+    std = np.maximum(np.std(work, axis=2, dtype=np.float32), float(EPS)).astype(np.float32, copy=False)
+    vmax = np.max(work, axis=2).astype(np.float32, copy=False)
+    argmax = np.argmax(work, axis=2).astype(np.int64, copy=False)
+    argmax_clip = np.clip(argmax, ARGMAX_CLIP_MIN, ARGMAX_CLIP_MAX)
+    idxs = np.stack([argmax_clip - 1, argmax_clip, argmax_clip + 1], axis=2).astype(np.int64, copy=False)
+    vals = np.take_along_axis(work, idxs, axis=2)
+    w_sum = np.sum(vals, axis=2, dtype=np.float32)
+    num = np.sum(vals * idxs.astype(np.float32), axis=2, dtype=np.float32)
+    centroid = np.where(w_sum > float(EPS), num / np.maximum(w_sum, float(EPS)), argmax_clip.astype(np.float32))
+    dist = (centroid * float(DIST_SCALE_M)).astype(np.float32, copy=False)
+    snr = ((vmax - mean) / std).astype(np.float32, copy=False)
+    reflectance = (dist * dist * vmax / float(REFLECT_DENOM)).astype(np.float32, copy=False)
+    reflectance = np.where(vmax == float(REFLECT_SAT_VALUE), reflectance * sat_coef, reflectance).astype(np.float32, copy=False)
+    conf = ((snr > float(SNR_THRESH)) & (reflectance > float(REFLECT_THRESH))).astype(np.float32, copy=False)
+    return {
+        "sat_coef": sat_coef,
+        "mean": mean.astype(np.float32, copy=False),
+        "std": std,
+        "max": vmax,
+        "argmax": argmax.astype(np.float32, copy=False),
+        "argmax_clip": argmax_clip.astype(np.float32, copy=False),
+        "dist": dist,
+        "snr": snr,
+        "reflectance": reflectance,
+        "conf": conf,
+    }
 
-    注意：这个函数会“自适应”本张图的动态范围（vmin/vmax），因此如果要让
-    GT 和 PRED 使用同一套色彩映射，请改用 `_colorize_depth_with_range`，
-    并用 GT 计算出来的 (vmin,vmax) 去给 PRED 上色。
-    """
-    import cv2  # type: ignore
 
-    d = np.asarray(depth_m, dtype=np.float32)
-    valid = np.isfinite(d) & (d >= float(MIN_SHOW_M))
-    if not np.any(valid):
-        return np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
-
-    inv = np.zeros_like(d, dtype=np.float32)
-    inv[valid] = 1.0 / np.clip(d[valid], EPS, np.inf)
-    iv = inv[valid]
-    vmin = float(np.min(iv))
-    vmax = float(np.max(iv))
-    if vmax <= vmin:
-        vmax = vmin + 1e-6
-
-    u8 = np.zeros((TOF_H, TOF_W), dtype=np.uint8)
-    u8[valid] = np.clip(np.rint((inv[valid] - vmin) / (vmax - vmin) * 255.0), 0, 255).astype(np.uint8)
-    bgr = cv2.applyColorMap(u8, cv2.COLORMAP_TURBO)
-    bgr[~valid] = (0, 0, 0)
-    return bgr
-
-
-def _inv_depth_range_from_depth(depth_m: np.ndarray) -> tuple[float, float] | None:
-    """从 depth(m) 计算 inv_depth 的 (vmin,vmax)；无有效像素返回 None。"""
+def _inv_depth_range_from_depth(depth_m: np.ndarray) -> Tuple[float, float] | None:
     d = np.asarray(depth_m, dtype=np.float32)
     valid = np.isfinite(d) & (d >= float(MIN_SHOW_M))
     if not np.any(valid):
@@ -319,94 +142,33 @@ def _inv_depth_range_from_depth(depth_m: np.ndarray) -> tuple[float, float] | No
     inv_v = 1.0 / np.clip(d[valid], EPS, np.inf)
     vmin = float(np.min(inv_v))
     vmax = float(np.max(inv_v))
-    if vmax <= vmin:
-        vmax = vmin + 1e-6
-    return vmin, vmax
+    return (vmin, vmax if vmax > vmin else vmin + 1e-6)
 
 
 def _colorize_depth_with_range(depth_m: np.ndarray, inv_vmin: float, inv_vmax: float) -> np.ndarray:
-    """用指定的 inv_depth 范围给 depth(m) 上色（GT/PRED 统一色彩系统用）。"""
     import cv2  # type: ignore
 
     d = np.asarray(depth_m, dtype=np.float32)
     valid = np.isfinite(d) & (d >= float(MIN_SHOW_M))
     if not np.any(valid):
         return np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
-
     inv = np.zeros_like(d, dtype=np.float32)
     inv[valid] = 1.0 / np.clip(d[valid], EPS, np.inf)
-
-    vmin = float(inv_vmin)
-    vmax = float(inv_vmax)
-    if vmax <= vmin:
-        vmax = vmin + 1e-6
-
     u8 = np.zeros((TOF_H, TOF_W), dtype=np.uint8)
-    u8[valid] = np.clip(np.rint((inv[valid] - vmin) / (vmax - vmin) * 255.0), 0, 255).astype(np.uint8)
+    u8[valid] = np.clip(np.rint((inv[valid] - inv_vmin) / (inv_vmax - inv_vmin) * 255.0), 0, 255).astype(np.uint8)
     bgr = cv2.applyColorMap(u8, cv2.COLORMAP_TURBO)
     bgr[~valid] = (0, 0, 0)
     return bgr
 
 
-def _colorize_error(err_m: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    """abs error (m) -> BGR INFERNO, invalid 为黑。"""
-    import cv2  # type: ignore
-
-    e = np.asarray(err_m, dtype=np.float32)
-    m = (valid.astype(bool)) & np.isfinite(e)
-    if not np.any(m):
-        return np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
-    ev = e[m]
-    vmax = float(np.percentile(ev, 95)) if ev.size else 0.0
-    vmax = max(vmax, 1e-6)
-    u8 = np.zeros((TOF_H, TOF_W), dtype=np.uint8)
-    u8[m] = np.clip(np.rint(np.minimum(e[m], vmax) / vmax * 255.0), 0, 255).astype(np.uint8)
-    bgr = cv2.applyColorMap(u8, cv2.COLORMAP_INFERNO)
-    bgr[~m] = (0, 0, 0)
-    return bgr
-
-
-def _colorize_prob(prob: np.ndarray, valid: np.ndarray) -> np.ndarray:
-    """SNR 标量图 -> 灰度 BGR（gamma=DISP_GAMMA），invalid 为黑。
-
-    显示映射：snr=10 对应白色（先做 snr/10 再 clamp 到 0~1）。
-    """
-    s = np.asarray(prob, dtype=np.float32)
-    m = valid.astype(bool)
-
-    # 仅用于显示：snr 先归一到 [0,1]（10 对应 1），再做 gamma 映射。
-    gamma = float(DISP_GAMMA)
-    disp = np.zeros((TOF_H, TOF_W), dtype=np.float32)
-    disp[m] = np.power(np.clip(s[m] / float(SNR_SHOW_MAX), 0.0, 1.0), 1.0 / gamma)
-
-    u8 = np.clip(np.rint(disp * 255.0), 0, 255).astype(np.uint8)
-    bgr = np.stack([u8, u8, u8], axis=2)
-    bgr[~m] = (0, 0, 0)
-    return bgr
-
-
-def _make_range_snr_mask(depth_m: np.ndarray, snr: np.ndarray) -> np.ndarray:
-    """按 pred 距离段应用 SNR 阈值：
-
-    - <=3m:   snr > 5.5
-    - 3~5m:   snr > 5
-    - 5~8m:   snr > 4.5
-    - >8m:    snr > 4
-    """
-    d = np.asarray(depth_m, dtype=np.float32)
-    s = np.asarray(snr, dtype=np.float32)
-    valid = np.isfinite(d) & np.isfinite(s) & (d >= float(MIN_SHOW_M))
-    thr = np.full(d.shape, float(SNR_GATE_GT8M), dtype=np.float32)
-    thr = np.where(d <= 8.0, float(SNR_GATE_5TO8M), thr)
-    thr = np.where(d <= 5.0, float(SNR_GATE_3TO5M), thr)
-    thr = np.where(d <= 3.0, float(SNR_GATE_LE3M), thr)
-    return valid & (s > thr)
+def _colorize_gray01(x: np.ndarray) -> np.ndarray:
+    u8 = np.clip(np.rint(np.clip(np.asarray(x, dtype=np.float32), 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
+    return np.stack([u8, u8, u8], axis=2)
 
 
 def _find_pairs(train_dir: Path) -> List[Tuple[Path, Path]]:
-    ins = sorted(train_dir.glob("input_*.npy"))
     pairs: List[Tuple[Path, Path]] = []
-    for ip in ins:
+    for ip in sorted(train_dir.glob("input_*.npy")):
         op = train_dir / ip.name.replace("input_", "output_", 1)
         if op.exists():
             pairs.append((ip, op))
@@ -427,26 +189,19 @@ def main() -> int:
     try:
         import cv2  # type: ignore
     except Exception as e:
-        raise RuntimeError("missing dependency opencv-python, run: py -m pip install opencv-python") from e
+        raise RuntimeError("missing dependency opencv-python") from e
 
     try:
         import torch
     except Exception as e:
         raise RuntimeError("missing dependency torch") from e
 
-    # 本文件已移动到 nn/ 下：nn_dir = .../nn
     nn_dir = Path(__file__).resolve().parent
     train_dir = nn_dir / "train_data"
-    ckpt_path = nn_dir / "model_last.pt"
-
-    if not train_dir.exists():
-        raise FileNotFoundError(f"missing train_data dir: {train_dir}")
-
     pairs = _find_pairs(train_dir)
     if not pairs:
         raise FileNotFoundError(f"no input/output pairs found under: {train_dir}")
 
-    # import 网络：把 nn 加到 sys.path，直接 import net.py
     if str(nn_dir) not in sys.path:
         sys.path.insert(0, str(nn_dir))
     from net import Network  # noqa: E402
@@ -455,233 +210,77 @@ def main() -> int:
     net = Network(in_channels=TOF_C).to(device)
     net.eval()
 
-    if ckpt_path.exists():
-        # 优先使用 weights_only=True（新版本 torch 支持），避免 pickle 风险提示
-        try:
-            ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
-        except TypeError:
-            ckpt = torch.load(str(ckpt_path), map_location="cpu")
-        sd = ckpt.get("state_dict", ckpt)
-        net.load_state_dict(sd, strict=False)
-        print(f"[load] {ckpt_path}")
-    else:
-        print(f"[warn] missing checkpoint: {ckpt_path} (use random weights)")
-
-    cv2.namedWindow("CHECK_TRAIN", cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow("CHECK_NET", cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow("HIST", cv2.WINDOW_AUTOSIZE)
     mouse = {"x": 0, "y": 0}
 
     def on_mouse(event: int, x: int, y: int, flags: int, userdata: object) -> None:
-        if int(event) != int(cv2.EVENT_MOUSEMOVE):
-            return
-        mouse["x"] = int(x)
-        mouse["y"] = int(y)
+        if int(event) == int(cv2.EVENT_MOUSEMOVE):
+            mouse["x"] = int(x)
+            mouse["y"] = int(y)
 
-    cv2.setMouseCallback("CHECK_TRAIN", on_mouse)
+    cv2.setMouseCallback("CHECK_NET", on_mouse)
 
     idx = 0
-    cached_idx = -1
-    cached_in: np.ndarray | None = None
-    cached_gt: np.ndarray | None = None
-    cached_pred_depth: np.ndarray | None = None
-    cached_base_depth: np.ndarray | None = None
-    cached_bias: np.ndarray | None = None
-    cached_snr: np.ndarray | None = None
     while True:
         ip, op = pairs[idx]
-        if cached_idx != idx:
-            x, gt = _load_pair(ip, op)
-            # 显示用 GT 有效性：仅保留 [MIN_SHOW_M, MAX_GT_SHOW_M]。
-            valid_gt = np.isfinite(gt) & (gt >= float(MIN_SHOW_M)) & (gt <= float(MAX_GT_SHOW_M))
+        x, gt = _load_pair(ip, op)
+        rule = _compute_rule_maps(x)
+        with torch.no_grad():
+            inp = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
+            pred_depth = net(inp)[0][0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+            conf_map = net(inp)[1][0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
 
-            # run net
-            with torch.no_grad():
-                inp = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
-                out_t = net.forward_train(inp)
-                base_t = out_t["dist_raw"][:, 0, :, :]  # (1,H,W), 重心*0.6
-                bias_t = out_t["bias"][:, 0, :, :]  # (1,H,W), 米
-                dist_t = out_t["dist"][:, 0, :, :]  # (1,H,W), 直接为米
-
-                base_depth = base_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)  # (H,W)
-                bias_map = bias_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)  # (H,W)
-                pred_depth = dist_t.squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)  # (H,W)
-
-            cached_in, cached_gt = x, gt
-            cached_base_depth = base_depth
-            cached_bias = bias_map
-            cached_pred_depth, cached_snr = pred_depth, np.zeros((TOF_H, TOF_W), np.float32)
-            cached_idx = idx
-
-        assert (
-            cached_in is not None
-            and cached_gt is not None
-            and cached_pred_depth is not None
-            and cached_base_depth is not None
-            and cached_bias is not None
-            and cached_snr is not None
-        )
-
-        # 显示时的真值有效区域：仅保留 [MIN_SHOW_M, MAX_GT_SHOW_M]。
-        valid_gt = np.isfinite(cached_gt) & (cached_gt >= float(MIN_SHOW_M)) & (cached_gt <= float(MAX_GT_SHOW_M))
-        cached_snr = _compute_snr_from_input(cached_in)
-        # INPUT reflectance：参考 xuanguang/new_method.py，但这里只取首个 max，只计算一次
-        input_reflectance = _compute_input_reflectance(cached_in, cached_pred_depth)
-        inten_u8 = _render_input_reflectance_u8(input_reflectance)
-        # 显示方向对齐 cali/check.py：向右旋转90° + 水平翻转
-        inten_u8 = cv2.rotate(inten_u8, cv2.ROTATE_90_CLOCKWISE)
-        inten_u8 = cv2.flip(inten_u8, 1)
-        in_big = cv2.resize(inten_u8, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
-        in_bgr = cv2.cvtColor(in_big, cv2.COLOR_GRAY2BGR)
-
-        # GT / PRED / CONF
-        # 关键：以“裁剪后(不在 [MIN_SHOW_M, MAX_GT_SHOW_M] 置为 0)”的 GT 动态范围建立“距离→颜色”映射系统，
-        # PRED 跟随同一套映射；这样真值图中不会显示距离大于 MAX_GT_SHOW_M 米的区域
-        gt_for_disp = np.where(
-            np.isfinite(cached_gt) & (cached_gt >= float(MIN_SHOW_M)) & (cached_gt <= float(MAX_GT_SHOW_M)),
-            cached_gt,
-            0.0,
-        )
+        gt_for_disp = np.where(np.isfinite(gt) & (gt >= float(MIN_SHOW_M)) & (gt <= float(MAX_GT_SHOW_M)), gt, 0.0)
         inv_range = _inv_depth_range_from_depth(gt_for_disp)
         if inv_range is None:
             gt_bgr = np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
             pred_bgr = np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
         else:
-            inv_vmin, inv_vmax = inv_range
-            # 真值显示时只画出 <=MAX_GT_SHOW_M 的部分，其余为 0/黑
-            gt_bgr = _colorize_depth_with_range(gt_for_disp, inv_vmin, inv_vmax)
-            pred_bgr = _colorize_depth_with_range(cached_pred_depth, inv_vmin, inv_vmax)
+            gt_bgr = _colorize_depth_with_range(gt_for_disp, inv_range[0], inv_range[1])
+            pred_bgr = _colorize_depth_with_range(pred_depth, inv_range[0], inv_range[1])
+        pred_bgr = pred_bgr.copy()
+        pred_bgr[conf_map <= 0.5] = (0, 0, 0)
 
-        # 两种 SNR 卡控结果图：
-        # 1) 固定阈值 SNR > 4
-        pred_bgr_fix4 = pred_bgr.copy()
-        snr_mask_fix4 = cached_snr > float(SNR_GATE_FIXED)
-        pred_bgr_fix4[~snr_mask_fix4] = (0, 0, 0)
+        refl_bgr = cv2.cvtColor(cv2.resize(cv2.flip(cv2.rotate(np.clip(np.rint(np.clip(rule["reflectance"], 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8), cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR)
+        gt_big = cv2.resize(cv2.flip(cv2.rotate(gt_bgr, cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
+        pred_big = cv2.resize(cv2.flip(cv2.rotate(pred_bgr, cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
+        conf_big = cv2.resize(cv2.flip(cv2.rotate(_colorize_gray01(conf_map), cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
 
-        # 2) 双条件卡控：SNR > 4 且 reflectance > 2.5%
-        pred_bgr_range = pred_bgr.copy()
-        snr_mask_range = (
-            np.isfinite(cached_pred_depth)
-            & (cached_pred_depth >= float(MIN_SHOW_M))
-            & np.isfinite(cached_snr)
-            & (cached_snr > float(SNR_GATE_FIXED))
-            & np.isfinite(input_reflectance)
-            & (input_reflectance > float(REFLECT_THRESH))
-        )
-        pred_bgr_range[~snr_mask_range] = (0, 0, 0)
-
-        gt_bgr = cv2.flip(cv2.rotate(gt_bgr, cv2.ROTATE_90_CLOCKWISE), 1)
-        pred_bgr_fix4 = cv2.flip(cv2.rotate(pred_bgr_fix4, cv2.ROTATE_90_CLOCKWISE), 1)
-        pred_bgr_range = cv2.flip(cv2.rotate(pred_bgr_range, cv2.ROTATE_90_CLOCKWISE), 1)
-
-        gt_big = cv2.resize(gt_bgr, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
-        pred_fix4_big = cv2.resize(pred_bgr_fix4, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
-        pred_range_big = cv2.resize(pred_bgr_range, (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
-
-        # hover info（单窗口拼图：2x2 + 顶部 header，需要先扣掉 header 高度）
         mx = int(np.clip(mouse.get("x", 0), 0, SHOW_W * 2 - 1))
-        my_view = int(mouse.get("y", 0)) - int(HEADER_H)
-        my = int(np.clip(my_view, 0, SHOW_H * 2 - 1))
+        my = int(np.clip(int(mouse.get("y", 0)) - int(HEADER_H), 0, SHOW_H * 2 - 1))
         tile_x0 = 0 if mx < SHOW_W else SHOW_W
         tile_y0 = 0 if my < SHOW_H else SHOW_H
         px, py = _disp_xy_to_pixel(mx - tile_x0, my - tile_y0, SHOW_W, SHOW_H)
-        gt_v = float(cached_gt[py, px])
-        base_v = float(cached_base_depth[py, px])
-        bias_v = float(cached_bias[py, px])
-        pr_v = float(cached_pred_depth[py, px])
-        refl_v = float(input_reflectance[py, px])
-        refl_txt = f"{refl_v * 100.0:.3f}%"
-        hover_hbins = np.asarray(cached_in[py, px, :], dtype=np.float32)
-        hover_src = np.asarray(hover_hbins[:HIST_BINS], dtype=np.float32)
-        hover_mean = float(np.mean(hover_src, dtype=np.float32)) if hover_src.size else 0.0
-        hover_raw_max = float(np.max(hover_src)) if hover_src.size else 0.0
-        hover_bin_63 = float(hover_hbins[HIST_BINS]) if hover_hbins.shape[0] > HIST_BINS else 0.0
-        hover_bin_64 = float(hover_hbins[HIST_BINS + 1]) if hover_hbins.shape[0] > (HIST_BINS + 1) else 0.0
-        hover_tail = float(hover_bin_64 * float(REFLECT_SAT_VALUE) + hover_bin_63)
-        hover_eq_max = float(_adjust_reflect_peak(np.array([[hover_raw_max]], dtype=np.float32), np.array([[hover_bin_63]], dtype=np.float32), np.array([[hover_bin_64]], dtype=np.float32))[0, 0])
-        hover_txt = (
-            f"pred {pr_v:.3f}m  gt {gt_v:.3f}m  base {base_v:.3f}m  bias {bias_v:.3f}m  refl {refl_txt}"
-            if gt_v >= float(MIN_SHOW_M)
-            else f"pred {pr_v:.3f}m  gt --  base {base_v:.3f}m  bias {bias_v:.3f}m  refl {refl_txt}"
-        )
-        hover_txt2 = (
-            f"tail={hover_tail:.3f}  eq_max={hover_eq_max:.3f}  "
-            f"signal={max(hover_eq_max - hover_mean, 0.0):.3f}  refl={refl_txt}"
-        )
+        dx, dy = _pixel_to_disp_xy(px, py, SHOW_W, SHOW_H)
 
-        # 单窗口拼图，更方便截图
+        for img in [refl_bgr, gt_big, pred_big, conf_big]:
+            marked = _draw_marker(img, dx, dy)
+            img[:] = marked
+
+        hover1 = f"pred {float(pred_depth[py, px]):.3f}m  gt {float(gt[py, px]):.3f}m  conf {float(conf_map[py, px]):.0f}  snr {float(rule['snr'][py, px]):.3f}"
+        hover2 = f"mean {float(rule['mean'][py, px]):.3f}  std {float(rule['std'][py, px]):.3f}  max {float(rule['max'][py, px]):.3f}  argmax {int(rule['argmax'][py, px])}->{int(rule['argmax_clip'][py, px])}"
+
+        refl_bgr = _with_text(refl_bgr, "REFLECTANCE")
         gt_big = _with_text(gt_big, "GT")
-        pred_fix4_big = _with_text(pred_fix4_big, "PRED (SNR > 4)")
-        pred_range_big = _with_text(pred_range_big, "PRED (SNR > 4 and refl > 2.5%)")
+        pred_big = _with_text(pred_big, "PRED (conf==1)")
+        conf_big = _with_text(conf_big, "CONF")
+        view = np.vstack([np.zeros((HEADER_H, SHOW_W * 2, 3), dtype=np.uint8), np.hstack([refl_bgr, gt_big]), np.hstack([pred_big, conf_big])])
+        view[:HEADER_H] = _with_text(view[:HEADER_H], f"sample {idx + 1}/{len(pairs)}  |  {hover1}", y=22)
+        view[:HEADER_H] = _with_text(view[:HEADER_H], hover2, y=46)
+        cv2.imshow("CHECK_NET", view)
 
-        # 四张图同步绘制鼠标指向的点
-        dx_m, dy_m = _pixel_to_disp_xy(px, py, SHOW_W, SHOW_H)
-        in_bgr = _draw_marker(in_bgr, dx_m, dy_m)
-        gt_big = _draw_marker(gt_big, dx_m, dy_m)
-        pred_fix4_big = _draw_marker(pred_fix4_big, dx_m, dy_m)
-        pred_range_big = _draw_marker(pred_range_big, dx_m, dy_m)
-
-        top = np.hstack([in_bgr, gt_big])
-        bot = np.hstack([pred_fix4_big, pred_range_big])
-        view = np.vstack([top, bot])
-        # 顶部标题栏：显示当前样本进度 + hover 文本
-        progress_txt = f"sample {idx + 1}/{len(pairs)}"
-        header_txt = f"{progress_txt}  |  {hover_txt}"
-
-        # hover 行单独放到顶部标题栏，避免和 tile 内的 "INPUT/GT/..." 文本重叠
-        header = np.zeros((HEADER_H, view.shape[1], 3), dtype=np.uint8)
-        header = _with_text(header, header_txt, y=22)
-        header = _with_text(header, hover_txt2, y=46)
-        view = np.vstack([header, view])
-
-        cv2.imshow("CHECK_TRAIN", view)
-
-        # hovered point histogram（取输入的前 62 个 bin：0~61）
-        try:
-            hbins = cached_in[py, px, :]
-        except Exception:
-            hbins = np.zeros((TOF_C,), dtype=np.float32)
-        hist_img = _render_histogram_bgr(hbins, w=HIST_W, h=HIST_H, max_bins=HIST_BINS, title="IN_HIST")
-        hsrc = np.asarray(hbins[:HIST_BINS], dtype=np.float32)
-        if hsrc.size:
-            h_peak_idx = int(np.argmax(hsrc))
-            h_max = float(hsrc[h_peak_idx])
-            h_mean = float(np.mean(hsrc, dtype=np.float32))
-            h_std = float(np.std(hsrc, dtype=np.float32))
-            h_snr = float((h_max - h_mean) / max(h_std, 1e-6))
-        else:
-            h_peak_idx = 0
-            h_max = 0.0
-            h_mean = 0.0
-            h_std = 0.0
-            h_snr = 0.0
-        cv2.putText(
-            hist_img,
-            "snr = (max - mean) / std, using bins[0..61]",
-            (10, 48),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (230, 230, 230),
-            1,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            hist_img,
-            f"max[{h_peak_idx}]={h_max:.3f}  mean={h_mean:.3f}  std={h_std:.3f}  snr={h_snr:.4f}",
-            (10, 68),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (230, 230, 230),
-            1,
-            cv2.LINE_AA,
-        )
+        hist_img = _render_histogram_bgr(x[py, px, :])
+        hist_img = _with_text(hist_img, f"dist={float(pred_depth[py, px]):.3f}m conf={float(conf_map[py, px]):.0f} refl={float(rule['reflectance'][py, px]) * 100.0:.3f}%", y=48)
+        hist_img = _with_text(hist_img, f"sat_coef={float(rule['sat_coef'][py, px]):.3f} snr={float(rule['snr'][py, px]):.3f}", y=68)
         cv2.imshow("HIST", hist_img)
 
         k = int(cv2.waitKey(30) & 0xFF)
-        if k == 27:  # ESC
+        if k == 27:
             break
-        elif k == ord("4"):
+        if k == ord("4"):
             idx = (idx - 1) % len(pairs)
-        elif k == ord("6"):
+        if k == ord("6"):
             idx = (idx + 1) % len(pairs)
 
     cv2.destroyAllWindows()
@@ -690,5 +289,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

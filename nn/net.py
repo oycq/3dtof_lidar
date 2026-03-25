@@ -4,20 +4,21 @@
 """
 nn/net.py
 
-网络结构：
-- 距离基线：直接由输入原始直方图计算
-    1) n = argmax(x)
-    2) 取 [n-2, n-1, n, n+1, n+2] 五个 bin 计算重心 bin_idx
-    3) dist_raw = bin_idx * 0.6 (m)
-- pileup bias 补偿（每像素）：
-    输入 [v(n-2), v(n-1), v(n), v(n+1), v(n+2)]，经 MLP 5-8-8-1 输出 bias
-    bias clip 到 [-1.2, 1.2]m
-    dist = dist_raw - bias
-- 置信度：固定 SNR（非学习）
-    peak = max(x[:62])
-    mean = mean(x[:62])
-    std = std(x[:62])
-    snr = (peak - mean) / std
+规则网络，直接由 64-bin 直方图输出：
+- dist: 距离（米）
+- conf: 置信度（0/1）
+
+流程：
+1) 先计算最后两个 bin 的饱和系数：
+   sat_coef = 50000 / (bin64 * 1024 + bin63)
+2) 将最后两个 bin 置 0 后，基于 64 个 bin 计算：
+   mean / std / max / argmax
+3) argmax clip 到 [1, 60]
+4) 距离 = argmax[-1, 0, 1] 三个 bin 的重心 * 0.6m
+5) snr = (max - mean) / std
+6) 反射率 = dist^2 * max / 156250
+   若 max == 1023，则反射率乘以 sat_coef
+7) 若 snr > 4 且 reflectance > 2.5%，则 conf = 1，否则为 0
 """
 
 from __future__ import annotations
@@ -25,96 +26,84 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-CONF_BINS = 62
 DIST_SCALE_M = 0.6
 DIST_EPS = 1e-6
-BIAS_CLIP_M = 1.2
+TAIL_SCALE = 50000.0
+TAIL_BASE = 1024.0
+REFLECT_DENOM = 156250.0
+REFLECT_SAT_VALUE = 1023.0
+REFLECT_THRESH = 0.025
+SNR_THRESH = 4.0
+ARGMAX_CLIP_MIN = 1
+ARGMAX_CLIP_MAX = 60
 
 class Network(nn.Module):
     def __init__(self, in_channels: int = 64):
         super().__init__()
         self.in_channels = int(in_channels)
-        self.bias_head = nn.Sequential(
-            nn.Linear(5, 4, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Linear(4, 4, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Linear(4, 1, bias=True),
+
+    def _prepare_bins(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        raw_bin_63 = x[:, -2:-1, :, :]
+        raw_bin_64 = x[:, -1:, :, :]
+        sat_denom = raw_bin_64 * float(TAIL_BASE) + raw_bin_63
+        sat_coef = torch.where(
+            sat_denom > float(DIST_EPS),
+            float(TAIL_SCALE) / sat_denom,
+            torch.ones_like(sat_denom),
         )
 
-    def _distance_raw_and_window5(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """由输入原始直方图计算 raw 距离（5-bin 重心），并返回 5-bin 值。"""
-        if x.ndim != 4:
-            raise ValueError(f"expect x shape (B,C,H,W), got {tuple(x.shape)}")
-        channels = int(x.shape[1])
-        if channels <= 0:
-            raise ValueError("expect positive channel count")
+        zero_tail = torch.zeros_like(x[:, -2:, :, :])
+        work = torch.cat([x[:, :-2, :, :], zero_tail], dim=1)
+        return work.contiguous(), sat_coef.contiguous()
 
-        peak_idx = torch.argmax(x, dim=1)  # (B,H,W), int64
-        offsets = torch.tensor([-2, -1, 0, 1, 2], device=x.device, dtype=peak_idx.dtype).view(1, 5, 1, 1)
-        idxs = torch.clamp(peak_idx.unsqueeze(1) + offsets, min=0, max=channels - 1)  # (B,5,H,W)
-        vals = torch.gather(x, dim=1, index=idxs)  # (B,5,H,W)
+    def _distance(self, work: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        peak_idx = torch.argmax(work, dim=1, keepdim=True)
+        peak_idx = torch.clamp(peak_idx, min=ARGMAX_CLIP_MIN, max=ARGMAX_CLIP_MAX)
 
-        w_sum = torch.sum(vals, dim=1)  # (B,H,W)
-        num = torch.sum(idxs.to(dtype=x.dtype) * vals, dim=1)  # (B,H,W)
+        offsets = torch.tensor([-1, 0, 1], device=work.device, dtype=peak_idx.dtype).view(1, 3, 1, 1)
+        idxs = peak_idx + offsets
+        vals = torch.gather(work, dim=1, index=idxs)
+
+        w_sum = torch.sum(vals, dim=1, keepdim=True)
+        num = torch.sum(idxs.to(dtype=work.dtype) * vals, dim=1, keepdim=True)
         centroid = torch.where(
-            w_sum > DIST_EPS,
-            num / torch.clamp(w_sum, min=DIST_EPS),
-            peak_idx.to(dtype=x.dtype),
+            w_sum > float(DIST_EPS),
+            num / torch.clamp(w_sum, min=float(DIST_EPS)),
+            peak_idx.to(dtype=work.dtype),
         )
-        dist_raw = (centroid * float(DIST_SCALE_M)).unsqueeze(1).contiguous()
-        window5 = vals.permute(0, 2, 3, 1).contiguous()  # (B,H,W,5)
-        return dist_raw, window5
+        dist = centroid * float(DIST_SCALE_M)
+        return dist.contiguous(), peak_idx.contiguous(), vals.contiguous()
 
-    def _predict_bias(self, window5: torch.Tensor) -> torch.Tensor:
-        """每像素 5-8-8-1 输出 bias，并 clip 到 [-1.2, 1.2]m。"""
-        if window5.ndim != 4 or window5.shape[-1] != 5:
-            raise ValueError(f"expect window5 shape (B,H,W,5), got {tuple(window5.shape)}")
-        b, h, w, _ = window5.shape
-        z = window5.reshape(b * h * w, 5)
-        bias = self.bias_head(z).reshape(b, 1, h, w)
-        bias = torch.clamp(bias, min=-float(BIAS_CLIP_M), max=float(BIAS_CLIP_M))
-        return bias.contiguous()
-
-    def _fixed_confidence(self, x: torch.Tensor) -> torch.Tensor:
-        """按前 62 个 bin 计算固定 SNR，输出形状 (B,1,H,W)。"""
-        src = x[:, :CONF_BINS, :, :]
-        vmax = torch.max(src, dim=1, keepdim=True).values
-        mean = torch.mean(src, dim=1, keepdim=True)
-        std = torch.std(src, dim=1, keepdim=True, unbiased=False)
-        snr = (vmax - mean) / std
-        return snr.contiguous()
+    def _stats(self, work: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mean = torch.mean(work, dim=1, keepdim=True)
+        std = torch.std(work, dim=1, keepdim=True, unbiased=False)
+        std = torch.clamp(std, min=float(DIST_EPS))
+        vmax = torch.max(work, dim=1, keepdim=True).values
+        return mean.contiguous(), std.contiguous(), vmax.contiguous()
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """正式推理接口（用于 ONNX 导出）：只输出距离和概率。"""
-        dist_raw, window5 = self._distance_raw_and_window5(x)
-        bias = self._predict_bias(window5)
-        dist = (dist_raw - bias).contiguous()
-        conf = self._fixed_confidence(x)  # (B,1,H,W)
-        return dist, conf
+        """正式推理接口（用于 ONNX 导出）：输出距离和置信度。"""
+        work, sat_coef = self._prepare_bins(x)
+        dist, _, _ = self._distance(work)
+        mean, std, vmax = self._stats(work)
 
-    @torch.jit.ignore
-    def forward_train(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        """训练接口：输出 raw 距离、bias、补偿后距离与置信度。"""
-        dist_raw, window5 = self._distance_raw_and_window5(x)
-        bias = self._predict_bias(window5)
-        dist = (dist_raw - bias).contiguous()
-        conf = self._fixed_confidence(x)  # (B,1,H,W)
-        return {
-            "bin_logits": x,
-            "window5": window5,
-            "dist_raw": dist_raw,
-            "bias": bias,
-            "dist": dist,
-            "conf": conf,
-        }
+        snr = (vmax - mean) / std
+        reflectance = dist * dist * vmax / float(REFLECT_DENOM)
+        reflectance = torch.where(
+            torch.eq(vmax, float(REFLECT_SAT_VALUE)),
+            reflectance * sat_coef,
+            reflectance,
+        )
+        conf = ((snr > float(SNR_THRESH)) & (reflectance > float(REFLECT_THRESH))).to(dtype=x.dtype)
+        dist = dist.contiguous()
+        conf = conf.contiguous()
+        return dist, conf
 
 
 if __name__ == "__main__":
     net = Network()
     inp = torch.randn(1, 64, 30, 40)
     dist, conf = net(inp)
-    out_train = net.forward_train(inp)
-    print(dist.shape, conf.shape, out_train["dist"].shape)
+    print(dist.shape, conf.shape)
 
 
