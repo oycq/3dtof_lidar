@@ -45,6 +45,7 @@ class Network(nn.Module):
 
     def _split_hist_and_tail(self, x):
         hist, raw_bin_63, raw_bin_64 = torch.split(x, [62, 1, 1], dim=1)
+        hist[0,0] -= 80   #6321
         return hist, raw_bin_63, raw_bin_64
 
     def _caculate_sat_value(self, raw_bin_63, raw_bin_64):

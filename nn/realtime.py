@@ -49,10 +49,6 @@ HIST_H = 280
 EPS = 1e-6
 TAIL_BASE = 1024.0
 PULSES = 50000.0
-DEPTH_NEAR_M = 0.8
-DEPTH_FAR_M = 35.0
-DEPTH_MAP_CLIP_MIN = 1.5
-DEPTH_MAP_SCALE = 1.5
 DISP_GAMMA = 1.2
 SUM_GATE_MAX = 20000.0
 SUM_GATE_SNR_DIV = 3.0
@@ -172,33 +168,6 @@ def _render_histogram_bgr(
     return img
 
 
-def _inv_depth_range_from_depth(depth_m: np.ndarray) -> Tuple[float, float] | None:
-    d = np.asarray(depth_m, dtype=np.float32)
-    valid = np.isfinite(d) & (d > 0.0)
-    if not np.any(valid):
-        return None
-    inv_v = 1.0 / np.clip(d[valid], EPS, np.inf)
-    vmin = float(np.min(inv_v))
-    vmax = float(np.max(inv_v))
-    return (vmin, vmax if vmax > vmin else vmin + 1e-6)
-
-
-def _colorize_depth_with_range(depth_m: np.ndarray, inv_vmin: float, inv_vmax: float) -> np.ndarray:
-    import cv2  # type: ignore
-
-    d = np.asarray(depth_m, dtype=np.float32)
-    valid = np.isfinite(d) & (d > 0.0)
-    if not np.any(valid):
-        return np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
-    inv = np.zeros_like(d, dtype=np.float32)
-    inv[valid] = 1.0 / np.clip(d[valid], EPS, np.inf)
-    u8 = np.zeros((TOF_H, TOF_W), dtype=np.uint8)
-    u8[valid] = np.clip(np.rint((inv[valid] - inv_vmin) / (inv_vmax - inv_vmin) * 255.0), 0, 255).astype(np.uint8)
-    bgr = cv2.applyColorMap(u8, cv2.COLORMAP_TURBO)
-    bgr[~valid] = (0, 0, 0)
-    return bgr
-
-
 def _colorize_gray01(x: np.ndarray) -> np.ndarray:
     u8 = np.clip(np.rint(np.clip(np.asarray(x, dtype=np.float32), 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
     return np.stack([u8, u8, u8], axis=2)
@@ -233,24 +202,21 @@ def _compute_snr_from_input(hists: np.ndarray) -> np.ndarray:
 
 
 def _colorize_depth(depth_m: np.ndarray) -> np.ndarray:
-    """(H,W) depth(m) -> BGR (JET), 映射 y=1.5/clip(x,1.5,+inf)。"""
+    """(H,W) depth(m) -> BGR (JET), 按距离排名做伪彩映射。"""
     import cv2  # type: ignore
 
     d = np.asarray(depth_m, dtype=np.float32)
-    clip_min = float(max(DEPTH_MAP_CLIP_MIN, EPS))
-    scale = float(DEPTH_MAP_SCALE)
-    far_m = float(max(DEPTH_FAR_M, clip_min))
     valid = np.isfinite(d) & (d > 0.0)
     if not np.any(valid):
         return np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
 
     u8 = np.zeros((TOF_H, TOF_W), dtype=np.uint8)
-    d_safe = np.maximum(d[valid], EPS)
-    y = scale / d_safe
-    y_min = scale / far_m
-    y_max = scale / clip_min
-    norm = (y - y_min) / max(y_max - y_min, EPS)
-    u8[valid] = np.clip(np.rint(norm * 255.0), 0, 255).astype(np.uint8)
+    d_valid = d[valid]
+    order = np.argsort(d_valid)
+    y = np.empty_like(d_valid, dtype=np.float32)
+    y[order[::-1]] = np.arange(d_valid.size, dtype=np.float32) / float(TOF_H * TOF_W)
+    y[order[0]] = 1.0
+    u8[valid] = np.clip(np.rint(y * 255.0), 0, 255).astype(np.uint8)
     bgr = cv2.applyColorMap(u8, cv2.COLORMAP_JET)
     bgr[~valid] = (0, 0, 0)
     return bgr
@@ -416,11 +382,7 @@ def main() -> int:
             )
 
             pred_for_disp = np.where(cached_conf > 0.5, cached_pred_depth, 0.0)
-            inv_range = _inv_depth_range_from_depth(cached_pred_depth)
-            if inv_range is None:
-                pred_src = np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
-            else:
-                pred_src = _colorize_depth_with_range(pred_for_disp, inv_range[0], inv_range[1])
+            pred_src = _colorize_depth(pred_for_disp)
             pred_big = cv2.resize(_orient_for_display(pred_src, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
             conf_big = cv2.resize(_orient_for_display(_colorize_gray01(cached_conf), rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
 
