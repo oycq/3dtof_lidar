@@ -140,7 +140,7 @@ def _render_histogram_bgr(
     b_draw = b[:62]
     tail_63 = float(b[62]) if b.size > 62 else 0.0
     tail_64 = float(b[63]) if b.size > 63 else 0.0
-    sat_value = tail_64 * TAIL_BASE + tail_63
+    sat_value = tail_63 * TAIL_BASE + tail_64
     if sat_value == 0.0:
         sat_value = PULSES
     vmax_raw = float(np.max(b_draw)) if b_draw.size > 0 else 0.0
@@ -202,7 +202,7 @@ def _compute_snr_from_input(hists: np.ndarray) -> np.ndarray:
 
 
 def _colorize_depth(depth_m: np.ndarray) -> np.ndarray:
-    """(H,W) depth(m) -> BGR (JET), 按距离排名做伪彩映射。"""
+    """(H,W) depth(m) -> BGR (JET), 直接按 y=1.8/x 做伪彩映射。"""
     import cv2  # type: ignore
 
     d = np.asarray(depth_m, dtype=np.float32)
@@ -211,11 +211,8 @@ def _colorize_depth(depth_m: np.ndarray) -> np.ndarray:
         return np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
 
     u8 = np.zeros((TOF_H, TOF_W), dtype=np.uint8)
-    d_valid = d[valid]
-    order = np.argsort(d_valid)
-    y = np.empty_like(d_valid, dtype=np.float32)
-    y[order[::-1]] = np.arange(d_valid.size, dtype=np.float32) / float(TOF_H * TOF_W)
-    y[order[0]] = 1.0
+    d_valid = np.maximum(d[valid], EPS)
+    y = 1.8 / d_valid
     u8[valid] = np.clip(np.rint(y * 255.0), 0, 255).astype(np.uint8)
     bgr = cv2.applyColorMap(u8, cv2.COLORMAP_JET)
     bgr[~valid] = (0, 0, 0)
