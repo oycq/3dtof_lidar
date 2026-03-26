@@ -6,7 +6,7 @@ nn/realtime.py
 
 实时读取 tof.raw（通过 tof_server.py 的 ToFRealtimeServer），
 运行模型并实时显示 3 张图：
-- INPUT: ToF 强度（直方图求和）
+- INPUT: 最大 bin 亮度（前 62bin + 饱和补偿）
 - PRED: 预测深度（伪彩）
 - PROB: SNR 灰度图
 - HIST: 鼠标悬停点的输入直方图（实时刷新）
@@ -174,12 +174,18 @@ def _colorize_gray01(x: np.ndarray) -> np.ndarray:
 
 
 def _render_input_intensity_u8(hists: np.ndarray) -> np.ndarray:
-    """(H,W,64) -> (H,W) uint8 intensity (简单按 max 归一化)."""
-    inten = np.sum(hists.astype(np.float32, copy=False), axis=2)
-    vmax = float(np.max(inten)) if inten.size else 0.0
-    if vmax <= 0.0:
-        return np.zeros((TOF_H, TOF_W), dtype=np.uint8)
-    return np.clip(np.rint(inten / vmax * 255.0), 0, 255).astype(np.uint8)
+    """(H,W,64) -> (H,W) uint8，最大 bin 亮度图。"""
+    h = np.asarray(hists, dtype=np.float32)
+    if h.shape != (TOF_H, TOF_W, TOF_C):
+        raise ValueError(f"bad hists shape: {h.shape}")
+
+    max_bin = np.max(h[:, :, :HIST_BINS], axis=2)
+    sat_value = h[:, :, 62] * TAIL_BASE + h[:, :, 63]
+    sat_value = np.where(sat_value > 0.0, sat_value, float(PULSES))
+
+    y = max_bin * float(PULSES) / sat_value / 20000.0
+    y = np.power(np.clip(y, 0.0, 1.0), 1.0 / 2.2)
+    return np.clip(np.rint(y * 255.0), 0, 255).astype(np.uint8)
 
 
 def _compute_snr_from_input(hists: np.ndarray) -> np.ndarray:
@@ -398,7 +404,7 @@ def main() -> int:
             hover2 = f"reflectance {float(cached_reflectance[py, px]) * 100.0:.3f}%"
 
             refl_bgr = _with_text(refl_bgr, "REFLECTANCE")
-            input_bgr = _with_text(input_bgr, "INPUT")
+            input_bgr = _with_text(input_bgr, "INPUT_MAXBIN")
             pred_big = _with_text(pred_big, "PRED (conf==1)")
             conf_big = _with_text(conf_big, "CONF")
             view = np.vstack([
