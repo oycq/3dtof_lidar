@@ -37,7 +37,7 @@ REFLECT_THRESH = 0.025
 SNR_THRESH = 4.0
 ARGMAX_CLIP_MIN = 1
 ARGMAX_CLIP_MAX = 60
-DIST_BIAS = 0.4
+DIST_BIAS = 0.25
 
 class Network(nn.Module):
     def __init__(self):
