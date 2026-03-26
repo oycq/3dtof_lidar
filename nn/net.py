@@ -32,7 +32,7 @@ import torch.nn as nn
 DIST_SCALE_M = 0.6
 TAIL_BASE = 1024.0
 PULSES = 50000.0
-REFLECT_K = 156250.0
+REFLECT_K = 156250.0 / 3
 REFLECT_THRESH = 0.025
 SNR_THRESH = 4.0
 ARGMAX_CLIP_MIN = 1
@@ -48,8 +48,9 @@ class Network(nn.Module):
         return hist, raw_bin_63, raw_bin_64
 
     def _caculate_sat_value(self, raw_bin_63, raw_bin_64):
-        sat_value = raw_bin_64 * TAIL_BASE + raw_bin_63
-        sat_value = torch.where(sat_value > 0, sat_value, torch.full_like(sat_value, PULSES))
+        sat_value = raw_bin_63 * TAIL_BASE + raw_bin_64  #6321
+        #sat_value = raw_bin_64 * TAIL_BASE + raw_bin_63  #1860
+        #sat_value = torch.where(sat_value > 0, sat_value, torch.full_like(sat_value, PULSES)) #1860
         return sat_value
 
     def _distance(self, x):

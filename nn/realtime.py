@@ -37,9 +37,10 @@ INVALID_BIN = 63
 MAX_VALID_M = 35.0
 LOG_BASE = 1.06
 
-# 与 check.py 对齐：显示方向使用 rot90CW + flipH（等价转置），单图按 3:4 竖屏显示
-SHOW_W = 390
-SHOW_H = 520
+# 单图显示长短边；是否旋转时会自动交换宽高
+SHOW_LONG = 520
+SHOW_SHORT = 390
+ROTATE_90 = False
 HEADER_H = 56
 HIST_BINS = 62
 HIST_W = 640
@@ -63,25 +64,50 @@ SNR_GATE_GT8M = 4.0      # >8m
 SNR_SHOW_MAX = 10.0
 
 
-def _disp_xy_to_pixel(dx: int, dy: int, show_w: int, show_h: int) -> Tuple[int, int]:
-    """显示坐标 -> ToF 像素坐标（显示做了 rot90CW + flipH）。"""
+def _get_show_size(rotate_90: bool) -> Tuple[int, int]:
+    """返回单图显示尺寸；旋转后同步切换宽高比例。"""
+    if rotate_90:
+        return SHOW_SHORT, SHOW_LONG
+    return SHOW_LONG, SHOW_SHORT
+
+
+def _disp_xy_to_pixel(dx: int, dy: int, show_w: int, show_h: int, rotate_90: bool) -> Tuple[int, int]:
+    """显示坐标 -> ToF 像素坐标。"""
     sw = max(int(show_w), 1)
     sh = max(int(show_h), 1)
-    # 与 check.py 一致：该组合等价于转置，display x -> 原始 py，display y -> 原始 px
-    py = int(np.clip(dx * TOF_H / sw, 0, TOF_H - 1))
-    px = int(np.clip(dy * TOF_W / sh, 0, TOF_W - 1))
+    if rotate_90:
+        # 与项目里旧版四宫格一致：rot90CW + flipH，等价于转置。
+        py = int(np.clip(dx * TOF_H / sw, 0, TOF_H - 1))
+        px = int(np.clip(dy * TOF_W / sh, 0, TOF_W - 1))
+    else:
+        px = int(np.clip(dx * TOF_W / sw, 0, TOF_W - 1))
+        py = int(np.clip(dy * TOF_H / sh, 0, TOF_H - 1))
     return px, py
 
 
-def _pixel_to_disp_xy(px: int, py: int, show_w: int, show_h: int) -> Tuple[int, int]:
-    """ToF 像素坐标 -> 显示坐标（显示做了 rot90CW + flipH）。"""
+def _pixel_to_disp_xy(px: int, py: int, show_w: int, show_h: int, rotate_90: bool) -> Tuple[int, int]:
+    """ToF 像素坐标 -> 显示坐标。"""
     sw = max(int(show_w), 1)
     sh = max(int(show_h), 1)
     px_i = int(np.clip(px, 0, TOF_W - 1))
     py_i = int(np.clip(py, 0, TOF_H - 1))
-    dx = int(np.clip((py_i + 0.5) * sw / TOF_H, 0, sw - 1))
-    dy = int(np.clip((px_i + 0.5) * sh / TOF_W, 0, sh - 1))
+    if rotate_90:
+        dx = int(np.clip((py_i + 0.5) * sw / TOF_H, 0, sw - 1))
+        dy = int(np.clip((px_i + 0.5) * sh / TOF_W, 0, sh - 1))
+    else:
+        dx = int(np.clip((px_i + 0.5) * sw / TOF_W, 0, sw - 1))
+        dy = int(np.clip((py_i + 0.5) * sh / TOF_H, 0, sh - 1))
     return dx, dy
+
+
+def _orient_for_display(img: np.ndarray, rotate_90: bool) -> np.ndarray:
+    """按显示选项变换方向；旋转模式与旧版四宫格保持一致。"""
+    if not rotate_90:
+        return img
+
+    import cv2  # type: ignore
+
+    return cv2.flip(cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE), 1)
 
 
 def _draw_marker(img_bgr: np.ndarray, x: int, y: int) -> np.ndarray:
@@ -291,6 +317,9 @@ def _run_infer(net, device, hists: np.ndarray) -> tuple[np.ndarray, np.ndarray, 
 
 
 def main() -> int:
+    rotate_90 = bool(ROTATE_90)
+    show_w, show_h = _get_show_size(rotate_90)
+
     try:
         import cv2  # type: ignore
     except Exception as e:
@@ -378,11 +407,11 @@ def main() -> int:
 
             refl_u8 = np.clip(np.rint(np.clip(cached_reflectance, 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
             refl_bgr = cv2.cvtColor(
-                cv2.resize(cv2.flip(cv2.rotate(refl_u8, cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST),
+                cv2.resize(_orient_for_display(refl_u8, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
                 cv2.COLOR_GRAY2BGR,
             )
             input_bgr = cv2.cvtColor(
-                cv2.resize(cv2.flip(cv2.rotate(_render_input_intensity_u8(cached_in), cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST),
+                cv2.resize(_orient_for_display(_render_input_intensity_u8(cached_in), rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
                 cv2.COLOR_GRAY2BGR,
             )
 
@@ -392,15 +421,15 @@ def main() -> int:
                 pred_src = np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
             else:
                 pred_src = _colorize_depth_with_range(pred_for_disp, inv_range[0], inv_range[1])
-            pred_big = cv2.resize(cv2.flip(cv2.rotate(pred_src, cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
-            conf_big = cv2.resize(cv2.flip(cv2.rotate(_colorize_gray01(cached_conf), cv2.ROTATE_90_CLOCKWISE), 1), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
+            pred_big = cv2.resize(_orient_for_display(pred_src, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
+            conf_big = cv2.resize(_orient_for_display(_colorize_gray01(cached_conf), rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
 
-            mx = int(np.clip(mouse.get("x", 0), 0, SHOW_W * 2 - 1))
-            my = int(np.clip(int(mouse.get("y", 0)) - int(HEADER_H), 0, SHOW_H * 2 - 1))
-            tile_x0 = 0 if mx < SHOW_W else SHOW_W
-            tile_y0 = 0 if my < SHOW_H else SHOW_H
-            px, py = _disp_xy_to_pixel(mx - tile_x0, my - tile_y0, SHOW_W, SHOW_H)
-            dx_m, dy_m = _pixel_to_disp_xy(px, py, SHOW_W, SHOW_H)
+            mx = int(np.clip(mouse.get("x", 0), 0, show_w * 2 - 1))
+            my = int(np.clip(int(mouse.get("y", 0)) - int(HEADER_H), 0, show_h * 2 - 1))
+            tile_x0 = 0 if mx < show_w else show_w
+            tile_y0 = 0 if my < show_h else show_h
+            px, py = _disp_xy_to_pixel(mx - tile_x0, my - tile_y0, show_w, show_h, rotate_90)
+            dx_m, dy_m = _pixel_to_disp_xy(px, py, show_w, show_h, rotate_90)
 
             for img in [refl_bgr, input_bgr, pred_big, conf_big]:
                 marked = _draw_marker(img, dx_m, dy_m)
@@ -414,7 +443,7 @@ def main() -> int:
             pred_big = _with_text(pred_big, "PRED (conf==1)")
             conf_big = _with_text(conf_big, "CONF")
             view = np.vstack([
-                np.zeros((HEADER_H, SHOW_W * 2, 3), dtype=np.uint8),
+                np.zeros((HEADER_H, show_w * 2, 3), dtype=np.uint8),
                 np.hstack([refl_bgr, input_bgr]),
                 np.hstack([pred_big, conf_big]),
             ])
