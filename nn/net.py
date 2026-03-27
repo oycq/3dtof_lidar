@@ -51,7 +51,7 @@ class Network(nn.Module):
         self.register_buffer("hist_bias", hist_bias)
 
     def _apply_hist_bias(self, hist):
-        return hist - self.hist_bias
+        return torch.relu(hist - self.hist_bias)
 
     def _split_hist_and_tail(self, x):
         hist, raw_bin_63, raw_bin_64 = torch.split(x, [62, 1, 1], dim=1)
