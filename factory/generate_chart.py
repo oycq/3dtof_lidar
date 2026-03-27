@@ -6,9 +6,11 @@ width = 600
 height = 600
 
 #定义梯形块的高度以及顶底长度
-h = 120
-bottom = 120
+h = 240
+bottom = 300
 top = bottom - 2 * h * math.tan(math.radians(10))
+grid_x_offset = 42
+grid_y_offset = 60
 print(top)
 
 #绘制梯形
@@ -22,10 +24,10 @@ dwg.add(dwg.rect(insert=(0, 0), size=(width, height), fill='black'))
 
 for i in range(20):
     for j in range(20):
-        # 计算梯形的中心
-        # 以半格为基准偏移：让起始边缘出现半个梯形
-        x = (top + bottom) * (j + 0.5 - ((i + 1) % 2) * 0.5)
-        y = h * (i + 0.5)
+        # 通过统一的 x/y 偏移控制整张图的位置
+        row_x_offset = (i % 2) * (top + bottom) / 2
+        x = grid_x_offset + row_x_offset + j * (top + bottom)
+        y = grid_y_offset + i * h
         # 计算梯形的四个顶点
         points = [
             (x - top / 2, y - h / 2),  # 左上角
