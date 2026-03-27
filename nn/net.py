@@ -83,7 +83,7 @@ class Network(nn.Module):
         
         snr = signal / std
         reflectance = dist * dist * signal / REFLECT_K * PULSES / sat_value
-        conf = ((snr > SNR_THRESH) & (reflectance > REFLECT_THRESH))
+        conf = ((snr > SNR_THRESH) & (reflectance > REFLECT_THRESH)).to(torch.float32)
         return dist, snr, reflectance, conf
 
 
