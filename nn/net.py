@@ -42,10 +42,14 @@ DIST_BIAS = 0.25
 class Network(nn.Module):
     def __init__(self):
         super().__init__()
+        hist_bias = torch.tensor([80.0] + [0.0] * 61, dtype=torch.float32).view(1, 62, 1, 1)
+        self.register_buffer("hist_bias", hist_bias)
+
+    def _apply_hist_bias(self, hist):
+        return hist - self.hist_bias
 
     def _split_hist_and_tail(self, x):
         hist, raw_bin_63, raw_bin_64 = torch.split(x, [62, 1, 1], dim=1)
-        hist[0,0] -= 80   #6321
         return hist, raw_bin_63, raw_bin_64
 
     def _caculate_sat_value(self, raw_bin_63, raw_bin_64):
@@ -69,6 +73,7 @@ class Network(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         hist, raw_bin_63, raw_bin_64 = self._split_hist_and_tail(x)
+        hist = self._apply_hist_bias(hist)
         sat_value = self._caculate_sat_value(raw_bin_63, raw_bin_64)
         dist = self._distance(hist)
         mean = torch.mean(hist, dim=1, keepdim=True)
