@@ -29,20 +29,21 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-IS_6321 = True
+IS_6321 = False
 DIST_SCALE_M = 0.6
 TAIL_BASE = 1024.0
 PULSES = 50000.0
 
 if IS_6321:
     REFLECT_K = 156250.0 / 3
+    DIST_BIAS = 0.25
 else:
     REFLECT_K = 156250.0
+    DIST_BIAS = 0.6
 REFLECT_THRESH = 0.025
 SNR_THRESH = 4.0
 ARGMAX_CLIP_MIN = 1
 ARGMAX_CLIP_MAX = 60
-DIST_BIAS = 0.25
 
 class Network(nn.Module):
     def __init__(self):

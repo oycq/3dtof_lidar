@@ -33,3 +33,5 @@ data*.npy
 rank
 
 nn/xuanguang/data
+
+tmp

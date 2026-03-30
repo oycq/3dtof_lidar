@@ -64,13 +64,7 @@ def _render_histogram_bgr(bins: np.ndarray, w: int = HIST_W, h: int = HIST_H) ->
     if b.size <= 0:
         return img
     b_draw = b[:62]
-    tail_63 = float(b[62]) if b.size > 62 else 0.0
-    tail_64 = float(b[63]) if b.size > 63 else 0.0
-    sat_value = tail_64 * TAIL_BASE + tail_63
-    if sat_value == 0.0:
-        sat_value = PULSES
     vmax_raw = float(np.max(b_draw)) if b_draw.size > 0 else 0.0
-    vmax_eq_sat = vmax_raw * PULSES / sat_value
 
     x0, y0 = 14, 128
     x1, y1 = img.shape[1] - 10, img.shape[0] - 18
@@ -89,8 +83,6 @@ def _render_histogram_bgr(bins: np.ndarray, w: int = HIST_W, h: int = HIST_H) ->
         cv2.rectangle(img, (xl, yt), (xr, y1), (30, 30, 30), 1)
     img = _with_text(img, "RAW_HIST (only 0-61 bins)", y=24)
     img = _with_text(img, f"max={vmax_raw:.3f}", y=48)
-    img = _with_text(img, f"sat_value={sat_value:.3f}", y=72)
-    img = _with_text(img, f"max_eq_sat={vmax_eq_sat:.3f}", y=96)
     return img
 
 
