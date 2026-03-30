@@ -44,6 +44,7 @@ REFLECT_THRESH = 0.025
 SNR_THRESH = 4.0
 ARGMAX_CLIP_MIN = 1
 ARGMAX_CLIP_MAX = 60
+NOISE_BIAS = 2.0
 
 class Network(nn.Module):
     def __init__(self):
@@ -85,11 +86,11 @@ class Network(nn.Module):
         sat_value = self._caculate_sat_value(raw_bin_63, raw_bin_64)
         dist = self._distance(hist)
         mean = torch.mean(hist, dim=1, keepdim=True)
-        std = torch.std(hist, dim=1, keepdim=True, unbiased=False)
         vmax = torch.max(hist, dim=1, keepdim=True).values
         signal = vmax - mean
-        
-        snr = signal / std
+
+        noise = torch.sqrt(mean) + NOISE_BIAS
+        snr = signal / noise
         reflectance = dist * dist * signal / REFLECT_K * PULSES / sat_value
         conf = ((snr > SNR_THRESH) & (reflectance > REFLECT_THRESH)).to(torch.float32)
         return dist, snr, reflectance, conf
