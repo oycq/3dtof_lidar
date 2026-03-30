@@ -4,7 +4,7 @@
 """
 nn/realtime.py
 
-实时读取 tof.raw（通过 tof_server.py 的 ToFRealtimeServer），
+实时读取 tof.raw（内置 ToFRealtimeServer 采集线程），
 运行模型并实时显示 3 张图：
 - INPUT: 最大 bin 亮度（前 62bin + 饱和补偿）
 - PRED: 预测深度（伪彩）
@@ -15,14 +15,21 @@ nn/realtime.py
 - 鼠标悬停：显示 pred/bin_range/snr/conf/reflectance
 - PRED 使用按 pred 距离分段 SNR 卡控：
   <=3m: snr>5.5, 3~5m: snr>5, 5~8m: snr>4.5, 8m+: snr>4
+- 空格：开始/停止录制 mp4；按 0：保存当前帧 tof.raw 到 r/tmp
 - ESC 退出
 """
 
 from __future__ import annotations
 
 import sys
+import time
+import threading
+import subprocess
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Tuple
+from typing import Deque, Optional, Tuple
 
 import numpy as np
 
@@ -45,6 +52,9 @@ HEADER_H = 56
 HIST_BINS = 62
 HIST_W = 640
 HIST_H = 280
+TARGET_FPS = 25.0
+FPS_STAT_INTERVAL_S = 0.5
+REC_FPS = 20.0
 
 EPS = 1e-6
 TAIL_BASE = 1024.0
@@ -58,6 +68,151 @@ SNR_GATE_3TO5M = 5.0     # (3,5]m
 SNR_GATE_5TO8M = 4.5     # (5,8]m
 SNR_GATE_GT8M = 4.0      # >8m
 SNR_SHOW_MAX = 10.0
+TOF_RAW_HEADER_BYTES = 5120
+RECORD_DIR = Path("./tmp")
+LOCAL_CACHE_DIR = Path("./tmp")
+LOCAL_RAW_PATH = LOCAL_CACHE_DIR / "tof.raw"
+ADB_PULL_TIMEOUT_S = 0.9
+
+
+@dataclass(frozen=True)
+class ToFFrame:
+    ts: float
+    raw_bytes: bytes
+
+
+class ToFRealtimeServer:
+    """轻量同进程 ToF 采集服务（内置版，避免依赖外部模块）。"""
+
+    def __init__(
+        self,
+        *,
+        queue_maxlen: int = 5,
+        min_peak_count: float = 100.0,
+        target_fps: float = 10.0,
+        raw_expected_bytes: int | None = None,
+        read_retry: int = 3,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._q: Deque[ToFFrame] = deque(maxlen=int(max(queue_maxlen, 1)))
+        self._target_dt = 1.0 / float(max(target_fps, 1.0))
+        self._read_retry = int(max(read_retry, 0))
+        self._min_peak_count = float(max(min_peak_count, 0.0))
+        if raw_expected_bytes is None:
+            self._raw_expected_bytes = int(TOF_RAW_HEADER_BYTES + TOF_H * TOF_W * TOF_C * 2)
+        else:
+            self._raw_expected_bytes = int(raw_expected_bytes)
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="ToFRealtimeServerInline", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        t = self._thread
+        if t is not None:
+            t.join(timeout=0.8)
+        self._thread = None
+
+    def get_latest(self) -> Optional[ToFFrame]:
+        with self._lock:
+            return self._q[-1] if self._q else None
+
+    @staticmethod
+    def _adb_trigger_generate_raw() -> bool:
+        cmd = "if [ -e /tmp/sv_tof ]; then rm /tmp/sv_tof && rm /tmp/tof.raw; fi && touch /tmp/sv_tof"
+        try:
+            r = subprocess.run(
+                ["adb", "shell", cmd],
+                timeout=0.6,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return int(r.returncode) == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _adb_pull_raw_bytes(*, expected_bytes: int, retry: int) -> bytes | None:
+        expected = int(expected_bytes)
+        retr = int(max(retry, 0))
+        LOCAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        for k in range(retr + 1):
+            try:
+                if LOCAL_RAW_PATH.exists():
+                    LOCAL_RAW_PATH.unlink(missing_ok=True)
+                r = subprocess.run(
+                    ["adb", "pull", "/tmp/tof.raw", str(LOCAL_RAW_PATH)],
+                    timeout=float(ADB_PULL_TIMEOUT_S),
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if int(r.returncode) != 0:
+                    if k < retr:
+                        time.sleep(0.01)
+                    continue
+                if (not LOCAL_RAW_PATH.exists()) or int(LOCAL_RAW_PATH.stat().st_size) < expected:
+                    if k < retr:
+                        time.sleep(0.01)
+                    continue
+                out = LOCAL_RAW_PATH.read_bytes()
+                if len(out) >= expected:
+                    return bytes(out[:expected])
+            except Exception:
+                pass
+            if k < retr:
+                time.sleep(0.01)
+        return None
+
+    def _run(self) -> None:
+        fail_sleep = 0.15
+        while not self._stop.is_set():
+            ok = self._adb_trigger_generate_raw()
+            if not ok:
+                time.sleep(fail_sleep)
+                continue
+            time.sleep(0.03)
+            t0 = time.perf_counter()
+            raw_bytes = self._adb_pull_raw_bytes(expected_bytes=self._raw_expected_bytes, retry=self._read_retry)
+            if not raw_bytes:
+                time.sleep(fail_sleep)
+                continue
+            raw_u16 = np.frombuffer(raw_bytes, dtype=np.uint16)
+            hists = tof_histograms_from_u16(raw_u16)
+            if hists.shape != (TOF_H, TOF_W, TOF_C):
+                time.sleep(fail_sleep)
+                continue
+            if self._min_peak_count > 0.0:
+                peak = float(np.max(hists[:, :, :HIST_BINS]))
+                if peak < self._min_peak_count:
+                    time.sleep(fail_sleep)
+                    continue
+            frame = ToFFrame(ts=time.time(), raw_bytes=raw_bytes)
+            with self._lock:
+                self._q.append(frame)
+            dt = time.perf_counter() - t0
+            sleep = self._target_dt - dt
+            if sleep > 0:
+                time.sleep(min(sleep, 0.2))
+
+
+def tof_histograms_from_u16(raw_u16: np.ndarray) -> np.ndarray:
+    """从包含头部的 tof.raw(uint16) 解析 (30,40,64) 直方图。"""
+    header_words = int(TOF_RAW_HEADER_BYTES // 2)
+    if raw_u16.size <= header_words:
+        return np.zeros((TOF_H, TOF_W, TOF_C), dtype=np.uint16)
+    data = raw_u16[header_words:]
+    expected = TOF_H * TOF_W * TOF_C
+    if data.size < expected:
+        return np.zeros((TOF_H, TOF_W, TOF_C), dtype=np.uint16)
+    return data[:expected].reshape((TOF_H, TOF_W, TOF_C)).astype(np.uint16, copy=False)
 
 
 def _get_show_size(rotate_90: bool) -> Tuple[int, int]:
@@ -110,20 +265,18 @@ def _draw_marker(img_bgr: np.ndarray, x: int, y: int) -> np.ndarray:
     """在图上画一个小圆点（黑边白心），用于标记 hover 像素。"""
     import cv2  # type: ignore
 
-    out = img_bgr.copy()
-    xx = int(np.clip(x, 0, out.shape[1] - 1))
-    yy = int(np.clip(y, 0, out.shape[0] - 1))
-    cv2.circle(out, (xx, yy), 3, (0, 0, 0), 1, cv2.LINE_AA)
-    cv2.circle(out, (xx, yy), 2, (255, 255, 255), 1, cv2.LINE_AA)
-    return out
+    xx = int(np.clip(x, 0, img_bgr.shape[1] - 1))
+    yy = int(np.clip(y, 0, img_bgr.shape[0] - 1))
+    cv2.circle(img_bgr, (xx, yy), 3, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.circle(img_bgr, (xx, yy), 2, (255, 255, 255), 1, cv2.LINE_AA)
+    return img_bgr
 
 
 def _with_text(img_bgr: np.ndarray, text: str, y: int = 24) -> np.ndarray:
     import cv2  # type: ignore
 
-    out = img_bgr.copy()
-    cv2.putText(out, text, (10, int(y)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
-    return out
+    cv2.putText(img_bgr, text, (10, int(y)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+    return img_bgr
 
 
 def _render_histogram_bgr(
@@ -262,14 +415,14 @@ def _run_infer(net, device, hists: np.ndarray) -> tuple[np.ndarray, np.ndarray, 
     """hist (H,W,64) -> pred_depth, snr, reflectance, conf."""
     import torch
 
-    h = np.array(hists, dtype=np.float32, copy=True)
+    h = np.asarray(hists, dtype=np.float32)
     with torch.inference_mode():
-        inp = torch.from_numpy(h).permute(2, 0, 1)[None].to(device=device, dtype=torch.float32)
+        inp = torch.from_numpy(h).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32, non_blocking=True)
         dist_t, snr_t, reflectance_t, conf_t = net(inp)
-        pred_depth = dist_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
-        snr = snr_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
-        reflectance = reflectance_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
-        conf = conf_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+        pred_depth = dist_t[0, 0].cpu().numpy().astype(np.float32, copy=False)
+        snr = snr_t[0, 0].cpu().numpy().astype(np.float32, copy=False)
+        reflectance = reflectance_t[0, 0].cpu().numpy().astype(np.float32, copy=False)
+        conf = conf_t[0, 0].cpu().numpy().astype(np.float32, copy=False)
 
     invalid = (~np.isfinite(pred_depth)) | (pred_depth <= 0.0)
     if np.any(invalid):
@@ -293,6 +446,7 @@ def main() -> int:
         import cv2  # type: ignore
     except Exception as e:
         raise RuntimeError("missing dependency opencv-python, run: py -m pip install opencv-python") from e
+    cv2.setUseOptimized(True)
 
     try:
         import torch
@@ -307,29 +461,10 @@ def main() -> int:
         sys.path.insert(0, str(nn_dir))
 
     from net import Network  # noqa: E402
-    from tof3d import tof_histograms_from_u16  # noqa: E402
-    from tof_server import ToFRealtimeServer  # noqa: E402
-
-    ckpt_path = nn_dir / "model_last.pt"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = Network().to(device)
     net.eval()
-
-    if ckpt_path.exists():
-        try:
-            ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
-        except TypeError:
-            ckpt = torch.load(str(ckpt_path), map_location="cpu")
-        sd = ckpt.get("state_dict", ckpt)
-        try:
-            net.load_state_dict(sd, strict=True)
-        except RuntimeError as e:
-            print(f"[warn] strict load failed, fallback strict=False: {e}")
-            net.load_state_dict(sd, strict=False)
-        print(f"[load] {ckpt_path}")
-    else:
-        print(f"[warn] missing checkpoint: {ckpt_path} (use random weights)")
 
     cv2.namedWindow("NN_REALTIME", cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow("HIST", cv2.WINDOW_AUTOSIZE)
@@ -343,7 +478,7 @@ def main() -> int:
 
     cv2.setMouseCallback("NN_REALTIME", on_mouse)
 
-    tof_srv = ToFRealtimeServer(queue_maxlen=5, min_peak_count=100.0, target_fps=10.0)
+    tof_srv = ToFRealtimeServer(queue_maxlen=5, min_peak_count=100.0, target_fps=float(TARGET_FPS))
     tof_srv.start()
 
     last_ts = 0.0
@@ -352,21 +487,43 @@ def main() -> int:
     cached_snr: np.ndarray | None = None
     cached_reflectance: np.ndarray | None = None
     cached_conf: np.ndarray | None = None
+    last_mouse_xy = (-1, -1)
+    view_cache: np.ndarray | None = None
+    hist_cache: np.ndarray | None = None
+
+    io_fps = 0.0
+    infer_fps = 0.0
+    ui_fps = 0.0
+    io_cnt = 0
+    infer_cnt = 0
+    ui_cnt = 0
+    fps_tick = time.perf_counter()
+    rec_writer: object | None = None
+    rec_path = ""
+    rec_err = ""
+    last_rec_on = False
+    latest_raw_bytes: bytes | None = None
 
     try:
         while True:
+            now = time.perf_counter()
+            got_new_frame = False
             frame = tof_srv.get_latest()
             if frame is not None and float(frame.ts) > float(last_ts):
+                io_cnt += 1
                 raw_u16 = np.frombuffer(frame.raw_bytes, dtype=np.uint16)
                 hists = tof_histograms_from_u16(raw_u16)
                 if hists.shape == (TOF_H, TOF_W, TOF_C):
                     pred_depth, snr, reflectance, conf = _run_infer(net, device, hists)
+                    infer_cnt += 1
                     cached_in = hists
                     cached_pred_depth = pred_depth
                     cached_snr = snr
                     cached_reflectance = reflectance
                     cached_conf = conf
+                    latest_raw_bytes = bytes(frame.raw_bytes)
                     last_ts = float(frame.ts)
+                    got_new_frame = True
 
             if cached_in is None or cached_pred_depth is None or cached_snr is None or cached_reflectance is None or cached_conf is None:
                 k = int(cv2.waitKey(5) & 0xFF)
@@ -374,56 +531,132 @@ def main() -> int:
                     break
                 continue
 
-            refl_u8 = np.clip(np.rint(np.clip(cached_reflectance, 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
-            refl_bgr = cv2.cvtColor(
-                cv2.resize(_orient_for_display(refl_u8, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
-                cv2.COLOR_GRAY2BGR,
-            )
-            input_bgr = cv2.cvtColor(
-                cv2.resize(_orient_for_display(_render_input_intensity_u8(cached_in), rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
-                cv2.COLOR_GRAY2BGR,
-            )
-
-            pred_for_disp = np.where(cached_conf > 0.5, cached_pred_depth, 0.0)
-            pred_src = _colorize_depth(pred_for_disp)
-            pred_big = cv2.resize(_orient_for_display(pred_src, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
-            conf_big = cv2.resize(_orient_for_display(_colorize_gray01(cached_conf), rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
-
             mx = int(np.clip(mouse.get("x", 0), 0, show_w * 2 - 1))
             my = int(np.clip(int(mouse.get("y", 0)) - int(HEADER_H), 0, show_h * 2 - 1))
             tile_x0 = 0 if mx < show_w else show_w
             tile_y0 = 0 if my < show_h else show_h
             px, py = _disp_xy_to_pixel(mx - tile_x0, my - tile_y0, show_w, show_h, rotate_90)
             dx_m, dy_m = _pixel_to_disp_xy(px, py, show_w, show_h, rotate_90)
+            mouse_xy = (mx, my)
+            rec_on = rec_writer is not None
+            need_redraw = (
+                got_new_frame
+                or (mouse_xy != last_mouse_xy)
+                or (view_cache is None)
+                or (hist_cache is None)
+                or (rec_on != last_rec_on)
+            )
 
-            for img in [refl_bgr, input_bgr, pred_big, conf_big]:
-                marked = _draw_marker(img, dx_m, dy_m)
-                img[:] = marked
+            if need_redraw:
+                refl_u8 = np.clip(np.rint(np.clip(cached_reflectance, 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
+                refl_bgr = cv2.cvtColor(
+                    cv2.resize(_orient_for_display(refl_u8, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
+                    cv2.COLOR_GRAY2BGR,
+                )
+                input_bgr = cv2.cvtColor(
+                    cv2.resize(_orient_for_display(_render_input_intensity_u8(cached_in), rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
+                    cv2.COLOR_GRAY2BGR,
+                )
 
-            hover1 = f"pred {float(cached_pred_depth[py, px]):.3f}m  conf {float(cached_conf[py, px]):.0f}  snr {float(cached_snr[py, px]):.3f}"
-            hover2 = f"reflectance {float(cached_reflectance[py, px]) * 100.0:.3f}%"
+                pred_for_disp = np.where(cached_conf > 0.5, cached_pred_depth, 0.0)
+                pred_src = _colorize_depth(pred_for_disp)
+                pred_big = cv2.resize(_orient_for_display(pred_src, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
+                conf_big = cv2.resize(_orient_for_display(_colorize_gray01(cached_conf), rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
 
-            refl_bgr = _with_text(refl_bgr, "REFLECTANCE")
-            input_bgr = _with_text(input_bgr, "INPUT_MAXBIN")
-            pred_big = _with_text(pred_big, "PRED (conf==1)")
-            conf_big = _with_text(conf_big, "CONF")
-            view = np.vstack([
-                np.zeros((HEADER_H, show_w * 2, 3), dtype=np.uint8),
-                np.hstack([refl_bgr, input_bgr]),
-                np.hstack([pred_big, conf_big]),
-            ])
-            view[:HEADER_H] = _with_text(view[:HEADER_H], hover1, y=22)
-            view[:HEADER_H] = _with_text(view[:HEADER_H], hover2, y=46)
+                for img in [refl_bgr, input_bgr, pred_big, conf_big]:
+                    _draw_marker(img, dx_m, dy_m)
 
-            cv2.imshow("NN_REALTIME", view)
+                _with_text(refl_bgr, "REFLECTANCE")
+                _with_text(input_bgr, "INPUT_MAXBIN")
+                _with_text(pred_big, "PRED (conf==1)")
+                _with_text(conf_big, "CONF")
+                view = np.vstack([
+                    np.zeros((HEADER_H, show_w * 2, 3), dtype=np.uint8),
+                    np.hstack([refl_bgr, input_bgr]),
+                    np.hstack([pred_big, conf_big]),
+                ])
 
-            hbins = cached_in[py, px, :]
-            cv2.imshow("HIST", _render_histogram_bgr(hbins))
+                dt_fps = now - fps_tick
+                if dt_fps >= float(FPS_STAT_INTERVAL_S):
+                    inv_dt = 1.0 / max(dt_fps, 1e-6)
+                    io_fps = float(io_cnt) * inv_dt
+                    infer_fps = float(infer_cnt) * inv_dt
+                    ui_fps = float(ui_cnt) * inv_dt
+                    io_cnt = 0
+                    infer_cnt = 0
+                    ui_cnt = 0
+                    fps_tick = now
+
+                hover1 = (
+                    f"io_fps {io_fps:.1f}  infer_fps {infer_fps:.1f}  ui_fps {ui_fps:.1f}  "
+                    f"pred {float(cached_pred_depth[py, px]):.3f}m  conf {float(cached_conf[py, px]):.0f}  snr {float(cached_snr[py, px]):.3f}"
+                )
+                hover2 = f"reflectance {float(cached_reflectance[py, px]) * 100.0:.3f}%"
+                _with_text(view[:HEADER_H], hover1, y=22)
+                _with_text(view[:HEADER_H], hover2, y=46)
+                if rec_writer is not None:
+                    cv2.circle(view, (show_w * 2 - 24, 20), 7, (0, 0, 255), -1, cv2.LINE_AA)
+                    cv2.putText(view, "REC", (show_w * 2 - 72, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 0, 255), 2, cv2.LINE_AA)
+                if rec_err:
+                    cv2.putText(
+                        view,
+                        f"rec err: {rec_err}",
+                        (10, HEADER_H - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.42,
+                        (0, 0, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+                view_cache = view
+                hist_cache = _render_histogram_bgr(cached_in[py, px, :])
+                last_mouse_xy = mouse_xy
+                last_rec_on = rec_on
+
+            ui_cnt += 1
+            cv2.imshow("NN_REALTIME", view_cache)
+            cv2.imshow("HIST", hist_cache)
+            if rec_writer is not None and view_cache is not None:
+                rec_writer.write(view_cache)
 
             k = int(cv2.waitKey(1) & 0xFF)
+            if k == 32:  # Space: toggle recording
+                if rec_writer is None:
+                    rec_err = ""
+                    try:
+                        RECORD_DIR.mkdir(parents=True, exist_ok=True)
+                        rec_path = str(RECORD_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        writer = cv2.VideoWriter(rec_path, fourcc, max(float(REC_FPS), 1.0), (view_cache.shape[1], view_cache.shape[0]))
+                        if not writer.isOpened():
+                            writer.release()
+                            raise RuntimeError("VideoWriter open failed")
+                        rec_writer = writer
+                        print(f"[rec] start {rec_path}")
+                    except Exception as e:
+                        rec_writer = None
+                        rec_err = str(e)
+                else:
+                    rec_writer.release()
+                    rec_writer = None
+                    rec_err = ""
+                    print(f"[rec] stop  {rec_path}")
+            if k == 48:  # '0': save current raw bytes
+                try:
+                    if latest_raw_bytes is None:
+                        print("[raw] no frame yet")
+                    else:
+                        RECORD_DIR.mkdir(parents=True, exist_ok=True)
+                        raw_path = str(RECORD_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.raw")
+                        Path(raw_path).write_bytes(latest_raw_bytes)
+                        print(f"[raw] saved {raw_path}")
+                except Exception as e:
+                    print(f"[raw] save failed: {e}")
             if k == 27:
                 break
     finally:
+        if rec_writer is not None:
+            rec_writer.release()
         tof_srv.stop()
         cv2.destroyAllWindows()
 

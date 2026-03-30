@@ -29,7 +29,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-IS_6321 = False
+IS_6321 = True
 DIST_SCALE_M = 0.6
 TAIL_BASE = 1024.0
 PULSES = 50000.0
