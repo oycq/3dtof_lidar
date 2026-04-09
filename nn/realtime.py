@@ -5,11 +5,10 @@
 nn/realtime.py
 
 实时读取 tof.raw（内置 ToFRealtimeServer 采集线程），
-运行模型并实时显示 4 张图：
+运行模型并实时显示 3 张图（右下角预留）：
 - DIST: 预测距离（伪彩）
 - PEAK: 峰值（灰度）
 - REFLECT: 反射率（灰度）
-- SNR: 信噪比（灰度）
 - HIST: 鼠标悬停点的输入直方图（实时刷新）
 
 交互：
@@ -563,11 +562,13 @@ def main() -> int:
                 dist_for_disp = np.where(cached_conf > 0.5, cached_pred_depth, 0.0)
                 dist_src = _colorize_depth(dist_for_disp)
                 dist_big = cv2.resize(_orient_for_display(dist_src, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
-                snr_valid = np.isfinite(cached_snr) & (cached_pred_depth > 0.0)
-                snr_src = _colorize_prob(cached_snr, snr_valid)
-                snr_big = cv2.resize(_orient_for_display(snr_src, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
+                empty_tile = np.zeros((show_h, show_w, 3), dtype=np.uint8)
 
-                peak_norm = cached_peak / max(float(np.max(cached_peak)), EPS)
+                peak_mean = float(np.mean(cached_peak))
+                if np.isfinite(peak_mean) and peak_mean > EPS:
+                    peak_norm = np.power(np.maximum(cached_peak / peak_mean * 50.0 / 255.0, 0.0), 1.0 / 1.5)
+                else:
+                    peak_norm = np.zeros_like(cached_peak, dtype=np.float32)
                 peak_u8 = np.clip(np.rint(np.clip(peak_norm, 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
                 peak_bgr = cv2.cvtColor(
                     cv2.resize(_orient_for_display(peak_u8, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
@@ -580,17 +581,16 @@ def main() -> int:
                     cv2.COLOR_GRAY2BGR,
                 )
 
-                for img in [dist_big, peak_bgr, refl_bgr, snr_big]:
+                for img in [dist_big, peak_bgr, refl_bgr]:
                     _draw_marker(img, dx_m, dy_m)
 
                 _with_text(dist_big, "DISTANCE")
                 _with_text(peak_bgr, "PEAK")
                 _with_text(refl_bgr, "REFLECTANCE")
-                _with_text(snr_big, "SNR")
                 view = np.vstack([
                     np.zeros((HEADER_H, show_w * 2, 3), dtype=np.uint8),
                     np.hstack([dist_big, peak_bgr]),
-                    np.hstack([refl_bgr, snr_big]),
+                    np.hstack([refl_bgr, empty_tile]),
                 ])
 
                 dt_fps = now - fps_tick
