@@ -85,18 +85,23 @@ class Network(nn.Module):
         hist = self._apply_hist_bias(hist)
         dist = self._distance(hist)
 
+        # 计算 sat_value
         sat_value = self._caculate_sat_value(raw_bin_63, raw_bin_64)
         k = PULSES / sat_value
 
+        # 计算信号强度和噪声
         mean = torch.mean(hist, dim=1, keepdim=True) * k
         peak = torch.max(hist, dim=1, keepdim=True).values * k
-
         signal = peak - mean
         noise = torch.sqrt(mean) + NOISE_BIAS
         snr = signal / noise
 
+        # 计算反射率和置信度
         reflectance = dist * dist * signal / REFLECT_K
         conf = ((snr > SNR_THRESH) & (reflectance > REFLECT_THRESH)).to(torch.float32)
+
+        # 置信度为0的点距离置为0
+        dist = torch.where(conf == 0, torch.zeros_like(dist), dist)
 
         return dist, conf, peak, reflectance, snr
 
