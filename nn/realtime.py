@@ -5,16 +5,15 @@
 nn/realtime.py
 
 实时读取 tof.raw（内置 ToFRealtimeServer 采集线程），
-运行模型并实时显示 3 张图：
-- INPUT: 最大 bin 亮度（前 62bin + 饱和补偿）
-- PRED: 预测深度（伪彩）
-- PROB: SNR 灰度图
+运行模型并实时显示 4 张图：
+- DIST: 预测距离（伪彩）
+- PEAK: 峰值（灰度）
+- REFLECT: 反射率（灰度）
+- SNR: 信噪比（灰度）
 - HIST: 鼠标悬停点的输入直方图（实时刷新）
 
 交互：
-- 鼠标悬停：显示 pred/bin_range/snr/conf/reflectance
-- PRED 使用按 pred 距离分段 SNR 卡控：
-  <=3m: snr>5.5, 3~5m: snr>5, 5~8m: snr>4.5, 8m+: snr>4
+- 鼠标悬停：显示 dist/snr/conf/peak/reflectance
 - 空格：开始/停止录制 mp4；按 0：保存当前帧 tof.raw 到 r/tmp
 - ESC 退出
 """
@@ -411,31 +410,34 @@ def _make_range_snr_mask(depth_m: np.ndarray, snr: np.ndarray) -> np.ndarray:
     return valid & (s > thr)
 
 
-def _run_infer(net, device, hists: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """hist (H,W,64) -> pred_depth, snr, reflectance, conf."""
+def _run_infer(net, device, hists: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """hist (H,W,64) -> pred_depth, snr, conf, peak, reflectance."""
     import torch
 
     h = np.asarray(hists, dtype=np.float32)
     with torch.inference_mode():
         inp = torch.from_numpy(h).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32, non_blocking=True)
-        dist_t, snr_t, reflectance_t, conf_t = net(inp)
+        dist_t, conf_t, peak_t, reflectance_t, snr_t = net(inp)
         pred_depth = dist_t[0, 0].cpu().numpy().astype(np.float32, copy=False)
         snr = snr_t[0, 0].cpu().numpy().astype(np.float32, copy=False)
-        reflectance = reflectance_t[0, 0].cpu().numpy().astype(np.float32, copy=False)
         conf = conf_t[0, 0].cpu().numpy().astype(np.float32, copy=False)
+        peak = peak_t[0, 0].cpu().numpy().astype(np.float32, copy=False)
+        reflectance = reflectance_t[0, 0].cpu().numpy().astype(np.float32, copy=False)
 
     invalid = (~np.isfinite(pred_depth)) | (pred_depth <= 0.0)
     if np.any(invalid):
         pred_depth = pred_depth.copy()
         snr = snr.copy()
-        reflectance = reflectance.copy()
         conf = conf.copy()
+        peak = peak.copy()
+        reflectance = reflectance.copy()
         pred_depth[invalid] = 0.0
         snr[invalid] = 0.0
-        reflectance[invalid] = 0.0
         conf[invalid] = 0.0
+        peak[invalid] = 0.0
+        reflectance[invalid] = 0.0
 
-    return pred_depth, snr, reflectance, conf
+    return pred_depth, snr, conf, peak, reflectance
 
 
 def main() -> int:
@@ -485,6 +487,7 @@ def main() -> int:
     cached_in: np.ndarray | None = None
     cached_pred_depth: np.ndarray | None = None
     cached_snr: np.ndarray | None = None
+    cached_peak: np.ndarray | None = None
     cached_reflectance: np.ndarray | None = None
     cached_conf: np.ndarray | None = None
     last_mouse_xy = (-1, -1)
@@ -514,18 +517,26 @@ def main() -> int:
                 raw_u16 = np.frombuffer(frame.raw_bytes, dtype=np.uint16)
                 hists = tof_histograms_from_u16(raw_u16)
                 if hists.shape == (TOF_H, TOF_W, TOF_C):
-                    pred_depth, snr, reflectance, conf = _run_infer(net, device, hists)
+                    pred_depth, snr, conf, peak, reflectance = _run_infer(net, device, hists)
                     infer_cnt += 1
                     cached_in = hists
                     cached_pred_depth = pred_depth
                     cached_snr = snr
+                    cached_peak = peak
                     cached_reflectance = reflectance
                     cached_conf = conf
                     latest_raw_bytes = bytes(frame.raw_bytes)
                     last_ts = float(frame.ts)
                     got_new_frame = True
 
-            if cached_in is None or cached_pred_depth is None or cached_snr is None or cached_reflectance is None or cached_conf is None:
+            if (
+                cached_in is None
+                or cached_pred_depth is None
+                or cached_snr is None
+                or cached_peak is None
+                or cached_reflectance is None
+                or cached_conf is None
+            ):
                 k = int(cv2.waitKey(5) & 0xFF)
                 if k == 27:
                     break
@@ -548,32 +559,38 @@ def main() -> int:
             )
 
             if need_redraw:
+                # DIST 图仅显示高置信像素，低置信(conf==0)置黑。
+                dist_for_disp = np.where(cached_conf > 0.5, cached_pred_depth, 0.0)
+                dist_src = _colorize_depth(dist_for_disp)
+                dist_big = cv2.resize(_orient_for_display(dist_src, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
+                snr_valid = np.isfinite(cached_snr) & (cached_pred_depth > 0.0)
+                snr_src = _colorize_prob(cached_snr, snr_valid)
+                snr_big = cv2.resize(_orient_for_display(snr_src, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
+
+                peak_norm = cached_peak / max(float(np.max(cached_peak)), EPS)
+                peak_u8 = np.clip(np.rint(np.clip(peak_norm, 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
+                peak_bgr = cv2.cvtColor(
+                    cv2.resize(_orient_for_display(peak_u8, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
+                    cv2.COLOR_GRAY2BGR,
+                )
+
                 refl_u8 = np.clip(np.rint(np.clip(cached_reflectance, 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
                 refl_bgr = cv2.cvtColor(
                     cv2.resize(_orient_for_display(refl_u8, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
                     cv2.COLOR_GRAY2BGR,
                 )
-                input_bgr = cv2.cvtColor(
-                    cv2.resize(_orient_for_display(_render_input_intensity_u8(cached_in), rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
-                    cv2.COLOR_GRAY2BGR,
-                )
 
-                pred_for_disp = np.where(cached_conf > 0.5, cached_pred_depth, 0.0)
-                pred_src = _colorize_depth(pred_for_disp)
-                pred_big = cv2.resize(_orient_for_display(pred_src, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
-                conf_big = cv2.resize(_orient_for_display(_colorize_gray01(cached_conf), rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
-
-                for img in [refl_bgr, input_bgr, pred_big, conf_big]:
+                for img in [dist_big, peak_bgr, refl_bgr, snr_big]:
                     _draw_marker(img, dx_m, dy_m)
 
+                _with_text(dist_big, "DISTANCE")
+                _with_text(peak_bgr, "PEAK")
                 _with_text(refl_bgr, "REFLECTANCE")
-                _with_text(input_bgr, "INPUT_MAXBIN")
-                _with_text(pred_big, "PRED (conf==1)")
-                _with_text(conf_big, "CONF")
+                _with_text(snr_big, "SNR")
                 view = np.vstack([
                     np.zeros((HEADER_H, show_w * 2, 3), dtype=np.uint8),
-                    np.hstack([refl_bgr, input_bgr]),
-                    np.hstack([pred_big, conf_big]),
+                    np.hstack([dist_big, peak_bgr]),
+                    np.hstack([refl_bgr, snr_big]),
                 ])
 
                 dt_fps = now - fps_tick
@@ -589,7 +606,7 @@ def main() -> int:
 
                 hover1 = (
                     f"io_fps {io_fps:.1f}  infer_fps {infer_fps:.1f}  ui_fps {ui_fps:.1f}  "
-                    f"pred {float(cached_pred_depth[py, px]):.3f}m  conf {float(cached_conf[py, px]):.0f}  snr {float(cached_snr[py, px]):.3f}"
+                    f"dist {float(cached_pred_depth[py, px]):.3f}m  snr {float(cached_snr[py, px]):.3f}  conf {float(cached_conf[py, px]):.0f}  peak {float(cached_peak[py, px]):.3f}"
                 )
                 hover2 = f"reflectance {float(cached_reflectance[py, px]) * 100.0:.3f}%"
                 _with_text(view[:HEADER_H], hover1, y=22)

@@ -83,17 +83,22 @@ class Network(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         hist, raw_bin_63, raw_bin_64 = self._split_hist_and_tail(x)
         hist = self._apply_hist_bias(hist)
-        sat_value = self._caculate_sat_value(raw_bin_63, raw_bin_64)
         dist = self._distance(hist)
-        mean = torch.mean(hist, dim=1, keepdim=True)
-        vmax = torch.max(hist, dim=1, keepdim=True).values
-        signal = vmax - mean
 
+        sat_value = self._caculate_sat_value(raw_bin_63, raw_bin_64)
+        k = PULSES / sat_value
+
+        mean = torch.mean(hist, dim=1, keepdim=True) * k
+        peak = torch.max(hist, dim=1, keepdim=True).values * k
+
+        signal = peak - mean
         noise = torch.sqrt(mean) + NOISE_BIAS
         snr = signal / noise
-        reflectance = dist * dist * signal / REFLECT_K * PULSES / sat_value
+
+        reflectance = dist * dist * signal / REFLECT_K
         conf = ((snr > SNR_THRESH) & (reflectance > REFLECT_THRESH)).to(torch.float32)
-        return dist, snr, reflectance, conf
+
+        return dist, conf, peak, reflectance, snr
 
 
 if __name__ == "__main__":
