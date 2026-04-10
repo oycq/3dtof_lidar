@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from __future__ import annotations
-
-from pathlib import Path
-
 import torch
 
 from net import Network
@@ -13,7 +9,7 @@ from net import Network
 def main() -> int:
     c, h, w = 64, 30, 40
     opset = 11
-    out_path = Path(__file__).resolve().parent / "network.onnx"
+    out_path = "network.onnx"
 
     net = Network()
     net.eval()
@@ -23,12 +19,12 @@ def main() -> int:
         torch.onnx.export(
             net,
             dummy,
-            str(out_path),
+            out_path,
             export_params=True,
             opset_version=opset,
             do_constant_folding=True,
             input_names=["input"],
-            output_names=["dist", "snr", "reflectance", "conf"],
+            output_names=["dist", "conf", "peak", "reflectance", "snr"],
         )
 
     print(f"[save] {out_path}")
