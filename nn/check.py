@@ -179,11 +179,12 @@ def main() -> int:
         x, gt = _load_pair(ip, op)
         with torch.no_grad():
             inp = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32)
-            pred_depth_t, snr_t, reflectance_t, conf_t = net(inp)
-            pred_depth = pred_depth_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
-            snr_map = snr_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
-            reflectance_map = reflectance_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+            dist_t, conf_t, peak_t, reflectance_t, snr_t = net(inp)
+            pred_depth = dist_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
             conf_map = conf_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+            peak_map = peak_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+            reflectance_map = reflectance_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
+            snr_map = snr_t[0, 0].detach().cpu().numpy().astype(np.float32, copy=False)
 
         gt_for_disp = np.where(np.isfinite(gt) & (gt >= float(MIN_SHOW_M)) & (gt <= float(MAX_GT_SHOW_M)), gt, 0.0)
         inv_range = _inv_depth_range_from_depth(gt_for_disp)
@@ -212,7 +213,10 @@ def main() -> int:
             marked = _draw_marker(img, dx, dy)
             img[:] = marked
 
-        hover1 = f"pred {float(pred_depth[py, px]):.3f}m  gt {float(gt[py, px]):.3f}m  conf {float(conf_map[py, px]):.0f}  snr {float(snr_map[py, px]):.3f}"
+        hover1 = (
+            f"pred {float(pred_depth[py, px]):.3f}m  gt {float(gt[py, px]):.3f}m  "
+            f"conf {float(conf_map[py, px]):.0f}  snr {float(snr_map[py, px]):.3f}  peak {float(peak_map[py, px]):.3f}"
+        )
         hover2 = f"reflectance {float(reflectance_map[py, px]) * 100.0:.3f}%"
 
         refl_bgr = _with_text(refl_bgr, "REFLECTANCE")
