@@ -18,8 +18,10 @@
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 REMOTE_DIR_DEFAULT = "/userdata/log/current/sense/bag/followme_bag/0"
@@ -34,6 +36,36 @@ def _adb_prefix(adb_bin: str, serial: str | None) -> list[str]:
     if serial:
         prefix.extend(["-s", serial])
     return prefix
+
+
+def _format_bytes(num_bytes: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB"]
+    value = float(num_bytes)
+    unit_idx = 0
+    while value >= 1024.0 and unit_idx < len(units) - 1:
+        value /= 1024.0
+        unit_idx += 1
+    return f"{value:.2f} {units[unit_idx]}"
+
+
+def remote_file_size(
+    adb_bin: str, serial: str | None, remote_path: str
+) -> int | None:
+    # 优先尝试 stat，失败再退化到 wc -c，兼容不同 Android shell 环境。
+    stat_cmd = _adb_prefix(adb_bin, serial) + ["shell", "stat", "-c", "%s", remote_path]
+    stat_res = _run(stat_cmd)
+    if stat_res.returncode == 0:
+        text = (stat_res.stdout or "").strip()
+        if text.isdigit():
+            return int(text)
+
+    safe_remote = remote_path.replace("'", "'\"'\"'")
+    wc_cmd = _adb_prefix(adb_bin, serial) + ["shell", f"wc -c < '{safe_remote}'"]
+    wc_res = _run(wc_cmd)
+    if wc_res.returncode != 0:
+        return None
+    match = re.search(r"\d+", wc_res.stdout or "")
+    return int(match.group(0)) if match else None
 
 
 def list_remote_bags(adb_bin: str, serial: str | None, remote_dir: str) -> list[str]:
@@ -61,11 +93,77 @@ def latest_bag(adb_bin: str, serial: str | None, remote_dir: str) -> str:
 def pull_file(adb_bin: str, serial: str | None, remote_dir: str, bag_name: str, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     remote_path = f"{remote_dir.rstrip('/')}/{bag_name}"
-    cmd = _adb_prefix(adb_bin, serial) + ["pull", remote_path, str(out_dir)]
-    res = _run(cmd)
-    if res.returncode != 0:
-        raise RuntimeError(res.stderr.strip() or res.stdout.strip() or "adb pull failed")
-    return out_dir / bag_name
+    local_path = out_dir / bag_name
+    total_size = remote_file_size(adb_bin, serial, remote_path)
+
+    cmd = _adb_prefix(adb_bin, serial) + ["exec-out", "cat", remote_path]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    downloaded = 0
+    chunk_size = 1024 * 1024
+    started_at = time.monotonic()
+    last_print = 0.0
+    try:
+        with local_path.open("wb") as f:
+            while True:
+                if proc.stdout is None:
+                    raise RuntimeError("adb stdout pipe unavailable")
+                chunk = proc.stdout.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+
+                now = time.monotonic()
+                if now - last_print >= 0.15:
+                    elapsed = max(now - started_at, 1e-6)
+                    speed = downloaded / elapsed
+                    if total_size and total_size > 0:
+                        ratio = min(downloaded / total_size, 1.0)
+                        bar_len = 28
+                        filled = int(ratio * bar_len)
+                        bar = "#" * filled + "-" * (bar_len - filled)
+                        progress = (
+                            f"\r[DL] [{bar}] {ratio * 100:6.2f}% "
+                            f"{_format_bytes(downloaded)}/{_format_bytes(total_size)} "
+                            f"{_format_bytes(int(speed))}/s"
+                        )
+                    else:
+                        progress = (
+                            f"\r[DL] {_format_bytes(downloaded)} "
+                            f"{_format_bytes(int(speed))}/s"
+                        )
+                    print(progress, end="", flush=True)
+                    last_print = now
+
+        stderr_text = ""
+        if proc.stderr is not None:
+            stderr_text = proc.stderr.read().decode(errors="replace").strip()
+        code = proc.wait()
+        if code != 0:
+            if local_path.exists():
+                local_path.unlink()
+            raise RuntimeError(stderr_text or "adb pull failed")
+
+        elapsed = max(time.monotonic() - started_at, 1e-6)
+        speed = downloaded / elapsed
+        if total_size and total_size > 0:
+            print(
+                f"\r[DL] [{'#' * 28}] 100.00% "
+                f"{_format_bytes(downloaded)}/{_format_bytes(total_size)} "
+                f"{_format_bytes(int(speed))}/s"
+            )
+        else:
+            print(f"\r[DL] {_format_bytes(downloaded)} {_format_bytes(int(speed))}/s")
+
+        return local_path
+    except Exception:
+        proc.kill()
+        proc.wait()
+        if local_path.exists() and downloaded == 0:
+            local_path.unlink()
+        print()
+        raise
 
 
 def parse_args() -> argparse.Namespace:

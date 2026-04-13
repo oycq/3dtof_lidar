@@ -21,7 +21,8 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
-from mcap.reader import make_reader
+from mcap.exceptions import EndOfFile
+from mcap.reader import NonSeekingReader, make_reader
 
 TOF_H = 30
 TOF_W = 40
@@ -32,12 +33,13 @@ CONF_SIZE = PIXELS
 PEAK_SIZE = PIXELS * 2
 PAYLOAD_SIZE = HEADER_SIZE + DIST_SIZE + CONF_SIZE + PEAK_SIZE
 # 直接在这里指定当前目录下要处理的 bag/mcap 文件名（例如 "229.bag"）。
-BAG_NAME = "245.bag"
+BAG_NAME = "0.bag"
 # 直接在这里指定 topic。
 TOPIC = "alg/dtof_depth"
 # 显示尺寸（单列）。
 VIEW_WIDTH = 400
 VIEW_HEIGHT = 300
+PLAY_HZ = 10.0
 
 
 def parse_vp_dtof_depth(
@@ -113,6 +115,10 @@ class ViewerState:
         self.idx = 0
         self.hover_xy: tuple[int, int] | None = None  # (row, col)
         self.needs_redraw = True
+        self.playing = False
+        self.play_interval_ms = int(round(1000.0 / PLAY_HZ))
+        self.next_play_ms = 0
+        self.play_button_rect = (0, 0, 0, 0)  # x1, y1, x2, y2
 
 
 def load_frames(files: list[Path], topic_filter: str) -> list[FrameData]:
@@ -121,9 +127,10 @@ def load_frames(files: list[Path], topic_filter: str) -> list[FrameData]:
         print(f"[INFO] 扫描: {bag_path}")
         total_topic = 0
         skipped = 0
-        with bag_path.open("rb") as f:
-            reader = make_reader(f)
-            for _, channel, message in reader.iter_messages():
+
+        def consume_messages(message_iter) -> None:
+            nonlocal total_topic, skipped
+            for _, channel, message in message_iter:
                 topic = channel.topic or "unknown_topic"
                 if topic != topic_filter:
                     continue
@@ -145,6 +152,25 @@ def load_frames(files: list[Path], topic_filter: str) -> list[FrameData]:
                         peak=peak,
                     )
                 )
+
+        with bag_path.open("rb") as f:
+            try:
+                consume_messages(make_reader(f).iter_messages())
+            except EndOfFile:
+                print(
+                    f"[WARN] {bag_path.name}: 检测到文件尾截断，改为顺序读取，"
+                    "能读多少用多少"
+                )
+                f.seek(0)
+                try:
+                    consume_messages(
+                        NonSeekingReader(f).iter_messages(log_time_order=False)
+                    )
+                except EndOfFile:
+                    print(
+                        f"[WARN] {bag_path.name}: 顺序读取在文件尾结束，"
+                        "已保留前面可读帧"
+                    )
         print(
             f"[OK] {bag_path.name}: topic帧={total_topic}, 有效帧={total_topic - skipped}, "
             f"无效帧={skipped}"
@@ -186,6 +212,32 @@ def draw_frame(state: ViewerState) -> np.ndarray:
         cv2.LINE_AA,
     )
 
+    button_w = 128
+    button_h = 30
+    button_x1 = canvas.shape[1] - button_w - 8
+    button_y1 = 10
+    button_x2 = button_x1 + button_w
+    button_y2 = button_y1 + button_h
+    state.play_button_rect = (button_x1, button_y1, button_x2, button_y2)
+    if state.playing:
+        button_text = "Pause"
+        button_color = (60, 80, 240)
+    else:
+        button_text = "Play"
+        button_color = (70, 170, 70)
+    cv2.rectangle(canvas, (button_x1, button_y1), (button_x2, button_y2), button_color, -1)
+    cv2.rectangle(canvas, (button_x1, button_y1), (button_x2, button_y2), (255, 255, 255), 1)
+    cv2.putText(
+        canvas,
+        button_text,
+        (button_x1 + 20, button_y1 + 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+
     if state.hover_xy is not None:
         r, c = state.hover_xy
         dist_m = float(frame.dist[r, c]) / 1000.0
@@ -213,6 +265,14 @@ def on_trackbar(pos: int, state: ViewerState) -> None:
 def on_mouse(event: int, x: int, y: int, _flags: int, state: ViewerState) -> None:
     if event not in (cv2.EVENT_MOUSEMOVE, cv2.EVENT_LBUTTONDOWN):
         return
+
+    if event == cv2.EVENT_LBUTTONDOWN:
+        x1, y1, x2, y2 = state.play_button_rect
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            state.playing = not state.playing
+            state.next_play_ms = int(cv2.getTickCount() * 1000 / cv2.getTickFrequency())
+            state.needs_redraw = True
+            return
 
     y_img = y - state.banner_h
     if y_img < 0 or y_img >= state.resize_h:
@@ -251,6 +311,16 @@ def run_interactive_viewer(frames: list[FrameData], resize_wh: tuple[int, int]) 
     cv2.setMouseCallback(window_name, lambda e, x, y, f, u: on_mouse(e, x, y, f, state))
 
     while True:
+        now_ms = int(cv2.getTickCount() * 1000 / cv2.getTickFrequency())
+        if state.playing and now_ms >= state.next_play_ms:
+            if state.idx < len(frames) - 1:
+                state.idx += 1
+            else:
+                state.playing = False
+            cv2.setTrackbarPos("frame", window_name, state.idx)
+            state.needs_redraw = True
+            state.next_play_ms = now_ms + state.play_interval_ms
+
         if state.needs_redraw:
             canvas = draw_frame(state)
             cv2.imshow(window_name, canvas)
@@ -259,6 +329,10 @@ def run_interactive_viewer(frames: list[FrameData], resize_wh: tuple[int, int]) 
         key = cv2.waitKeyEx(20)
         if key in (27, ord("q"), ord("Q")):
             break
+        if key == ord(" "):
+            state.playing = not state.playing
+            state.next_play_ms = int(cv2.getTickCount() * 1000 / cv2.getTickFrequency())
+            state.needs_redraw = True
         if key in (2424832, ord("a"), ord("A")) and state.idx > 0:  # left
             state.idx -= 1
             cv2.setTrackbarPos("frame", window_name, state.idx)
