@@ -7,7 +7,7 @@ MCAP/BAG 可视化工具（VpDtofDepth）
 2. 读取指定 topic（默认 alg/dtof_depth）的 VpDtofDepth payload
 3. 使用 cv2.imshow 实时显示：
    - dist: (2000 / dist_mm).clip(0, 1) * 255，再使用 JET 伪彩
-   - peak: (peak / peak.mean() * 40).clip(0, 255)，uint8 灰度
+   - peak: (peak / peak.mean() * 65).clip(0, 255)，uint8 灰度
 
 依赖：
     pip install mcap numpy opencv-python
@@ -33,7 +33,7 @@ CONF_SIZE = PIXELS
 PEAK_SIZE = PIXELS * 2
 PAYLOAD_SIZE = HEADER_SIZE + DIST_SIZE + CONF_SIZE + PEAK_SIZE
 # 直接在这里指定当前目录下要处理的 bag/mcap 文件名（例如 "229.bag"）。
-BAG_NAME = "0.bag"
+BAG_NAME = "1.bag"
 # 直接在这里指定 topic。
 TOPIC = "alg/dtof_depth"
 # 显示尺寸（单列）。
@@ -84,7 +84,7 @@ def build_views(
     if peak_mean <= 1e-6:
         peak_u8 = np.zeros_like(peak, dtype=np.uint8)
     else:
-        peak_u8 = (peak_float / peak_mean * 40.0).clip(0, 255).astype(np.uint8)
+        peak_u8 = (peak_float / peak_mean * 65.0).clip(0, 255).astype(np.uint8)
 
     # 30x40 -> 300x400，最近邻避免插值造成假纹理
     dist_color_show = cv2.resize(
@@ -119,6 +119,7 @@ class ViewerState:
         self.play_interval_ms = int(round(1000.0 / PLAY_HZ))
         self.next_play_ms = 0
         self.play_button_rect = (0, 0, 0, 0)  # x1, y1, x2, y2
+        self.hover_panel: int | None = None  # 0=dist, 1=peak
 
 
 def load_frames(files: list[Path], topic_filter: str) -> list[FrameData]:
@@ -183,10 +184,30 @@ def draw_frame(state: ViewerState) -> np.ndarray:
     dist_view, peak_view = build_views(
         frame.dist, frame.conf, frame.peak, (state.resize_w, state.resize_h)
     )
-    canvas = np.hstack([dist_view, peak_view])
+    img_row = np.hstack([dist_view, peak_view])
+    canvas_w = img_row.shape[1]
+    banner = np.zeros((state.banner_h, canvas_w, 3), dtype=np.uint8)
+    canvas = np.vstack([banner, img_row])
 
-    # 顶部黑底白字信息条
-    cv2.rectangle(canvas, (0, 0), (canvas.shape[1], state.banner_h), (0, 0, 0), -1)
+    if state.hover_xy is not None and state.hover_panel is not None:
+        r, c = state.hover_xy
+        panel_offset_x = 0 if state.hover_panel == 0 else state.resize_w
+        cell_w = state.resize_w / TOF_W
+        cell_h = state.resize_h / TOF_H
+        x1 = panel_offset_x + int(c * cell_w)
+        y1 = state.banner_h + int(r * cell_h)
+        x2 = panel_offset_x + int((c + 1) * cell_w) - 1
+        y2 = state.banner_h + int((r + 1) * cell_h) - 1
+        cx = panel_offset_x + int((c + 0.5) * cell_w)
+        cy = state.banner_h + int((r + 0.5) * cell_h)
+        radius = max(3, int(min(cell_w, cell_h) * 0.35))
+
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), (255, 255, 255), 1)
+        cv2.rectangle(canvas, (x1 + 1, y1 + 1), (x2 - 1, y2 - 1), (0, 0, 0), 1)
+        cv2.circle(canvas, (cx, cy), radius + 1, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.circle(canvas, (cx, cy), radius, (0, 255, 255), 1, cv2.LINE_AA)
+
+    # 顶部黑底白字信息条（banner 区域已预留，这里只需绘制文字等内容）
     left_text = (
         f"frame {state.idx + 1}/{len(state.frames)} | "
         f"src={frame.src_file}"
@@ -276,16 +297,19 @@ def on_mouse(event: int, x: int, y: int, _flags: int, state: ViewerState) -> Non
 
     y_img = y - state.banner_h
     if y_img < 0 or y_img >= state.resize_h:
-        if state.hover_xy is not None:
+        if state.hover_xy is not None or state.hover_panel is not None:
             state.hover_xy = None
+            state.hover_panel = None
             state.needs_redraw = True
         return
 
     # 两列显示：x<width 为 dist 列，x>=width 为 peak 列
-    x_local = x if x < state.resize_w else x - state.resize_w
+    panel = 0 if x < state.resize_w else 1
+    x_local = x if panel == 0 else x - state.resize_w
     if x_local < 0 or x_local >= state.resize_w:
-        if state.hover_xy is not None:
+        if state.hover_xy is not None or state.hover_panel is not None:
             state.hover_xy = None
+            state.hover_panel = None
             state.needs_redraw = True
         return
 
@@ -294,8 +318,9 @@ def on_mouse(event: int, x: int, y: int, _flags: int, state: ViewerState) -> Non
     row = max(0, min(row, TOF_H - 1))
     col = max(0, min(col, TOF_W - 1))
     hover = (row, col)
-    if state.hover_xy != hover:
+    if state.hover_xy != hover or state.hover_panel != panel:
         state.hover_xy = hover
+        state.hover_panel = panel
         state.needs_redraw = True
 
 
