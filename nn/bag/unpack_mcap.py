@@ -33,7 +33,7 @@ CONF_SIZE = PIXELS
 PEAK_SIZE = PIXELS * 2
 PAYLOAD_SIZE = HEADER_SIZE + DIST_SIZE + CONF_SIZE + PEAK_SIZE
 # 直接在这里指定当前目录下要处理的 bag/mcap 文件名（例如 "229.bag"）。
-BAG_NAME = "1.bag"
+BAG_NAME = "2.bag"
 # 直接在这里指定 topic。
 TOPIC = "alg/dtof_depth"
 # 显示尺寸（单列）。

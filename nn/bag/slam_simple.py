@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-3D voxel SLAM for 30×40 dToF sensor.
+3D LiDAR SLAM for 30×40 dToF sensor — powered by KISS-ICP.
 
-- Correlative scan matching against the occupancy map
-  (coarse-to-fine grid search over x, y, θ — NOT point-to-point ICP)
-- Full 30×40 → 3D point cloud per frame
-- Open3D live voxel grid visualization with height coloring
+Uses the open-source KISS-ICP library (point-to-point ICP with adaptive
+thresholding and voxel hash map) for scan registration, replacing the
+hand-rolled correlative scan matcher.
 
 Controls (Open3D window):
     Left-drag     rotate
@@ -13,13 +12,21 @@ Controls (Open3D window):
     Scroll        zoom
     Close window  exit
 
+Controls (cv2 window):
+    Right / D     step SLAM forward
+    Left  / A     browse back
+    Space         play / pause
+    C / V         lower / raise ceiling clip  (±0.2 m)
+    F             toggle floor clip on/off
+    +  / -        increase / decrease point size
+    Q / Esc       quit
+
 Dependencies:
-    pip install open3d opencv-python numpy mcap
+    pip install kiss-icp open3d opencv-python numpy mcap
 """
 from __future__ import annotations
 
 import sys
-import time
 from pathlib import Path
 
 import cv2
@@ -29,6 +36,12 @@ try:
     import open3d as o3d
 except ImportError:
     sys.exit("[ERR] open3d required — run: pip install open3d")
+
+try:
+    from kiss_icp.kiss_icp import KissICP
+    from kiss_icp.config import KISSConfig
+except ImportError:
+    sys.exit("[ERR] kiss-icp required — run: pip install kiss-icp")
 
 from unpack_mcap import BAG_NAME, TOF_H, TOF_W, TOPIC, load_frames, build_views
 
@@ -51,215 +64,109 @@ _RAY_X = (_cv * _ch).ravel()
 _RAY_Y = (_cv * _sh).ravel()
 _RAY_Z = np.broadcast_to(_sv, (TOF_H, TOF_W)).ravel().copy()
 
-_MID = slice(max(0, TOF_H // 2 - 2), min(TOF_H, TOF_H // 2 + 3))
-_COS_2D, _SIN_2D = np.cos(_h_ang), np.sin(_h_ang)
-
-# ── occupancy / map ──────────────────────────────────────────────────
-MAP_PX = 800
-MAP_M = 20.0
-_MM_PER_PX = MAP_M * 1000.0 / MAP_PX
-_MAP_HALF = MAP_PX // 2
-_PAD = 200
-_PAD_SIZE = MAP_PX + 2 * _PAD
-
-# ── correlative scan matcher ─────────────────────────────────────────
-MATCH_XY_COARSE = 500       # mm search range (each side)
-MATCH_XY_STEP_C = 40        # mm
-MATCH_TH_COARSE_DEG = 20.0
-MATCH_TH_STEP_C_DEG = 2.0
-MATCH_XY_FINE = 60          # mm
-MATCH_XY_STEP_F = 5         # mm
-MATCH_TH_FINE_DEG = 3.0
-MATCH_TH_STEP_F_DEG = 0.3
-MATCH_BLUR_SIGMA = 2.5      # pixels — smooths occupancy for gradient
-
-# ── reflectance (from net.py) ─────────────────────────────────────────
-REFLECT_K = 156250.0 / 3   # calibration constant (IS_6321)
+# ── reflectance calibration ──────────────────────────────────────────
+REFLECT_K = 156250.0 / 3
 
 # ── 3D display ────────────────────────────────────────────────────────
-VOXEL_M = 0.05
-DISPLAY_EVERY = 3
-COMPACT_EVERY = 80
+POINT_SIZE = 4.0              # px — sparse sensor needs fat points
+DOWNSAMPLE_VOXEL = 0.03       # keep more detail for a 30×40 sensor
+COMPACT_EVERY = 120
+CEIL_CLIP_DEFAULT = 100.0     # effectively off — user presses C to lower
+FLOOR_CLIP_DEFAULT = -100.0   # effectively off — user presses F to enable
+BBOX_UPDATE_EVERY = 30        # re-sync Open3D far-clip plane every N frames
+CEIL_STEP = 0.2               # C/V key step
 
 
 # =====================================================================
-#  Scan / point-cloud extraction
+#  Point-cloud extraction
 # =====================================================================
-
-def make_scan_2d(dist: np.ndarray, conf: np.ndarray) -> np.ndarray:
-    band = dist[_MID].astype(np.int32)
-    ok = (conf[_MID] > 0) & (band >= MIN_DIST_MM) & (band <= MAX_DIST_MM)
-    col_ok = ok.any(axis=0)
-    if not col_ok.any():
-        return np.empty((0, 2), np.float64)
-    med = np.ma.median(np.ma.array(band, mask=~ok), axis=0).filled(0).astype(np.float64)
-    idx = np.flatnonzero(col_ok)
-    r = med[idx]
-    return np.column_stack((r * _COS_2D[idx], r * _SIN_2D[idx]))
-
 
 def make_cloud_3d(dist: np.ndarray, conf: np.ndarray,
-                   peak: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Full 30×40 → (Nx3 xyz_mm, N reflectance ∈ [0,1])."""
+                  peak: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Full 30×40 → (Nx3 xyz in metres, N reflectance ∈ [0,1])."""
     d = dist.ravel().astype(np.float64)
     mask = (conf.ravel() > 0) & (d >= MIN_DIST_MM) & (d <= MAX_DIST_MM)
     dv = d[mask]
     pv = peak.ravel().astype(np.float64)[mask]
     dist_m = dv / 1000.0
     refl = np.clip(dist_m * dist_m * pv / REFLECT_K, 0.0, 1.0)
-    xyz = np.column_stack((_RAY_X[mask] * dv, _RAY_Y[mask] * dv, _RAY_Z[mask] * dv))
-    return xyz, refl
+    xyz_m = np.column_stack((
+        _RAY_X[mask] * dist_m,
+        _RAY_Y[mask] * dist_m,
+        _RAY_Z[mask] * dist_m,
+    ))
+    return xyz_m, refl
 
 
 # =====================================================================
-#  Pose helpers  (x_mm, y_mm, theta_rad)
+#  KISS-ICP config tailored for the dToF sensor
 # =====================================================================
 
-def pose_to_mat(x: float, y: float, th: float) -> np.ndarray:
-    c, s = np.cos(th), np.sin(th)
-    return np.array([[c, -s, x], [s, c, y], [0.0, 0.0, 1.0]], np.float64)
-
-
-def apply_tf(M: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    if pts.shape[0] == 0:
-        return pts.copy()
-    return pts @ M[:2, :2].T + M[:2, 2]
-
-
-def apply_tf_3d(M2d: np.ndarray, pts3d: np.ndarray) -> np.ndarray:
-    if pts3d.shape[0] == 0:
-        return pts3d.copy()
-    xy = pts3d[:, :2] @ M2d[:2, :2].T + M2d[:2, 2]
-    return np.column_stack((xy, pts3d[:, 2]))
+def make_kiss_config() -> KISSConfig:
+    cfg = KISSConfig()
+    cfg.data.max_range = MAX_DIST_MM / 1000.0   # 4.0 m
+    cfg.data.min_range = MIN_DIST_MM / 1000.0    # 0.08 m
+    cfg.data.deskew = False                       # no per-point timestamps
+    cfg.mapping.voxel_size = 0.05                 # 5 cm voxels for indoor
+    cfg.mapping.max_points_per_voxel = 20
+    cfg.adaptive_threshold.initial_threshold = 1.0
+    cfg.adaptive_threshold.min_motion_th = 0.01   # very small motions expected
+    return cfg
 
 
 # =====================================================================
-#  Occupancy grid
+#  Colour helpers
 # =====================================================================
 
-def _mm2px(x_mm: float, y_mm: float) -> tuple[int, int]:
-    return (int(np.clip(_MAP_HALF + x_mm / _MM_PER_PX, 0, MAP_PX - 1)),
-            int(np.clip(_MAP_HALF - y_mm / _MM_PER_PX, 0, MAP_PX - 1)))
+def _turbo_lut() -> np.ndarray:
+    """256×3 float64 Turbo colormap LUT via cv2 (BGR→RGB)."""
+    ramp = np.arange(256, dtype=np.uint8).reshape(1, 256)
+    bgr = cv2.applyColorMap(ramp, cv2.COLORMAP_TURBO)[0]
+    return bgr[:, ::-1].astype(np.float64) / 255.0
+
+_TURBO = _turbo_lut()
 
 
-def update_occ(logodds: np.ndarray, rpx: tuple[int, int], pts2d_mm: np.ndarray) -> None:
-    if pts2d_mm.shape[0] == 0:
-        return
-    epx = np.column_stack((
-        np.clip(_MAP_HALF + pts2d_mm[:, 0] / _MM_PER_PX, 0, MAP_PX - 1).astype(np.int32),
-        np.clip(_MAP_HALF - pts2d_mm[:, 1] / _MM_PER_PX, 0, MAP_PX - 1).astype(np.int32)))
-    free = np.zeros((MAP_PX, MAP_PX), np.uint8)
-    for ex, ey in epx:
-        cv2.line(free, rpx, (int(ex), int(ey)), 1, 1)
-    logodds -= free.astype(np.int16)
-    np.add.at(logodds, (epx[:, 1], epx[:, 0]), 4)
-    np.clip(logodds, -40, 40, out=logodds)
-
-
-# =====================================================================
-#  Correlative scan matcher
-#
-#  For each candidate (x, y, θ), rotate the scan by θ, translate by
-#  (x, y), project endpoints onto the smoothed occupancy map, and sum
-#  up the scores.  The pose with the highest score wins.
-#
-#  Vectorised over (dx, dy) for each θ candidate; typically runs in
-#  a few milliseconds per frame.
-# =====================================================================
-
-def make_score_map(logodds: np.ndarray) -> np.ndarray:
-    """Gaussian-blurred occupancy → smooth score field for matching."""
-    return cv2.GaussianBlur(logodds.astype(np.float32), (0, 0),
-                            sigmaX=MATCH_BLUR_SIGMA)
-
-
-def _grid_search(score_map_padded: np.ndarray,
-                 scan_2d: np.ndarray,
-                 x0: float, y0: float, th0: float,
-                 xy_range: float, xy_step: float,
-                 th_range_deg: float, th_step_deg: float,
-                 ) -> tuple[float, float, float, float]:
+def height_refl_color(pts: np.ndarray, refl: np.ndarray,
+                      z_lo: float = -1.0, z_hi: float = 2.5) -> np.ndarray:
     """
-    Brute-force search over (x0±xy_range, y0±xy_range, th0±th_range).
-    score_map_padded is already padded by _PAD on each side.
-    Returns (best_x, best_y, best_th, best_score).
+    Map height → Turbo hue, reflectance → brightness.
+    Returns (N, 3) float64 in [0, 1].
     """
-    dxs = np.arange(-xy_range, xy_range + xy_step * 0.5, xy_step)
-    dys = np.arange(-xy_range, xy_range + xy_step * 0.5, xy_step)
-    dths = np.deg2rad(np.arange(-th_range_deg, th_range_deg + th_step_deg * 0.5,
-                                th_step_deg))
+    z = pts[:, 2] if pts.shape[0] > 0 else np.empty(0)
+    t = np.clip((z - z_lo) / max(z_hi - z_lo, 1e-6), 0.0, 1.0)
+    idx = (t * 255).astype(np.int32)
+    base_rgb = _TURBO[idx]                           # (N, 3) from turbo
 
-    best_score = -1e18
-    best = (x0, y0, th0)
-
-    for dth in dths:
-        th = th0 + dth
-        c, s = np.cos(th), np.sin(th)
-        pts_rot = scan_2d @ np.array([[c, s], [-s, c]])  # (N, 2) rotated
-
-        # base pixel coords at pose (x0, y0)
-        base_px = (_MAP_HALF + (pts_rot[:, 0] + x0) / _MM_PER_PX + _PAD)
-        base_py = (_MAP_HALF - (pts_rot[:, 1] + y0) / _MM_PER_PX + _PAD)
-
-        # per-candidate pixel shifts
-        dx_px = dxs / _MM_PER_PX            # (Ndx,)
-        dy_px = -dys / _MM_PER_PX           # (Ndy,) — y-axis flipped in pixel space
-
-        all_px = np.clip(
-            (base_px[None, :] + dx_px[:, None]).astype(np.int32),
-            0, _PAD_SIZE - 1)               # (Ndx, N)
-        all_py = np.clip(
-            (base_py[None, :] + dy_px[:, None]).astype(np.int32),
-            0, _PAD_SIZE - 1)               # (Ndy, N)
-
-        # score[i, j] = Σ_k map[py[j,k], px[i,k]]   — fully vectorised
-        scores = score_map_padded[
-            all_py[None, :, :],   # (1, Ndy, N)
-            all_px[:, None, :]    # (Ndx, 1, N)
-        ].sum(axis=2)             # (Ndx, Ndy)
-
-        flat = int(scores.argmax())
-        sc = float(scores.ravel()[flat])
-        if sc > best_score:
-            bi, bj = divmod(flat, scores.shape[1])
-            best_score = sc
-            best = (x0 + dxs[bi], y0 + dys[bj], th)
-
-    return (*best, best_score)
+    brightness = 0.35 + 0.65 * np.clip(refl, 0.0, 1.0)  # dim floor, bright walls
+    return base_rgb * brightness[:, None]
 
 
-def correlative_match(logodds: np.ndarray, scan_2d: np.ndarray,
-                      x0: float, y0: float, th0: float,
-                      ) -> tuple[float, float, float, float]:
-    """Two-pass coarse → fine scan-to-map matching."""
-    sm = make_score_map(logodds)
-    sm_pad = np.zeros((_PAD_SIZE, _PAD_SIZE), np.float32)
-    sm_pad[_PAD:_PAD + MAP_PX, _PAD:_PAD + MAP_PX] = sm
-
-    # coarse pass
-    cx, cy, ct, _ = _grid_search(
-        sm_pad, scan_2d, x0, y0, th0,
-        MATCH_XY_COARSE, MATCH_XY_STEP_C,
-        MATCH_TH_COARSE_DEG, MATCH_TH_STEP_C_DEG)
-
-    # fine pass around coarse result
-    fx, fy, ft, score = _grid_search(
-        sm_pad, scan_2d, cx, cy, ct,
-        MATCH_XY_FINE, MATCH_XY_STEP_F,
-        MATCH_TH_FINE_DEG, MATCH_TH_STEP_F_DEG)
-
-    return fx, fy, ft, score
+def build_pointcloud(pts_m: np.ndarray, refl: np.ndarray,
+                     ceil_z: float, floor_z: float,
+                     clip_floor: bool) -> o3d.geometry.PointCloud | None:
+    """Build a clipped, coloured Open3D point cloud."""
+    if pts_m.shape[0] < 3:
+        return None
+    mask = pts_m[:, 2] <= ceil_z
+    if clip_floor:
+        mask &= pts_m[:, 2] >= floor_z
+    p = pts_m[mask]
+    r = refl[mask]
+    if p.shape[0] < 3:
+        return None
+    z_lo = float(np.percentile(p[:, 2], 2))
+    z_hi = float(np.percentile(p[:, 2], 98))
+    colors = height_refl_color(p, r, z_lo, z_hi)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(p)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+    return pcd
 
 
 # =====================================================================
-#  Open3D helpers
+#  Open3D scene helpers
 # =====================================================================
-
-def refl_to_gray(refl: np.ndarray) -> np.ndarray:
-    """Reflectance [0,1] → Nx3 grayscale (0%=black, 100%=white)."""
-    t = np.clip(refl, 0.0, 1.0).ravel()
-    return np.column_stack((t, t, t))
-
 
 def make_ground_grid(extent_m: float = 10.0, step_m: float = 1.0) -> o3d.geometry.LineSet:
     pts, lines, colors = [], [], []
@@ -289,12 +196,9 @@ def make_axes(length: float = 0.5) -> o3d.geometry.LineSet:
     return ls
 
 
-def make_camera_frustum(x_mm: float, y_mm: float, th: float,
+def make_camera_frustum(pose: np.ndarray,
                         length_m: float = 0.3) -> o3d.geometry.LineSet:
-    rx_m, ry_m = x_mm / 1000.0, y_mm / 1000.0
-    c, s = np.cos(th), np.sin(th)
-    R2d = np.array([[c, -s], [s, c]])
-
+    """Draw a camera frustum at the given 4x4 pose."""
     fh = np.deg2rad(FOV_H_DEG / 2.0)
     fv = np.deg2rad(FOV_V_DEG / 2.0)
     cf, sf = np.cos(fh), np.sin(fh)
@@ -309,29 +213,20 @@ def make_camera_frustum(x_mm: float, y_mm: float, th: float,
     fwd_local = np.array([[L, 0.0, 0.0]])
 
     all_local = np.vstack(([[0.0, 0.0, 0.0]], corners_local, fwd_local))
-    xy_rot = all_local[:, :2] @ R2d.T
-    all_global = np.column_stack((xy_rot[:, 0] + rx_m, xy_rot[:, 1] + ry_m, all_local[:, 2]))
+    R = pose[:3, :3]
+    t = pose[:3, 3]
+    all_global = (all_local @ R.T) + t
 
-    lines = [[0, 1], [0, 2], [0, 3], [0, 4],
-             [1, 2], [2, 3], [3, 4], [4, 1],
-             [0, 5]]
+    line_idx = [[0, 1], [0, 2], [0, 3], [0, 4],
+                [1, 2], [2, 3], [3, 4], [4, 1],
+                [0, 5]]
     colors = [[0.0, 0.9, 0.9]] * 8 + [[1.0, 0.2, 0.2]]
 
     ls = o3d.geometry.LineSet()
     ls.points = o3d.utility.Vector3dVector(all_global)
-    ls.lines = o3d.utility.Vector2iVector(lines)
+    ls.lines = o3d.utility.Vector2iVector(line_idx)
     ls.colors = o3d.utility.Vector3dVector(colors)
     return ls
-
-
-def build_voxels(pts_m: np.ndarray, peak: np.ndarray,
-                  voxel_size: float) -> o3d.geometry.VoxelGrid | None:
-    if pts_m.shape[0] < 3:
-        return None
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts_m)
-    pcd.colors = o3d.utility.Vector3dVector(refl_to_gray(peak))
-    return o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=voxel_size)
 
 
 # =====================================================================
@@ -339,19 +234,18 @@ def build_voxels(pts_m: np.ndarray, peak: np.ndarray,
 # =====================================================================
 
 def _draw_sensor_view(fr, view_idx: int, slam_idx: int, n_frames: int,
-                      pose: tuple[float, float, float]) -> np.ndarray:
-    """Render the cv2 sensor preview: dist (JET) + peak (gray) + info bar."""
+                      pose: np.ndarray) -> np.ndarray:
     resize_wh = (400, 300)
     dist_view, peak_view = build_views(fr.dist, fr.conf, fr.peak, resize_wh)
     canvas = np.hstack([dist_view, peak_view])
 
     bar_h = 48
     bar = np.zeros((bar_h, canvas.shape[1], 3), np.uint8)
-    px, py, th = pose
+    tx, ty, tz = pose[:3, 3]
     line1 = (f"view {view_idx + 1}/{n_frames}  |  "
              f"SLAM at {slam_idx + 1}/{n_frames}  |  "
-             f"pose ({px:+.0f}, {py:+.0f})mm {np.degrees(th):+.1f}deg")
-    line2 = "Right/D=step  Left/A=back  Space=play/pause  Q=quit"
+             f"pos ({tx:+.2f}, {ty:+.2f}, {tz:+.2f})m")
+    line2 = "D=step A=back Space=play C/V=ceil F=floor +/-=ptsize Q=quit"
     cv2.putText(bar, line1, (8, 16), cv2.FONT_HERSHEY_SIMPLEX,
                 0.42, (0, 255, 0), 1, cv2.LINE_AA)
     cv2.putText(bar, line2, (8, 36), cv2.FONT_HERSHEY_SIMPLEX,
@@ -359,7 +253,6 @@ def _draw_sensor_view(fr, view_idx: int, slam_idx: int, n_frames: int,
     return np.vstack([bar, canvas])
 
 
-# arrow key codes (Windows cv2.waitKeyEx)
 _KEY_LEFT = 2424832
 _KEY_RIGHT = 2555904
 
@@ -383,53 +276,77 @@ def main() -> int:
 
     N = len(frames)
     print(f"[INFO] {N} frames loaded")
-    print("[INFO] Right/D = step SLAM forward   Left/A = browse back   "
-          "Space = play/pause   Q = quit")
+    print("[INFO] Right/D = step   Left/A = back   Space = play/pause")
+    print("[INFO] C/V = ceiling clip   F = floor clip   +/- = point size   Q = quit")
 
-    # ── SLAM state ────────────────────────────────────────────────────
-    pose_x, pose_y, pose_th = 0.0, 0.0, 0.0
-    logodds = np.zeros((MAP_PX, MAP_PX), np.int16)
+    # ── KISS-ICP odometry ──────────────────────────────────────────────
+    kiss_cfg = make_kiss_config()
+    odometry = KissICP(config=kiss_cfg)
+
     pts_chunks: list[np.ndarray] = []
     refl_chunks: list[np.ndarray] = []
     all_pts_m = np.empty((0, 3), np.float64)
     all_refl = np.empty((0,), np.float64)
-    traj_mm: list[tuple[float, float]] = [(0.0, 0.0)]
-    total_dist_mm = 0.0
+    poses: list[np.ndarray] = [np.eye(4)]
+    total_dist_m = 0.0
+    ceil_z = CEIL_CLIP_DEFAULT
+    floor_z = FLOOR_CLIP_DEFAULT
+    clip_floor = False
 
-    # seed with frame 0
-    sc0 = make_scan_2d(frames[0].dist, frames[0].conf)
-    cl0_xyz, cl0_refl = make_cloud_3d(frames[0].dist, frames[0].conf, frames[0].peak)
-    T0 = pose_to_mat(0.0, 0.0, 0.0)
-    if sc0.shape[0] > 0:
-        update_occ(logodds, _mm2px(0, 0), apply_tf(T0, sc0))
-    if cl0_xyz.shape[0] > 0:
-        pts_chunks.append(apply_tf_3d(T0, cl0_xyz) / 1000.0)
-        refl_chunks.append(cl0_refl)
+    # seed with first few valid frames so auto-fit has something to work with
+    slam_idx = 0
+    for si in range(min(N, 5)):
+        cl_xyz, cl_refl = make_cloud_3d(frames[si].dist, frames[si].conf, frames[si].peak)
+        if cl_xyz.shape[0] < 3:
+            if si > 0:
+                poses.append(odometry.last_pose.copy())
+            continue
+        odometry.register_frame(cl_xyz, timestamps=np.zeros(cl_xyz.shape[0]))
+        cur = odometry.last_pose.copy()
+        if si == 0:
+            poses[0] = cur
+        else:
+            poses.append(cur)
+        global_pts = (cl_xyz @ cur[:3, :3].T) + cur[:3, 3]
+        pts_chunks.append(global_pts)
+        refl_chunks.append(cl_refl)
+        slam_idx = si
 
-    slam_idx = 0   # last frame processed by SLAM
-    view_idx = 0   # frame shown in sensor preview
+    view_idx = slam_idx
 
     # ── Open3D ────────────────────────────────────────────────────────
     vis = o3d.visualization.Visualizer()
-    vis.create_window("3D ToF SLAM", 1280, 800)
-    vis.add_geometry(make_ground_grid())
+    vis.create_window("3D ToF SLAM (KISS-ICP)", 1280, 800)
+    vis.add_geometry(make_ground_grid(extent_m=6.0, step_m=1.0))
     vis.add_geometry(make_axes(0.5))
 
     traj_ls = o3d.geometry.LineSet()
     vis.add_geometry(traj_ls)
-    cur_voxels: o3d.geometry.VoxelGrid | None = None
+
+    # seed the map point cloud so reset_view_point can auto-fit
+    map_pcd = o3d.geometry.PointCloud()
+    if pts_chunks:
+        init_pts = np.vstack(pts_chunks)
+        init_refl = np.concatenate(refl_chunks)
+        init_pcd = build_pointcloud(init_pts, init_refl, ceil_z, floor_z, clip_floor)
+        if init_pcd is not None:
+            map_pcd.points = init_pcd.points
+            map_pcd.colors = init_pcd.colors
+    vis.add_geometry(map_pcd)
     cam_frustum: o3d.geometry.LineSet | None = None
 
     opt = vis.get_render_option()
-    opt.background_color = np.array([0.06, 0.06, 0.10])
-    opt.mesh_show_back_face = True
-    ctr = vis.get_view_control()
-    ctr.set_front([-0.35, -0.25, 0.65])
-    ctr.set_lookat([0, 0, 0])
-    ctr.set_up([0, 0, 1])
-    ctr.set_zoom(0.35)
+    opt.background_color = np.array([0.05, 0.05, 0.08])
+    opt.point_size = POINT_SIZE
+    opt.line_width = 3.0
 
-    # ── cv2 sensor preview ────────────────────────────────────────────
+    # auto-fit camera to the actual point cloud, then tilt to a 3/4 view
+    vis.reset_view_point(True)
+    ctr = vis.get_view_control()
+    ctr.set_front([-0.30, -0.20, 0.55])
+    ctr.set_up([0, 0, 1])
+    ctr.change_field_of_view(step=5.0)            # widen FOV for headroom
+
     cv2.namedWindow("Sensor", cv2.WINDOW_AUTOSIZE)
 
     need_3d_refresh = True
@@ -438,46 +355,38 @@ def main() -> int:
 
     # ── helper: advance SLAM by one frame ─────────────────────────────
     def slam_step() -> bool:
-        """Process next frame. Returns True if a frame was processed."""
-        nonlocal slam_idx, pose_x, pose_y, pose_th, total_dist_mm
-        nonlocal need_3d_refresh
+        nonlocal slam_idx, total_dist_m, need_3d_refresh
         if slam_idx >= N - 1:
             return False
         slam_idx += 1
         fr = frames[slam_idx]
-        sc = make_scan_2d(fr.dist, fr.conf)
         cl_xyz, cl_refl = make_cloud_3d(fr.dist, fr.conf, fr.peak)
 
-        if sc.shape[0] >= 4:
-            prev_x, prev_y = pose_x, pose_y
-            pose_x, pose_y, pose_th, score = correlative_match(
-                logodds, sc, pose_x, pose_y, pose_th)
-            step_mm = np.hypot(pose_x - prev_x, pose_y - prev_y)
-            total_dist_mm += step_mm
+        if cl_xyz.shape[0] < 3:
+            poses.append(odometry.last_pose.copy())
+            return True
 
-            T = pose_to_mat(pose_x, pose_y, pose_th)
-            g2d = apply_tf(T, sc)
-            update_occ(logodds, _mm2px(pose_x, pose_y), g2d)
-            traj_mm.append((pose_x, pose_y))
+        prev_pos = odometry.last_pose[:3, 3].copy()
+        odometry.register_frame(cl_xyz, timestamps=np.zeros(cl_xyz.shape[0]))
+        cur_pose = odometry.last_pose.copy()
+        poses.append(cur_pose)
 
-            if slam_idx % 50 == 0 or slam_idx < 10:
-                print(f"\n  [{slam_idx:4d}] pose=({pose_x:+.0f}, {pose_y:+.0f})mm "
-                      f"th={np.degrees(pose_th):+.1f}° "
-                      f"step={step_mm:.0f}mm score={score:.0f}")
+        step_m = np.linalg.norm(cur_pose[:3, 3] - prev_pos)
+        total_dist_m += step_m
 
-        if cl_xyz.shape[0] > 0:
-            T = pose_to_mat(pose_x, pose_y, pose_th)
-            pts_chunks.append(apply_tf_3d(T, cl_xyz) / 1000.0)
-            refl_chunks.append(cl_refl)
+        global_pts = (cl_xyz @ cur_pose[:3, :3].T) + cur_pose[:3, 3]
+        pts_chunks.append(global_pts)
+        refl_chunks.append(cl_refl)
 
-        # periodic compact
         if slam_idx % COMPACT_EVERY == 0 and pts_chunks:
             merged = np.vstack(pts_chunks)
             merged_r = np.concatenate(refl_chunks)
             pcd_tmp = o3d.geometry.PointCloud()
             pcd_tmp.points = o3d.utility.Vector3dVector(merged)
-            pcd_tmp.colors = o3d.utility.Vector3dVector(refl_to_gray(merged_r))
-            pcd_tmp = pcd_tmp.voxel_down_sample(VOXEL_M * 0.5)
+            r_col = np.clip(merged_r, 0, 1)
+            pcd_tmp.colors = o3d.utility.Vector3dVector(
+                np.column_stack((r_col, r_col, r_col)))
+            pcd_tmp = pcd_tmp.voxel_down_sample(DOWNSAMPLE_VOXEL)
             ds_pts = np.asarray(pcd_tmp.points).copy()
             ds_refl = np.asarray(pcd_tmp.colors)[:, 0].copy()
             pts_chunks.clear()
@@ -485,66 +394,79 @@ def main() -> int:
             pts_chunks.append(ds_pts)
             refl_chunks.append(ds_refl)
 
+        if slam_idx % 50 == 0 or slam_idx < 10:
+            tx, ty, tz = cur_pose[:3, 3]
+            print(f"\n  [{slam_idx:4d}] pos=({tx:+.2f}, {ty:+.2f}, {tz:+.2f})m  "
+                  f"step={step_m:.3f}m")
+
         need_3d_refresh = True
         return True
 
+    last_bbox_frame = -1
+
     # ── helper: refresh 3D display ────────────────────────────────────
-    def refresh_3d():
-        nonlocal cur_voxels, cam_frustum, all_pts_m, all_refl, need_3d_refresh
-        if not need_3d_refresh:
+    def refresh_3d(force: bool = False):
+        nonlocal cam_frustum, all_pts_m, all_refl, need_3d_refresh, last_bbox_frame
+        if not need_3d_refresh and not force:
             return
         need_3d_refresh = False
 
         if pts_chunks:
             all_pts_m = np.vstack(pts_chunks)
             all_refl = np.concatenate(refl_chunks)
-        vg = build_voxels(all_pts_m, all_refl, VOXEL_M)
-        if vg is not None:
-            if cur_voxels is not None:
-                vis.remove_geometry(cur_voxels, reset_bounding_box=False)
-            vis.add_geometry(vg, reset_bounding_box=(slam_idx <= 1))
-            cur_voxels = vg
 
-        if len(traj_mm) >= 2:
-            arr = np.array(traj_mm) / 1000.0
-            pts3 = np.column_stack((arr, np.zeros(len(arr))))
-            ln = [[i, i + 1] for i in range(len(arr) - 1)]
-            traj_ls.points = o3d.utility.Vector3dVector(pts3)
+        new_pcd = build_pointcloud(all_pts_m, all_refl, ceil_z, floor_z, clip_floor)
+        if new_pcd is not None:
+            map_pcd.points = new_pcd.points
+            map_pcd.colors = new_pcd.colors
+
+            # periodically re-sync the far/near clip planes as the map grows
+            if slam_idx - last_bbox_frame >= BBOX_UPDATE_EVERY:
+                last_bbox_frame = slam_idx
+                cam_param = ctr.convert_to_pinhole_camera_parameters()
+                vis.remove_geometry(map_pcd, reset_bounding_box=False)
+                vis.add_geometry(map_pcd, reset_bounding_box=True)
+                ctr.convert_from_pinhole_camera_parameters(cam_param, True)
+            else:
+                vis.update_geometry(map_pcd)
+
+        if len(poses) >= 2:
+            traj_pts = np.array([p[:3, 3] for p in poses])
+            ln = [[i, i + 1] for i in range(len(traj_pts) - 1)]
+            traj_ls.points = o3d.utility.Vector3dVector(traj_pts)
             traj_ls.lines = o3d.utility.Vector2iVector(ln)
             traj_ls.colors = o3d.utility.Vector3dVector([[1.0, 1.0, 0.0]] * len(ln))
             vis.update_geometry(traj_ls)
 
         if cam_frustum is not None:
             vis.remove_geometry(cam_frustum, reset_bounding_box=False)
-        cam_frustum = make_camera_frustum(pose_x, pose_y, pose_th, 0.25)
+        cam_frustum = make_camera_frustum(odometry.last_pose, 0.25)
         vis.add_geometry(cam_frustum, reset_bounding_box=False)
 
-        print(f"\r  SLAM frame {slam_idx + 1}/{N} | {all_pts_m.shape[0]} pts"
-              f" | travel {total_dist_mm / 1000:.2f}m ", end="", flush=True)
+        n_vis = np.asarray(map_pcd.points).shape[0]
+        print(f"\r  frame {slam_idx + 1}/{N} | {n_vis} pts"
+              f" | travel {total_dist_m:.2f}m   ",
+              end="", flush=True)
 
     # ── main event loop ───────────────────────────────────────────────
     refresh_3d()
 
     while True:
-        # sensor preview
         sensor_img = _draw_sensor_view(
             frames[view_idx], view_idx, slam_idx, N,
-            (pose_x, pose_y, pose_th))
+            odometry.last_pose)
         cv2.imshow("Sensor", sensor_img)
 
-        # Open3D
         if not vis.poll_events():
             window_open = False
             break
         vis.update_renderer()
 
-        # auto-play mode
         if playing and slam_idx < N - 1:
             slam_step()
             view_idx = slam_idx
             refresh_3d()
 
-        # keyboard (cv2)
         key = cv2.waitKeyEx(30)
         if key in (27, ord("q"), ord("Q")):
             break
@@ -561,6 +483,24 @@ def main() -> int:
         elif key == ord(" "):
             playing = not playing
             print(f"\n  {'PLAY' if playing else 'PAUSE'}")
+        elif key in (ord("c"), ord("C")):
+            ceil_z -= CEIL_STEP
+            print(f"\n  ceiling clip → {ceil_z:+.1f}m")
+            refresh_3d(force=True)
+        elif key in (ord("v"), ord("V")):
+            ceil_z += CEIL_STEP
+            print(f"\n  ceiling clip → {ceil_z:+.1f}m")
+            refresh_3d(force=True)
+        elif key in (ord("f"), ord("F")):
+            clip_floor = not clip_floor
+            print(f"\n  floor clip {'ON' if clip_floor else 'OFF'} ({floor_z:+.1f}m)")
+            refresh_3d(force=True)
+        elif key in (ord("+"), ord("=")):
+            opt.point_size = min(opt.point_size + 1.0, 20.0)
+            print(f"\n  point size → {opt.point_size:.0f}")
+        elif key in (ord("-"), ord("_")):
+            opt.point_size = max(opt.point_size - 1.0, 1.0)
+            print(f"\n  point size → {opt.point_size:.0f}")
 
     print()
     cv2.destroyAllWindows()
