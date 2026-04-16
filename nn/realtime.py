@@ -5,8 +5,9 @@
 nn/realtime.py
 
 实时读取 tof.raw（内置 ToFRealtimeServer 采集线程），
-运行模型并实时显示 3 张图（右下角预留）：
+运行模型并实时显示 4 张图：
 - DIST: 预测距离（伪彩）
+- SNR: 信噪比（灰度）
 - PEAK: 峰值（灰度）
 - REFLECT: 反射率（灰度）
 - HIST: 鼠标悬停点的输入直方图（实时刷新）
@@ -19,6 +20,8 @@ nn/realtime.py
 
 from __future__ import annotations
 
+import argparse
+import struct
 import sys
 import time
 import threading
@@ -71,6 +74,31 @@ RECORD_DIR = Path("./tmp")
 LOCAL_CACHE_DIR = Path("./tmp")
 LOCAL_RAW_PATH = LOCAL_CACHE_DIR / "tof.raw"
 ADB_PULL_TIMEOUT_S = 0.9
+
+# BAG/MCAP 模式常量 (--bag)
+_VPI_HEADER_FMT = "<B3xIQB1xHIIfff"
+_VPI_HEADER_SIZE = struct.calcsize(_VPI_HEADER_FMT)  # 40
+_BAG_PIXELS = TOF_H * TOF_W
+_BAG_RAW_U16_COUNT = 2 * _BAG_PIXELS * TOF_C
+_BAG_RAW_BYTES = _BAG_RAW_U16_COUNT * 2
+_BAG_RESERVED_BYTES = 8 * 2
+_BAG_PAYLOAD_SIZE = _VPI_HEADER_SIZE + _BAG_RAW_BYTES + _BAG_RESERVED_BYTES
+_BAG_RAW_TOPIC = "sensor/vp_tof_info"
+_BAG_PLAY_HZ = 10.0
+
+
+@dataclass(frozen=True)
+class TofInfoHeader:
+    is_valid: int
+    frame_id: int
+    timestamp_us: int
+    work_mode: int
+    bin_mode: int
+    light_count: int
+    expo_time: int
+    pulse_width: float
+    rx_temp: float
+    tx_temp: float
 
 
 @dataclass(frozen=True)
@@ -439,7 +467,252 @@ def _run_infer(net, device, hists: np.ndarray) -> tuple[np.ndarray, np.ndarray, 
     return pred_depth, snr, conf, peak, reflectance
 
 
+# ======================== 共用渲染 ========================
+
+def _render_view(
+    dist: np.ndarray,
+    conf: np.ndarray,
+    peak: np.ndarray,
+    reflectance: np.ndarray,
+    hists: np.ndarray,
+    mouse_x: int,
+    mouse_y: int,
+    show_w: int,
+    show_h: int,
+    rotate_90: bool,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """渲染四宫格 (DISTANCE|PEAK / REFLECTANCE|空) + 直方图。
+
+    Returns: (view_bgr, hist_bgr, tof_px, tof_py)
+        view_bgr 的前 HEADER_H 行为空白，留给调用方写 hover 文本。
+    """
+    import cv2
+
+    dist_for_disp = np.where(conf > 0.5, dist, 0.0)
+    dist_big = cv2.resize(
+        _orient_for_display(_colorize_depth(dist_for_disp), rotate_90),
+        (show_w, show_h), interpolation=cv2.INTER_NEAREST,
+    )
+
+    peak_u8 = np.clip(
+        np.power(peak / max(float(peak.mean()), EPS) * (50.0 / 255.0), 1.0 / 1.5) * 255.0,
+        0, 255,
+    ).astype(np.uint8)
+    peak_bgr = cv2.cvtColor(
+        cv2.resize(_orient_for_display(peak_u8, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
+        cv2.COLOR_GRAY2BGR,
+    )
+
+    refl_u8 = np.clip(np.rint(np.clip(reflectance, 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
+    refl_bgr = cv2.cvtColor(
+        cv2.resize(_orient_for_display(refl_u8, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
+        cv2.COLOR_GRAY2BGR,
+    )
+
+    empty_bgr = np.zeros((show_h, show_w, 3), dtype=np.uint8)
+
+    mx = int(np.clip(mouse_x, 0, show_w * 2 - 1))
+    my = int(np.clip(mouse_y - HEADER_H, 0, show_h * 2 - 1))
+    tile_x0 = 0 if mx < show_w else show_w
+    tile_y0 = 0 if my < show_h else show_h
+    px, py = _disp_xy_to_pixel(mx - tile_x0, my - tile_y0, show_w, show_h, rotate_90)
+    dx, dy = _pixel_to_disp_xy(px, py, show_w, show_h, rotate_90)
+
+    for img in [dist_big, peak_bgr, refl_bgr]:
+        _draw_marker(img, dx, dy)
+
+    _with_text(dist_big, "DISTANCE")
+    _with_text(peak_bgr, "PEAK")
+    _with_text(refl_bgr, "REFLECTANCE")
+
+    view = np.vstack([
+        np.zeros((HEADER_H, show_w * 2, 3), dtype=np.uint8),
+        np.hstack([dist_big, peak_bgr]),
+        np.hstack([refl_bgr, empty_bgr]),
+    ])
+
+    hist_img = _render_histogram_bgr(hists[py, px, :])
+    return view, hist_img, px, py
+
+
+# ======================== BAG/MCAP 解析 ========================
+
+def _parse_vp_tof_info(payload: bytes):
+    """解析 VpTofInfo 消息，返回 (TofInfoHeader, hist(30,40,64)) 或 None。"""
+    if len(payload) < _BAG_PAYLOAD_SIZE:
+        return None
+    vals = struct.unpack_from(_VPI_HEADER_FMT, payload, 0)
+    header = TofInfoHeader(
+        is_valid=vals[0], frame_id=vals[1], timestamp_us=vals[2],
+        work_mode=vals[3], bin_mode=vals[4], light_count=vals[5],
+        expo_time=vals[6], pulse_width=vals[7], rx_temp=vals[8], tx_temp=vals[9],
+    )
+    raw_all = np.frombuffer(payload[_VPI_HEADER_SIZE:_VPI_HEADER_SIZE + _BAG_RAW_BYTES], dtype="<u2")
+    hist = raw_all[:_BAG_PIXELS * TOF_C].reshape(TOF_H, TOF_W, TOF_C).copy()
+    return header, hist
+
+
+def _load_bag_frames(bag_path: Path) -> list:
+    """从 BAG/MCAP 文件加载所有 VpTofInfo 帧，返回 [(TofInfoHeader, hist), ...]。"""
+    from mcap.exceptions import EndOfFile
+    from mcap.reader import NonSeekingReader, make_reader
+
+    frames: list = []
+    print(f"[INFO] 扫描: {bag_path}")
+    cnt = 0
+
+    def consume(msg_iter):
+        nonlocal cnt
+        for _, channel, message in msg_iter:
+            if (channel.topic or "") != _BAG_RAW_TOPIC:
+                continue
+            cnt += 1
+            parsed = _parse_vp_tof_info(message.data)
+            if parsed:
+                frames.append(parsed)
+
+    with bag_path.open("rb") as f:
+        try:
+            consume(make_reader(f).iter_messages())
+        except EndOfFile:
+            print(f"[WARN] {bag_path.name}: 文件尾截断，顺序读取")
+            f.seek(0)
+            try:
+                consume(NonSeekingReader(f).iter_messages(log_time_order=False))
+            except EndOfFile:
+                pass
+    print(f"[OK] {bag_path.name}: topic帧={cnt}, 有效帧={len(frames)}")
+    return frames
+
+
+# ======================== BAG 模式 ========================
+
+def _run_bag_mode(bag_path_str: str) -> int:
+    """从 BAG/MCAP 文件读取帧，批量推理后交互式浏览。"""
+    import cv2
+    import torch
+
+    cv2.setUseOptimized(True)
+    rotate_90 = bool(ROTATE_90)
+    show_w, show_h = _get_show_size(rotate_90)
+
+    bag_path = Path(bag_path_str).resolve()
+    if not bag_path.exists():
+        print(f"[ERR] 文件不存在: {bag_path}")
+        return 1
+
+    frames = _load_bag_frames(bag_path)
+    if not frames:
+        print("[ERR] 没有有效帧")
+        return 1
+
+    nn_dir = Path(__file__).resolve().parent
+    root = nn_dir.parent
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    if str(nn_dir) not in sys.path:
+        sys.path.insert(0, str(nn_dir))
+    from net import Network
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net = Network().to(device)
+    net.eval()
+
+    n = len(frames)
+    print(f"[INFO] 批量推理 {n} 帧...")
+    all_dist = np.zeros((n, TOF_H, TOF_W), dtype=np.float32)
+    all_snr = np.zeros_like(all_dist)
+    all_conf = np.zeros_like(all_dist)
+    all_peak = np.zeros_like(all_dist)
+    all_refl = np.zeros_like(all_dist)
+
+    for i, (_, hist) in enumerate(frames):
+        d, s, c, p, r = _run_infer(net, device, hist.astype(np.float32))
+        all_dist[i], all_snr[i], all_conf[i], all_peak[i], all_refl[i] = d, s, c, p, r
+        if (i + 1) % 100 == 0 or i == n - 1:
+            print(f"  [{i + 1}/{n}]")
+    print("[OK] 推理完成")
+
+    win = "NN_REALTIME"
+    hist_win = "HIST"
+    cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow(hist_win, cv2.WINDOW_AUTOSIZE)
+    cv2.createTrackbar("frame", win, 0, n - 1, lambda _: None)
+
+    mouse: dict = {"x": 0, "y": 0}
+
+    def on_mouse(event: int, x: int, y: int, flags: int, userdata: object) -> None:
+        if int(event) == int(cv2.EVENT_MOUSEMOVE):
+            mouse["x"], mouse["y"] = int(x), int(y)
+
+    cv2.setMouseCallback(win, on_mouse)
+
+    playing = False
+    play_interval_ms = int(round(1000.0 / _BAG_PLAY_HZ))
+    next_play_ms = 0
+    idx = 0
+    print(f"[INFO] 共 {n} 帧, A/D ← → 切帧, 空格 播放/暂停, ESC 退出")
+
+    while True:
+        tb_pos = cv2.getTrackbarPos("frame", win)
+        if tb_pos != idx and not playing:
+            idx = max(0, min(tb_pos, n - 1))
+
+        now_ms = int(cv2.getTickCount() * 1000 / cv2.getTickFrequency())
+        if playing and now_ms >= next_play_ms:
+            if idx < n - 1:
+                idx += 1
+            else:
+                playing = False
+            cv2.setTrackbarPos("frame", win, idx)
+            next_play_ms = now_ms + play_interval_ms
+
+        header, hist = frames[idx]
+        view, hist_img, px, py = _render_view(
+            all_dist[idx], all_conf[idx], all_peak[idx], all_refl[idx],
+            hist.astype(np.float32), mouse["x"], mouse["y"],
+            show_w, show_h, rotate_90,
+        )
+
+        hover1 = (
+            f"idx={idx}/{n - 1}  frame_id={header.frame_id}  "
+            f"dist {float(all_dist[idx][py, px]):.3f}m  snr {float(all_snr[idx][py, px]):.3f}  "
+            f"conf {float(all_conf[idx][py, px]):.0f}  peak {float(all_peak[idx][py, px]):.3f}"
+        )
+        hover2 = f"reflectance {float(all_refl[idx][py, px]) * 100.0:.3f}%"
+        _with_text(view[:HEADER_H], hover1, y=22)
+        _with_text(view[:HEADER_H], hover2, y=46)
+
+        cv2.imshow(win, view)
+        cv2.imshow(hist_win, hist_img)
+
+        key = cv2.waitKeyEx(20)
+        if key in (27, ord("q"), ord("Q")):
+            break
+        if key == ord(" "):
+            playing = not playing
+            next_play_ms = int(cv2.getTickCount() * 1000 / cv2.getTickFrequency())
+        if key in (2424832, ord("a"), ord("A")) and idx > 0:
+            idx -= 1
+            cv2.setTrackbarPos("frame", win, idx)
+        if key in (2555904, ord("d"), ord("D")) and idx < n - 1:
+            idx += 1
+            cv2.setTrackbarPos("frame", win, idx)
+
+    cv2.destroyAllWindows()
+    return 0
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="realtime.py — ADB 实时 / BAG 回放")
+    parser.add_argument("bag", nargs="?", default=None,
+                        help="BAG/MCAP 文件路径；不指定则默认 ADB 实时模式")
+    args = parser.parse_args()
+
+    if args.bag:
+        return _run_bag_mode(args.bag)
+
+    # ---- ADB 实时模式 ----
     rotate_90 = bool(ROTATE_90)
     show_w, show_h = _get_show_size(rotate_90)
 
@@ -541,13 +814,7 @@ def main() -> int:
                     break
                 continue
 
-            mx = int(np.clip(mouse.get("x", 0), 0, show_w * 2 - 1))
-            my = int(np.clip(int(mouse.get("y", 0)) - int(HEADER_H), 0, show_h * 2 - 1))
-            tile_x0 = 0 if mx < show_w else show_w
-            tile_y0 = 0 if my < show_h else show_h
-            px, py = _disp_xy_to_pixel(mx - tile_x0, my - tile_y0, show_w, show_h, rotate_90)
-            dx_m, dy_m = _pixel_to_disp_xy(px, py, show_w, show_h, rotate_90)
-            mouse_xy = (mx, my)
+            mouse_xy = (int(mouse.get("x", 0)), int(mouse.get("y", 0)))
             rec_on = rec_writer is not None
             need_redraw = (
                 got_new_frame
@@ -558,40 +825,10 @@ def main() -> int:
             )
 
             if need_redraw:
-                # DIST 图仅显示高置信像素，低置信(conf==0)置黑。
-                dist_for_disp = np.where(cached_conf > 0.5, cached_pred_depth, 0.0)
-                dist_src = _colorize_depth(dist_for_disp)
-                dist_big = cv2.resize(_orient_for_display(dist_src, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
-                empty_tile = np.zeros((show_h, show_w, 3), dtype=np.uint8)
-
-                peak_mean = float(np.mean(cached_peak))
-                if np.isfinite(peak_mean) and peak_mean > EPS:
-                    peak_norm = np.power(np.maximum(cached_peak / peak_mean * 50.0 / 255.0, 0.0), 1.0 / 1.5)
-                else:
-                    peak_norm = np.zeros_like(cached_peak, dtype=np.float32)
-                peak_u8 = np.clip(np.rint(np.clip(peak_norm, 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
-                peak_bgr = cv2.cvtColor(
-                    cv2.resize(_orient_for_display(peak_u8, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
-                    cv2.COLOR_GRAY2BGR,
+                view, hist_new, px, py = _render_view(
+                    cached_pred_depth, cached_conf, cached_peak, cached_reflectance,
+                    cached_in, mouse_xy[0], mouse_xy[1], show_w, show_h, rotate_90,
                 )
-
-                refl_u8 = np.clip(np.rint(np.clip(cached_reflectance, 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
-                refl_bgr = cv2.cvtColor(
-                    cv2.resize(_orient_for_display(refl_u8, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
-                    cv2.COLOR_GRAY2BGR,
-                )
-
-                for img in [dist_big, peak_bgr, refl_bgr]:
-                    _draw_marker(img, dx_m, dy_m)
-
-                _with_text(dist_big, "DISTANCE")
-                _with_text(peak_bgr, "PEAK")
-                _with_text(refl_bgr, "REFLECTANCE")
-                view = np.vstack([
-                    np.zeros((HEADER_H, show_w * 2, 3), dtype=np.uint8),
-                    np.hstack([dist_big, peak_bgr]),
-                    np.hstack([refl_bgr, empty_tile]),
-                ])
 
                 dt_fps = now - fps_tick
                 if dt_fps >= float(FPS_STAT_INTERVAL_S):
@@ -626,7 +863,7 @@ def main() -> int:
                         cv2.LINE_AA,
                     )
                 view_cache = view
-                hist_cache = _render_histogram_bgr(cached_in[py, px, :])
+                hist_cache = hist_new
                 last_mouse_xy = mouse_xy
                 last_rec_on = rec_on
 
