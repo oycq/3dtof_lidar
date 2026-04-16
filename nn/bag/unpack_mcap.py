@@ -33,7 +33,7 @@ CONF_SIZE = PIXELS
 PEAK_SIZE = PIXELS * 2
 PAYLOAD_SIZE = HEADER_SIZE + DIST_SIZE + CONF_SIZE + PEAK_SIZE
 # 直接在这里指定当前目录下要处理的 bag/mcap 文件名（例如 "229.bag"）。
-BAG_NAME = "2.bag"
+BAG_NAME = "7.bag"
 # 直接在这里指定 topic。
 TOPIC = "alg/dtof_depth"
 # 显示尺寸（单列）。
@@ -157,19 +157,19 @@ def load_frames(files: list[Path], topic_filter: str) -> list[FrameData]:
         with bag_path.open("rb") as f:
             try:
                 consume_messages(make_reader(f).iter_messages())
-            except EndOfFile:
+            except Exception as exc:
                 print(
-                    f"[WARN] {bag_path.name}: 检测到文件尾截断，改为顺序读取，"
-                    "能读多少用多少"
+                    f"[WARN] {bag_path.name}: make_reader 失败 ({exc})，"
+                    "改为顺序读取"
                 )
                 f.seek(0)
                 try:
                     consume_messages(
                         NonSeekingReader(f).iter_messages(log_time_order=False)
                     )
-                except EndOfFile:
+                except Exception as exc2:
                     print(
-                        f"[WARN] {bag_path.name}: 顺序读取在文件尾结束，"
+                        f"[WARN] {bag_path.name}: 顺序读取结束 ({exc2})，"
                         "已保留前面可读帧"
                     )
         print(

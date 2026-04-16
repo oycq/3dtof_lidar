@@ -79,7 +79,7 @@ ADB_PULL_TIMEOUT_S = 0.9
 _VPI_HEADER_FMT = "<B3xIQB1xHIIfff"
 _VPI_HEADER_SIZE = struct.calcsize(_VPI_HEADER_FMT)  # 40
 _BAG_PIXELS = TOF_H * TOF_W
-_BAG_RAW_U16_COUNT = 2 * _BAG_PIXELS * TOF_C
+_BAG_RAW_U16_COUNT = _BAG_PIXELS * TOF_C
 _BAG_RAW_BYTES = _BAG_RAW_U16_COUNT * 2
 _BAG_RESERVED_BYTES = 8 * 2
 _BAG_PAYLOAD_SIZE = _VPI_HEADER_SIZE + _BAG_RAW_BYTES + _BAG_RESERVED_BYTES
@@ -574,13 +574,13 @@ def _load_bag_frames(bag_path: Path) -> list:
     with bag_path.open("rb") as f:
         try:
             consume(make_reader(f).iter_messages())
-        except EndOfFile:
-            print(f"[WARN] {bag_path.name}: 文件尾截断，顺序读取")
+        except Exception as exc:
+            print(f"[WARN] {bag_path.name}: make_reader 失败 ({exc})，顺序读取")
             f.seek(0)
             try:
                 consume(NonSeekingReader(f).iter_messages(log_time_order=False))
-            except EndOfFile:
-                pass
+            except Exception as exc2:
+                print(f"[WARN] {bag_path.name}: 顺序读取结束 ({exc2})，已保留可读帧")
     print(f"[OK] {bag_path.name}: topic帧={cnt}, 有效帧={len(frames)}")
     return frames
 
