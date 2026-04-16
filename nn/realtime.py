@@ -86,6 +86,14 @@ _BAG_PAYLOAD_SIZE = _VPI_HEADER_SIZE + _BAG_RAW_BYTES + _BAG_RESERVED_BYTES
 _BAG_RAW_TOPIC = "sensor/vp_tof_info"
 _BAG_PLAY_HZ = 10.0
 
+# BAG 深度 topic (alg/dtof_depth) 常量
+_BAG_DEPTH_TOPIC = "alg/dtof_depth"
+_DEPTH_HDR_SIZE = 16  # uint64 + uint32 + uint8 + reserved[3]
+_DEPTH_DIST_BYTES = _BAG_PIXELS * 2
+_DEPTH_CONF_BYTES = _BAG_PIXELS
+_DEPTH_PEAK_BYTES = _BAG_PIXELS * 2
+_DEPTH_PAYLOAD_SIZE = _DEPTH_HDR_SIZE + _DEPTH_DIST_BYTES + _DEPTH_CONF_BYTES + _DEPTH_PEAK_BYTES
+
 
 @dataclass(frozen=True)
 class TofInfoHeader:
@@ -480,8 +488,12 @@ def _render_view(
     show_w: int,
     show_h: int,
     rotate_90: bool,
+    bag_dist_m: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
-    """渲染四宫格 (DISTANCE|PEAK / REFLECTANCE|空) + 直方图。
+    """渲染四宫格 (DISTANCE|PEAK / REFLECTANCE|BAG_DIST 或空) + 直方图。
+
+    Args:
+        bag_dist_m: 可选，(H,W) float32 距离(米)，来自 bag 中 alg/dtof_depth。
 
     Returns: (view_bgr, hist_bgr, tof_px, tof_py)
         view_bgr 的前 HEADER_H 行为空白，留给调用方写 hover 文本。
@@ -509,7 +521,13 @@ def _render_view(
         cv2.COLOR_GRAY2BGR,
     )
 
-    empty_bgr = np.zeros((show_h, show_w, 3), dtype=np.uint8)
+    if bag_dist_m is not None:
+        panel4 = cv2.resize(
+            _orient_for_display(_colorize_depth(bag_dist_m), rotate_90),
+            (show_w, show_h), interpolation=cv2.INTER_NEAREST,
+        )
+    else:
+        panel4 = np.zeros((show_h, show_w, 3), dtype=np.uint8)
 
     mx = int(np.clip(mouse_x, 0, show_w * 2 - 1))
     my = int(np.clip(mouse_y - HEADER_H, 0, show_h * 2 - 1))
@@ -518,17 +536,22 @@ def _render_view(
     px, py = _disp_xy_to_pixel(mx - tile_x0, my - tile_y0, show_w, show_h, rotate_90)
     dx, dy = _pixel_to_disp_xy(px, py, show_w, show_h, rotate_90)
 
-    for img in [dist_big, peak_bgr, refl_bgr]:
+    panels = [dist_big, peak_bgr, refl_bgr]
+    if bag_dist_m is not None:
+        panels.append(panel4)
+    for img in panels:
         _draw_marker(img, dx, dy)
 
     _with_text(dist_big, "DISTANCE")
     _with_text(peak_bgr, "PEAK")
     _with_text(refl_bgr, "REFLECTANCE")
+    if bag_dist_m is not None:
+        _with_text(panel4, "BAG_DIST")
 
     view = np.vstack([
         np.zeros((HEADER_H, show_w * 2, 3), dtype=np.uint8),
         np.hstack([dist_big, peak_bgr]),
-        np.hstack([refl_bgr, empty_bgr]),
+        np.hstack([refl_bgr, panel4]),
     ])
 
     hist_img = _render_histogram_bgr(hists[py, px, :])
@@ -550,6 +573,48 @@ def _parse_vp_tof_info(payload: bytes):
     raw_all = np.frombuffer(payload[_VPI_HEADER_SIZE:_VPI_HEADER_SIZE + _BAG_RAW_BYTES], dtype="<u2")
     hist = raw_all[:_BAG_PIXELS * TOF_C].reshape(TOF_H, TOF_W, TOF_C).copy()
     return header, hist
+
+
+def _parse_vp_dtof_depth(payload: bytes):
+    """解析 VpDtofDepth 消息，返回 (frame_id, dist_mm(30,40), conf(30,40)) 或 None。"""
+    if len(payload) < _DEPTH_PAYLOAD_SIZE:
+        return None
+    data = memoryview(payload)
+    frame_id = int.from_bytes(data[8:12], byteorder="little", signed=False)
+    dist_off = _DEPTH_HDR_SIZE
+    conf_off = dist_off + _DEPTH_DIST_BYTES
+    dist = np.frombuffer(data[dist_off:dist_off + _DEPTH_DIST_BYTES], dtype="<u2").reshape(TOF_H, TOF_W).copy()
+    conf = np.frombuffer(data[conf_off:conf_off + _DEPTH_CONF_BYTES], dtype=np.uint8).reshape(TOF_H, TOF_W).copy()
+    return frame_id, dist, conf
+
+
+def _load_bag_depth_map(bag_path: Path) -> dict:
+    """从 BAG/MCAP 加载 alg/dtof_depth topic，返回 {frame_id: (dist_mm, conf)}。"""
+    from mcap.reader import NonSeekingReader, make_reader
+
+    depth_map: dict = {}
+    print(f"[INFO] 加载 bag depth ({_BAG_DEPTH_TOPIC}): {bag_path.name}")
+
+    def consume(msg_iter):
+        for _, channel, message in msg_iter:
+            if (channel.topic or "") != _BAG_DEPTH_TOPIC:
+                continue
+            parsed = _parse_vp_dtof_depth(message.data)
+            if parsed:
+                fid, dist_mm, conf = parsed
+                depth_map[fid] = (dist_mm, conf)
+
+    with bag_path.open("rb") as f:
+        try:
+            consume(make_reader(f).iter_messages())
+        except Exception:
+            f.seek(0)
+            try:
+                consume(NonSeekingReader(f).iter_messages(log_time_order=False))
+            except Exception:
+                pass
+    print(f"[OK] bag depth 帧数: {len(depth_map)}")
+    return depth_map
 
 
 def _load_bag_frames(bag_path: Path) -> list:
@@ -605,6 +670,8 @@ def _run_bag_mode(bag_path_str: str) -> int:
     if not frames:
         print("[ERR] 没有有效帧")
         return 1
+
+    bag_depth_map = _load_bag_depth_map(bag_path)
 
     nn_dir = Path(__file__).resolve().parent
     root = nn_dir.parent
@@ -668,15 +735,27 @@ def _run_bag_mode(bag_path_str: str) -> int:
             next_play_ms = now_ms + play_interval_ms
 
         header, hist = frames[idx]
+
+        bag_dist_m = None
+        bag_depth_entry = bag_depth_map.get(header.frame_id)
+        if bag_depth_entry is not None:
+            bag_dist_mm, bag_conf = bag_depth_entry
+            bag_dist_m = bag_dist_mm.astype(np.float32) / 1000.0
+            bag_dist_m[bag_conf == 0] = 0.0
+
         view, hist_img, px, py = _render_view(
             all_dist[idx], all_conf[idx], all_peak[idx], all_refl[idx],
             hist.astype(np.float32), mouse["x"], mouse["y"],
             show_w, show_h, rotate_90,
+            bag_dist_m=bag_dist_m,
         )
 
+        bag_d_str = ""
+        if bag_dist_m is not None:
+            bag_d_str = f"  bag_dist {float(bag_dist_m[py, px]):.3f}m"
         hover1 = (
             f"idx={idx}/{n - 1}  frame_id={header.frame_id}  "
-            f"dist {float(all_dist[idx][py, px]):.3f}m  snr {float(all_snr[idx][py, px]):.3f}  "
+            f"dist {float(all_dist[idx][py, px]):.3f}m{bag_d_str}  snr {float(all_snr[idx][py, px]):.3f}  "
             f"conf {float(all_conf[idx][py, px]):.0f}  peak {float(all_peak[idx][py, px]):.3f}"
         )
         hover2 = f"reflectance {float(all_refl[idx][py, px]) * 100.0:.3f}%"
