@@ -490,7 +490,15 @@ def _render_view(
     rotate_90: bool,
     bag_dist_m: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
-    """渲染四宫格 (DISTANCE|PEAK / REFLECTANCE|BAG_DIST 或空) + 直方图。
+    """渲染面板 + 直方图。
+
+    BAG 模式布局（2x2）:
+        第一行: DISTANCE | BAG_DIST
+        第二行: PEAK     | REFLECTANCE
+
+    ADB 模式布局（1+2）:
+        第一行: DISTANCE（单图居左，右侧留黑）
+        第二行: PEAK     | REFLECTANCE
 
     Args:
         bag_dist_m: 可选，(H,W) float32 距离(米)，来自 bag 中 alg/dtof_depth。
@@ -522,12 +530,10 @@ def _render_view(
     )
 
     if bag_dist_m is not None:
-        panel4 = cv2.resize(
+        bag_panel = cv2.resize(
             _orient_for_display(_colorize_depth(bag_dist_m), rotate_90),
             (show_w, show_h), interpolation=cv2.INTER_NEAREST,
         )
-    else:
-        panel4 = np.zeros((show_h, show_w, 3), dtype=np.uint8)
 
     mx = int(np.clip(mouse_x, 0, show_w * 2 - 1))
     my = int(np.clip(mouse_y - HEADER_H, 0, show_h * 2 - 1))
@@ -538,7 +544,7 @@ def _render_view(
 
     panels = [dist_big, peak_bgr, refl_bgr]
     if bag_dist_m is not None:
-        panels.append(panel4)
+        panels.append(bag_panel)
     for img in panels:
         _draw_marker(img, dx, dy)
 
@@ -546,12 +552,18 @@ def _render_view(
     _with_text(peak_bgr, "PEAK")
     _with_text(refl_bgr, "REFLECTANCE")
     if bag_dist_m is not None:
-        _with_text(panel4, "BAG_DIST")
+        _with_text(bag_panel, "BAG_DIST")
+
+    if bag_dist_m is not None:
+        row1 = np.hstack([dist_big, bag_panel])
+    else:
+        row1 = np.hstack([dist_big, np.zeros((show_h, show_w, 3), dtype=np.uint8)])
+    row2 = np.hstack([peak_bgr, refl_bgr])
 
     view = np.vstack([
         np.zeros((HEADER_H, show_w * 2, 3), dtype=np.uint8),
-        np.hstack([dist_big, peak_bgr]),
-        np.hstack([refl_bgr, panel4]),
+        row1,
+        row2,
     ])
 
     hist_img = _render_histogram_bgr(hists[py, px, :])
