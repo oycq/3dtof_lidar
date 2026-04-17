@@ -87,8 +87,10 @@ class Network(nn.Module):
 
     def _crosstalk_suppression(self, hist):
         bin_thresh = torch.mean(hist, dim=(2, 3), keepdim=True) * CROSSTALK_MEAN_COEF
-        keep = hist >= bin_thresh
-        return torch.where(keep, hist, torch.zeros_like(hist))
+        # 用 sign+relu 构造 0/1 mask，避开 BPU 不支持的 where：
+        # hist > bin_thresh -> sign=1, relu=1；hist <= bin_thresh -> sign<=0, relu=0
+        mask = torch.relu(torch.sign(hist - bin_thresh))
+        return hist * mask
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         hist, raw_bin_63, raw_bin_64 = self._split_hist_and_tail(x)
