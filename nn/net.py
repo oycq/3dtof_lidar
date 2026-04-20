@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 IS_6321 = True
 DIST_SCALE_M = 0.6
@@ -45,17 +46,39 @@ else:
     DIST_BIAS = 0.6
 REFLECT_THRESH = 0.025
 SNR_THRESH = 4.0
-ARGMAX_CLIP_MIN = 1
-ARGMAX_CLIP_MAX = 60
 NOISE_BIAS = 4.0
 CROSSTALK_MEAN_COEF = 1
-EPS = 1e-6
+
+# peak mask 的偏置: 用于 sign(x - peak_val + PEAK_EPS) 在 peak 位置输出 1
+PEAK_EPS = 0.1
 
 class Network(nn.Module):
     def __init__(self):
         super().__init__()
         hist_bias = torch.tensor([80.0] + [0.0] * 61, dtype=torch.float32).view(1, 62, 1, 1)
         self.register_buffer("hist_bias", hist_bias)
+
+        # ---- 距离重心计算: 用 1x1 conv 替代 argmax + gather (BPU 友好) ----
+        # 输出通道 i 表示"假设 peak 在 bin i"时的三邻域重心距离:
+        #   tilt[i]   =  x[i+1] - x[i-1]           (右邻 - 左邻, 反映峰往哪边倾)
+        #   total[i]  =  x[i-1] + x[i] + x[i+1]    (三邻域总和)
+        #   centroid  =  tilt / (total + 1) + i    (+1 防除零)
+        # 等价于原先的 clip(argmax, 1, 60): i=0 复用 i=1 的 anchor, i=61 复用 i=60
+        tilt_kernel  = torch.zeros(62, 62, 1, 1, dtype=torch.float32)
+        total_kernel = torch.zeros(62, 62, 1, 1, dtype=torch.float32)
+        for i in range(62):
+            anchor = min(max(i, 1), 60)  # 实际参与重心计算的中心 bin, clip 到 [1, 60]
+            tilt_kernel[i,  anchor - 1, 0, 0] = -1.0
+            tilt_kernel[i,  anchor + 1, 0, 0] = 1.0
+            total_kernel[i, anchor - 1, 0, 0] = 1.0
+            total_kernel[i, anchor,     0, 0] = 1.0
+            total_kernel[i, anchor + 1, 0, 0] = 1.0
+        self.register_buffer("tilt_kernel",  tilt_kernel)
+        self.register_buffer("total_kernel", total_kernel)
+
+        # 每个通道加上自身 bin 索引, 同样 clip 到 [1, 60]
+        bin_index = torch.arange(62, dtype=torch.float32).clamp(1, 60).view(1, 62, 1, 1)
+        self.register_buffer("bin_index", bin_index)
 
     def _apply_hist_bias(self, hist):
         return torch.relu(hist - self.hist_bias)
@@ -73,16 +96,21 @@ class Network(nn.Module):
         return sat_value
 
     def _distance(self, x):
-        peak_idx = torch.argmax(x, dim=1, keepdim=True)
-        peak_idx = torch.clamp(peak_idx, min=ARGMAX_CLIP_MIN, max=ARGMAX_CLIP_MAX)
+        # 1) 卷积并行算出 62 个候选距离 (B, 62, H, W)
+        #    channel i 表示"假设 peak 在 bin i"时的三邻域重心距离
+        tilt  = F.conv2d(x, self.tilt_kernel)
+        total = F.conv2d(x, self.total_kernel) + 1.0  # +1 防止除 0
+        centroid = tilt / total + self.bin_index
+        dist_candidates = centroid * DIST_SCALE_M + DIST_BIAS
 
-        a = torch.gather(x, dim=1, index=peak_idx - 1)
-        b = torch.gather(x, dim=1, index=peak_idx)
-        c = torch.gather(x, dim=1, index=peak_idx + 1)
+        # 2) max + sign + relu 构造 one-hot peak mask (替代 argmax)
+        #    sign(0) = 0, 所以 peak 位置自己需要靠 +PEAK_EPS 唤醒成 1
+        #    PEAK_EPS = 0.1 < 1 (hist 最小计量单位), 不会把次大位置误判成 peak
+        peak_val  = torch.max(x, dim=1, keepdim=True).values
+        peak_mask = torch.relu(torch.sign(x - peak_val + PEAK_EPS))
 
-        centroid = (c - a) / (a + b + c + 1) + peak_idx # +1这里是为了防止除0
-        dist = centroid * DIST_SCALE_M
-        dist = dist + DIST_BIAS
+        # 3) 只在 peak 通道保留候选距离, sum 合并到单通道
+        dist = torch.sum(peak_mask * dist_candidates, dim=1, keepdim=True)
         return dist
 
     def _crosstalk_suppression(self, hist):
