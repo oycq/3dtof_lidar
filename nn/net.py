@@ -46,7 +46,7 @@ else:
     DIST_BIAS = 0.6
 REFLECT_THRESH = 0.025
 SNR_THRESH = 4.0
-NOISE_BIAS = 4.0
+NOISE_BIAS = 3.0
 CROSSTALK_MEAN_COEF = 1
 
 # peak mask 的偏置: 用于 sign(x - peak_val + PEAK_EPS) 在 peak 位置输出 1
@@ -106,7 +106,7 @@ class Network(nn.Module):
         # 2) max + sign + relu 构造 one-hot peak mask (替代 argmax)
         #    sign(0) = 0, 所以 peak 位置自己需要靠 +PEAK_EPS 唤醒成 1
         #    PEAK_EPS = 0.1 < 1 (hist 最小计量单位), 不会把次大位置误判成 peak
-        peak_val  = torch.max(x, dim=1, keepdim=True).values
+        peak_val  = torch.amax(x, dim=1, keepdim=True)
         peak_mask = torch.relu(torch.sign(x - peak_val + PEAK_EPS))
 
         # 3) 只在 peak 通道保留候选距离, sum 合并到单通道
@@ -133,18 +133,23 @@ class Network(nn.Module):
         # 窜光抑制: dist/peak 用抑制后 hist, mean 用原始 hist
         hist_eroded = self._crosstalk_suppression(hist)
 
+        # 计算距离
         dist = self._distance(hist_eroded)
 
         # 计算信号强度和噪声
         mean = torch.mean(hist, dim=1, keepdim=True)
-        peak = torch.max(hist_eroded, dim=1, keepdim=True).values
+        peak = torch.amax(hist_eroded, dim=1, keepdim=True)
         signal = peak - mean
         noise = torch.sqrt(mean) + NOISE_BIAS
         snr = signal / noise
 
-        # 计算反射率和置信度
+        # 计算反射率
         reflectance = dist * dist * signal / REFLECT_K
-        conf = ((snr > SNR_THRESH) & (reflectance > REFLECT_THRESH)).to(torch.float32)
+
+        # 计算置信度
+        snr_pass     = torch.relu(torch.sign(snr - SNR_THRESH))
+        reflect_pass = torch.relu(torch.sign(reflectance - REFLECT_THRESH))
+        conf = snr_pass * reflect_pass
 
         return dist, conf, peak, reflectance, snr
 
