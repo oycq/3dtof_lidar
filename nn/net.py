@@ -60,7 +60,7 @@ else:
 REFLECT_THRESH = 0.025
 SNR_THRESH = 4.0
 NOISE_BIAS = 3.0
-CROSSTALK_MEAN_COEF = 1
+CROSSTALK_MEAN_COEF = 0.66
 
 # peak mask 的偏置: 用于 sign(x - peak_val + PEAK_EPS) 在 peak 位置输出 1
 PEAK_EPS = 1
