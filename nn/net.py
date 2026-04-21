@@ -9,35 +9,45 @@ nn/net.py
 - snr: 信噪比
 - reflectance: 反射率
 - conf: 置信度(0/1)
-- peak: 峰值信号 (hist at 峰值 bin)
+- peak: 峰值信号 (原始 hist at 峰值 bin)
 
 流程:
 1) 拆分前 62 个有效 bin 与最后两个饱和 bin:
-   sat_value = bin64 * 1024 + bin63
-   若 sat_value <= 0, 则赋值为 50000
-2) 归一化: hist = hist * (50000 / sat_value), 统一到每脉冲基准
-3) 用 1x1 conv 并行算出 62 路候选距离 (每 bin 都做三邻域重心细化):
-      tilt[i]  =  x[i+1] - x[i-1]                    (右邻 - 左邻)
-      total[i] =  x[i-1] + x[i] + x[i+1]             (三邻域和)
-      centroid =  tilt / (total + 1) + i             (clip 到 [1, 60])
-      dist_per_bin = centroid * DIST_SCALE_M + DIST_BIAS     形状 (B, 62, H, W)
-4) 每个 bin 都算一组候选信号量, 形状都是 (B, 62, H, W):
-      signal_per_bin      = hist - mean(hist, dim=1)
+      sat_value = bin64 * 1024 + bin63
+      若 sat_value <= 0, 则赋值为 50000
+   得到归一化系数 k = PULSES / sat_value, 并构造归一化后的 hist_k = hist * k.
+
+   两份直方图各司其职:
+   - 原始 hist  : 用于距离重心 (dist_per_bin) 和 argmax 选峰 bin, 保持原始形状信息
+   - 归一化 hist_k: 用于 snr / crosstalk / reflect 三路, 使阈值在不同脉冲数下一致
+
+2) 用 1x1 conv 在原始 hist 上并行算出 62 路候选距离 (每 bin 都做三邻域重心细化):
+      tilt[i]  =  x[i+1] - x[i-1]                 (右邻 - 左邻)
+      total[i] =  x[i-1] + x[i] + x[i+1]          (三邻域和)
+      centroid =  tilt / (total + 1) + i          (clip 到 [1, 60])
+      dist_per_bin = centroid * DIST_SCALE_M + DIST_BIAS       (B, 62, H, W)
+
+3) 在 hist_k 上算每 bin 的信号量 (形状都是 (B, 62, H, W)):
+      signal_per_bin      = hist_k - mean(hist_k, dim=1)
       snr_per_bin         = signal_per_bin / (sqrt(mean) + NOISE_BIAS)
       reflectance_per_bin = dist_per_bin^2 * signal_per_bin / REFLECT_K
-5) 三路 per-bin mask (都是 (B, 62, H, W), 0/1):
-      crosstalk_mask : 每 bin 的帧均值阈值  (crosstalk_suppression 不改变 hist, 只输出 mask)
+
+4) 三路 per-bin mask (都是 (B, 62, H, W), 0/1), 全部基于 hist_k:
+      crosstalk_mask : hist_k > mean(hist_k) * CROSSTALK_MEAN_COEF
       snr_mask       : snr_per_bin         > SNR_THRESH
       reflect_mask   : reflectance_per_bin > REFLECT_THRESH
    三者相乘得到 per-bin 的 valid_mask.
-6) 测距: gated_hist   = valid_mask * hist
-         one_hot_mask = one-hot(argmax(gated_hist)), 按最近 bin 做 tiebreak
-7) 用 one_hot_mask 从 62 路候选里各挑出命中那一路 (sum):
+
+5) 测距: gated_hist   = valid_mask * hist           (注意: 用原始 hist)
+         one_hot_mask = one-hot(argmax(gated_hist)), 并列时按最小 bin 做 tiebreak
+
+6) 用 one_hot_mask 从 62 路候选里各挑出命中那一路 (sum):
       dist        = Σ one_hot_mask * dist_per_bin
       reflectance = Σ one_hot_mask * reflectance_per_bin
       snr         = Σ one_hot_mask * snr_per_bin
       peak        = Σ one_hot_mask * gated_hist    (= amax(gated_hist), 无效像素为 0)
-8) conf = amax(valid_mask, dim=1), 即任一 bin 通过 3 路 mask 即为有效像素
+
+7) conf = amax(valid_mask, dim=1), 即任一 bin 通过 3 路 mask 即为有效像素
 """
 
 from __future__ import annotations
@@ -135,43 +145,40 @@ class Network(nn.Module):
         return one_hot
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # ---- 0) 拆分: 62 个有效 bin + 2 个饱和 bin, 计算脉冲归一化系数 k ----
         hist, raw_bin_63, raw_bin_64 = self._split_hist_and_tail(x)
-
-        # 1) sat_value 归一化, 统一到每脉冲基准
         sat_value = self._caculate_sat_value(raw_bin_63, raw_bin_64)
         k = PULSES / sat_value
-        hist = hist * k
+        hist_k = hist * k  # 用于 snr / crosstalk / reflect (阈值在不同脉冲数下一致)
 
-        # 2) 62 路候选距离 (三邻域重心)
+        # ---- 1) 距离重心 & argmax 门控, 都用原始 hist ----
         dist_per_bin = self._dist_per_bin(hist)  # (B, 62, H, W)
 
-        # 3) 每 bin 的信号量 / 噪声
-        mean = torch.mean(hist, dim=1, keepdim=True)          # (B, 1, H, W)
-        signal_per_bin = hist - mean                          # (B, 62, H, W)
-        noise = torch.sqrt(mean) + NOISE_BIAS                 # (B, 1, H, W)
+        # ---- 2) 每 bin 的信号量 / 噪声 (基于归一化 hist_k) ----
+        mean_k         = torch.mean(hist_k, dim=1, keepdim=True)    # (B, 1, H, W)
+        signal_per_bin = hist_k - mean_k                            # (B, 62, H, W)
+        noise          = torch.sqrt(mean_k) + NOISE_BIAS            # (B, 1, H, W)
 
-        # 4) 每 bin 的 snr / 反射率 (62 路候选)
-        snr_per_bin = signal_per_bin / noise                                          # (B, 62, H, W)
+        snr_per_bin         = signal_per_bin / noise                                    # (B, 62, H, W)
         reflectance_per_bin = dist_per_bin * dist_per_bin * signal_per_bin / REFLECT_K  # (B, 62, H, W)
 
-        # 5) 三路 mask
-        crosstalk_mask = self._crosstalk_mask(hist)                                  # (B, 62, H, W)
-        snr_mask       = torch.relu(torch.sign(snr_per_bin - SNR_THRESH))            # (B, 62, H, W)
-        reflect_mask   = torch.relu(torch.sign(reflectance_per_bin - REFLECT_THRESH))  # (B, 62, H, W)
+        # ---- 3) 三路 per-bin mask (都基于 hist_k / per-bin 量) ----
+        crosstalk_mask = self._crosstalk_mask(hist_k)                                   # (B, 62, H, W)
+        snr_mask       = torch.relu(torch.sign(snr_per_bin         - SNR_THRESH))       # (B, 62, H, W)
+        reflect_mask   = torch.relu(torch.sign(reflectance_per_bin - REFLECT_THRESH))   # (B, 62, H, W)
+        valid_mask     = crosstalk_mask * snr_mask * reflect_mask                       # (B, 62, H, W)
 
-        # 6) 三 mask 合并为 per-bin 有效性, 门控 hist 后在 62 bin 中做 argmax -> one-hot
-        valid_mask    = crosstalk_mask * snr_mask * reflect_mask  # (B, 62, H, W)
-        gated_hist    = valid_mask * hist                         # (B, 62, H, W)
-        one_hot_mask  = self._argmax_onehot(gated_hist)           # (B, 62, H, W)
+        # ---- 4) 在原始 hist 上做 argmax 选峰 bin ----
+        gated_hist   = valid_mask * hist                  # (B, 62, H, W)
+        one_hot_mask = self._argmax_onehot(gated_hist)    # (B, 62, H, W)
 
-        # 7) 用 one_hot_mask 从 62 路候选里各挑出命中那一路;
-        #    peak 用 gated_hist (无效像素全 0, 等价于 amax(gated_hist))
+        # ---- 5) 用 one_hot_mask 从 62 路候选里各挑出命中那一路 ----
         dist        = torch.sum(one_hot_mask * dist_per_bin,        dim=1, keepdim=True)
         reflectance = torch.sum(one_hot_mask * reflectance_per_bin, dim=1, keepdim=True)
         snr         = torch.sum(one_hot_mask * snr_per_bin,         dim=1, keepdim=True)
-        peak        = torch.sum(one_hot_mask * gated_hist,          dim=1, keepdim=True)
+        peak        = torch.sum(one_hot_mask * hist_k,          dim=1, keepdim=True)  # = amax(gated_hist)
 
-        # 8) conf: 该像素任一 bin 通过 3 路 mask 即为有效
+        # ---- 6) conf: 该像素任一 bin 通过 3 路 mask 即为有效 ----
         conf = torch.amax(valid_mask, dim=1, keepdim=True)
 
         return dist, conf, peak, reflectance, snr
