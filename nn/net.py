@@ -50,7 +50,7 @@ NOISE_BIAS = 3.0
 CROSSTALK_MEAN_COEF = 1
 
 # peak mask 的偏置: 用于 sign(x - peak_val + PEAK_EPS) 在 peak 位置输出 1
-PEAK_EPS = 0.1
+PEAK_EPS = 1
 
 class Network(nn.Module):
     def __init__(self):
@@ -109,7 +109,14 @@ class Network(nn.Module):
         peak_val  = torch.amax(x, dim=1, keepdim=True)
         peak_mask = torch.relu(torch.sign(x - peak_val + PEAK_EPS))
 
-        # 3) 只在 peak 通道保留候选距离, sum 合并到单通道
+        # 3) 多个 bin 同时取到 peak_val 时, 只保留最近的那个(bin 索引最小)
+        #    非 peak 位=0, peak 位=(62 - bin_index)∈[2,61], bin 越小权重越大, 再 amax+sign+relu
+        #    (不能直接用 -bin_index: 非 peak 的 0 会被 amax 选中, 导致 sign 把非 peak 唤醒)
+        near_weighted = peak_mask * (62.0 - self.bin_index)
+        near_max      = torch.amax(near_weighted, dim=1, keepdim=True)
+        peak_mask     = torch.relu(torch.sign(near_weighted - near_max + PEAK_EPS))
+
+        # 4) 只在 peak 通道保留候选距离, sum 合并到单通道
         dist = torch.sum(peak_mask * dist_candidates, dim=1, keepdim=True)
         return dist
 
