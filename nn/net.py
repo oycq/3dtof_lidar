@@ -50,8 +50,6 @@ nn/net.py
 7) conf = amax(valid_mask, dim=1), 即任一 bin 通过 3 路 mask 即为有效像素
 """
 
-from __future__ import annotations
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -68,12 +66,14 @@ else:
     REFLECT_K = 156250.0
     DIST_BIAS = 0.6
 REFLECT_THRESH = 0.025
+# 反射率上限: 避免反射率太高,导致int16量化精度不够
+MAX_REFL = 30.0
 SNR_THRESH = 4.0
 NOISE_BIAS = 3.0
 CROSSTALK_MEAN_COEF = 0.66
 
 # peak mask 的偏置: 用于 sign(x - peak_val + PEAK_EPS) 在 peak 位置输出 1
-PEAK_EPS = 1
+PEAK_EPS = 0.4
 
 
 class Network(nn.Module):
@@ -116,9 +116,12 @@ class Network(nn.Module):
 
     def _crosstalk_mask(self, hist):
         """窜光抑制: 只输出 (B,62,H,W) 的 0/1 mask, 不改变 hist 本身."""
-        bin_thresh = torch.mean(hist, dim=(2, 3), keepdim=True) * CROSSTALK_MEAN_COEF
-        # hist > bin_thresh -> sign=1, relu=1; 否则 0
-        return torch.relu(torch.sign(hist - bin_thresh))
+        # 全图均值 mean(H,W): 拆成两次单轴 ReduceMean, 避免被 horizon 优化器折叠成
+        # GlobalAveragePool(只支持 int8 输入), 保证整条路径留在 int16 精度上.
+        mean_h = torch.mean(hist,   dim=2, keepdim=True)  # axes=[2]  -> ReduceMean int16
+        mean_hw = torch.mean(mean_h, dim=3, keepdim=True)  # axes=[3]  -> ReduceMean int16
+        crosstalk_threshold = mean_hw * CROSSTALK_MEAN_COEF
+        return torch.relu(torch.sign(hist - crosstalk_threshold))
 
     def _dist_per_bin(self, hist):
         """用三邻域重心算 62 路候选距离, 输出 (B, 62, H, W)."""
@@ -126,6 +129,23 @@ class Network(nn.Module):
         total = F.conv2d(hist, self.total_kernel) + 1.0  # +1 防止除 0
         centroid = tilt / total + self.bin_index
         return centroid * DIST_SCALE_M + DIST_BIAS
+
+    def _snr_and_mask(self, signal_per_bin, noise):
+        """每 bin 的 SNR = signal / noise, 以及 SNR mask = (snr > SNR_THRESH)."""
+        snr  = signal_per_bin / noise
+        mask = torch.relu(torch.sign(snr - SNR_THRESH))
+        return snr, mask
+
+    def _reflectance_and_mask(self, signal_per_bin, dist_per_bin):
+        """每 bin 的反射率 = dist^2 * signal / K, 以及 reflect mask = (reflect > REFLECT_THRESH).
+
+        量化友好: signal 先 clamp 到 MAX_REFL*K/dist^2, 保证 reflect 最大 = MAX_REFL (物理上限 3000%)
+        """
+        dist_sq             = dist_per_bin * dist_per_bin
+        signal_clip         = torch.minimum(signal_per_bin, (MAX_REFL * REFLECT_K) / dist_sq)
+        reflectance_per_bin = dist_sq * signal_clip / REFLECT_K
+        mask                = torch.relu(torch.sign(reflectance_per_bin - REFLECT_THRESH))
+        return reflectance_per_bin, mask
 
     def _argmax_onehot(self, x):
         """
@@ -159,13 +179,11 @@ class Network(nn.Module):
         signal_per_bin = hist_k - mean_k                            # (B, 62, H, W)
         noise          = torch.sqrt(mean_k) + NOISE_BIAS            # (B, 1, H, W)
 
-        snr_per_bin         = signal_per_bin / noise                                    # (B, 62, H, W)
-        reflectance_per_bin = dist_per_bin * dist_per_bin * signal_per_bin / REFLECT_K  # (B, 62, H, W)
+        snr_per_bin,         snr_mask     = self._snr_and_mask(signal_per_bin, noise)
+        reflectance_per_bin, reflect_mask = self._reflectance_and_mask(signal_per_bin, dist_per_bin)
 
-        # ---- 3) 三路 per-bin mask (都基于 hist_k / per-bin 量) ----
+        # ---- 3) 三路 per-bin mask ----
         crosstalk_mask = self._crosstalk_mask(hist_k)                                   # (B, 62, H, W)
-        snr_mask       = torch.relu(torch.sign(snr_per_bin         - SNR_THRESH))       # (B, 62, H, W)
-        reflect_mask   = torch.relu(torch.sign(reflectance_per_bin - REFLECT_THRESH))   # (B, 62, H, W)
         valid_mask     = crosstalk_mask * snr_mask * reflect_mask                       # (B, 62, H, W)
 
         # ---- 4) 在原始 hist 上做 argmax 选峰 bin ----
