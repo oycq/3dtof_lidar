@@ -6,8 +6,8 @@ nn/onboard.py
 
 On-board ToF quick preview:
 - read /tmp/tof.output
-- expected shape: 4x30x40 float32
-- channels: dist/snr/reflect/conf
+- expected shape: 5x30x40 float32
+- channels (C++ write order): dist/conf/peak/reflectance/snr
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import numpy as np
 TOF_H = 30
 TOF_W = 40
 PIXELS = TOF_H * TOF_W
-OUT_C = 4
+OUT_C = 5
 
 SHOW_W = 520
 SHOW_H = 390
@@ -54,9 +54,10 @@ def _bytes_to_output_maps(raw: bytes, remote_path: str) -> tuple[np.ndarray, np.
         raise ValueError(f"bad float count in {remote_path}: got {data.size}, expect {OUT_C * PIXELS}")
     maps = data.reshape(OUT_C, TOF_H, TOF_W).copy()
     dist = maps[0]
-    snr = maps[1]
-    reflect = maps[2]
-    conf = maps[3]
+    conf = maps[1]
+    _peak = maps[2]  # noqa: F841  # read but currently unused by UI
+    reflect = maps[3]
+    snr = maps[4]
     return dist, conf, reflect, snr
 
 
@@ -177,7 +178,7 @@ def main() -> int:
     print(f"[tm]   {REMOTE_TM_DIR}")
     print(f"[read] {REMOTE_OUTPUT_PATH}")
     print(f"[shape] {OUT_C}x{TOF_H}x{TOF_W}, dtype=float32")
-    print("[chan] dist/snr/reflect/conf")
+    print("[chan] dist/conf/peak/reflectance/snr (C++ write order)")
     print(f"[adb]  pull: {REMOTE_OUTPUT_PATH}")
     print("[mask] dist: conf<=0.5 -> black")
     print(f"[rec]  save mp4 to {RECORD_DIR}")
