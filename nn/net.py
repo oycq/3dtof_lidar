@@ -62,6 +62,7 @@ PULSES = 50000.0
 if IS_6321:
     REFLECT_K = 156250.0 / 3
     DIST_BIAS = 0.25
+    DIST_BIAS = -1.94
 else:
     REFLECT_K = 156250.0
     DIST_BIAS = 0.6
