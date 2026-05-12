@@ -48,11 +48,14 @@ LOG_BASE = 1.06
 # 单图显示长短边；是否旋转时会自动交换宽高
 SHOW_LONG = 520
 SHOW_SHORT = 390
-ROTATE_90 = False
+ROTATE_90 = 1
 HEADER_H = 56
 HIST_BINS = 62
 HIST_W = 640
 HIST_H = 280
+STRIP_BINS = 62   # 表格显示 bins 0..61
+STRIP_W = 240     # 图像宽度（函数内动态计算高度，此值仅作默认参数）
+STRIP_H = 0       # 高度由行数自动决定，此常量不再用于绘制
 TARGET_FPS = 25.0
 FPS_STAT_INTERVAL_S = 0.5
 REC_FPS = 20.0
@@ -355,6 +358,86 @@ def _render_histogram_bgr(
     return img
 
 
+def _render_bins_strip_bgr(
+    bins: np.ndarray,
+    px: int,
+    py: int,
+    w: int = STRIP_W,
+    h: int = STRIP_H,
+) -> np.ndarray:
+    """纯文字表格：62 行 × 2 列（bin#  eq_val），针对鼠标悬停像素。
+
+    eq_val = bin_raw * PULSES / sat_value
+    sat_value = b[62] * TAIL_BASE + b[63]（为 0 时取 PULSES）
+    argmax 行用亮绿色高亮。
+    """
+    import cv2  # type: ignore
+
+    b = np.asarray(bins, dtype=np.float32).reshape(-1)
+    n_show = min(STRIP_BINS, int(b.size))  # 62
+
+    b_draw = b[:n_show].copy()
+
+    # 计算 sat_value（同主直方图逻辑）
+    tail_63 = float(b[62]) if b.size > 62 else 0.0
+    tail_64 = float(b[63]) if b.size > 63 else 0.0
+    sat_value = tail_63 * TAIL_BASE + tail_64
+    if sat_value == 0.0:
+        sat_value = float(PULSES)
+
+    # eq_val = raw * PULSES / sat_value
+    eq = b_draw * float(PULSES) / sat_value
+
+    argmax_idx = int(np.argmax(b_draw)) if n_show > 0 else -1
+    vmax_raw = float(b_draw[argmax_idx]) if argmax_idx >= 0 else 0.0
+
+    # 每行行高
+    row_h = 16
+    header_h = 48
+    img_h = header_h + n_show * row_h + 4
+    img_w = max(int(w), 260)
+    img = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+
+    # 标题
+    cv2.putText(
+        img,
+        f"pixel=({int(px)},{int(py)})  sat={sat_value:.1f}",
+        (8, 16),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1, cv2.LINE_AA,
+    )
+    cv2.putText(
+        img,
+        f"peak_raw={vmax_raw:.1f}  peak_eq={float(eq[argmax_idx]) if argmax_idx >= 0 else 0:.1f}",
+        (8, 32),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1, cv2.LINE_AA,
+    )
+    cv2.putText(
+        img, "bin    eq_val (raw*PULSES/sat)",
+        (8, 46),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (120, 120, 120), 1, cv2.LINE_AA,
+    )
+    cv2.line(img, (0, header_h - 1), (img_w, header_h - 1), (60, 60, 60), 1)
+
+    for i in range(n_show):
+        y_text = header_h + i * row_h + row_h - 4
+        color = (80, 255, 80) if i == argmax_idx else (220, 220, 220)
+        if i % 2 == 0:
+            cv2.rectangle(
+                img,
+                (0, header_h + i * row_h),
+                (img_w, header_h + (i + 1) * row_h - 1),
+                (20, 20, 20), -1,
+            )
+        cv2.putText(
+            img,
+            f"{i:3d}    {eq[i]:10.2f}",
+            (8, y_text),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA,
+        )
+
+    return img
+
+
 def _colorize_gray01(x: np.ndarray) -> np.ndarray:
     u8 = np.clip(np.rint(np.clip(np.asarray(x, dtype=np.float32), 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
     return np.stack([u8, u8, u8], axis=2)
@@ -489,8 +572,8 @@ def _render_view(
     show_h: int,
     rotate_90: bool,
     bag_dist_m: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, int, int]:
-    """渲染面板 + 直方图。
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
+    """渲染面板 + 直方图 + bins 长条。
 
     BAG 模式布局（2x2）:
         第一行: DISTANCE | BAG_DIST
@@ -503,7 +586,7 @@ def _render_view(
     Args:
         bag_dist_m: 可选，(H,W) float32 距离(米)，来自 bag 中 alg/dtof_depth。
 
-    Returns: (view_bgr, hist_bgr, tof_px, tof_py)
+    Returns: (view_bgr, hist_bgr, strip_bgr, tof_px, tof_py)
         view_bgr 的前 HEADER_H 行为空白，留给调用方写 hover 文本。
     """
     import cv2
@@ -567,7 +650,8 @@ def _render_view(
     ])
 
     hist_img = _render_histogram_bgr(hists[py, px, :])
-    return view, hist_img, px, py
+    strip_img = _render_bins_strip_bgr(hists[py, px, :], px, py)
+    return view, hist_img, strip_img, px, py
 
 
 # ======================== BAG/MCAP 解析 ========================
@@ -714,8 +798,10 @@ def _run_bag_mode(bag_path_str: str) -> int:
 
     win = "NN_REALTIME"
     hist_win = "HIST"
+    strip_win = "BINS"
     cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow(hist_win, cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow(strip_win, cv2.WINDOW_AUTOSIZE)
     cv2.createTrackbar("frame", win, 0, n - 1, lambda _: None)
 
     mouse: dict = {"x": 0, "y": 0}
@@ -755,7 +841,7 @@ def _run_bag_mode(bag_path_str: str) -> int:
             bag_dist_m = bag_dist_mm.astype(np.float32) / 1000.0
             bag_dist_m[bag_conf == 0] = 0.0
 
-        view, hist_img, px, py = _render_view(
+        view, hist_img, strip_img, px, py = _render_view(
             all_dist[idx], all_conf[idx], all_peak[idx], all_refl[idx],
             hist.astype(np.float32), mouse["x"], mouse["y"],
             show_w, show_h, rotate_90,
@@ -776,6 +862,7 @@ def _run_bag_mode(bag_path_str: str) -> int:
 
         cv2.imshow(win, view)
         cv2.imshow(hist_win, hist_img)
+        cv2.imshow(strip_win, strip_img)
 
         key = cv2.waitKeyEx(20)
         if key in (27, ord("q"), ord("Q")):
@@ -833,6 +920,7 @@ def main() -> int:
 
     cv2.namedWindow("NN_REALTIME", cv2.WINDOW_AUTOSIZE)
     cv2.namedWindow("HIST", cv2.WINDOW_AUTOSIZE)
+    cv2.namedWindow("BINS", cv2.WINDOW_AUTOSIZE)
     mouse = {"x": 0, "y": 0}
 
     def on_mouse(event: int, x: int, y: int, flags: int, userdata: object) -> None:
@@ -856,6 +944,7 @@ def main() -> int:
     last_mouse_xy = (-1, -1)
     view_cache: np.ndarray | None = None
     hist_cache: np.ndarray | None = None
+    strip_cache: np.ndarray | None = None
 
     io_fps = 0.0
     infer_fps = 0.0
@@ -912,11 +1001,12 @@ def main() -> int:
                 or (mouse_xy != last_mouse_xy)
                 or (view_cache is None)
                 or (hist_cache is None)
+                or (strip_cache is None)
                 or (rec_on != last_rec_on)
             )
 
             if need_redraw:
-                view, hist_new, px, py = _render_view(
+                view, hist_new, strip_new, px, py = _render_view(
                     cached_pred_depth, cached_conf, cached_peak, cached_reflectance,
                     cached_in, mouse_xy[0], mouse_xy[1], show_w, show_h, rotate_90,
                 )
@@ -955,12 +1045,14 @@ def main() -> int:
                     )
                 view_cache = view
                 hist_cache = hist_new
+                strip_cache = strip_new
                 last_mouse_xy = mouse_xy
                 last_rec_on = rec_on
 
             ui_cnt += 1
             cv2.imshow("NN_REALTIME", view_cache)
             cv2.imshow("HIST", hist_cache)
+            cv2.imshow("BINS", strip_cache)
             if rec_writer is not None and view_cache is not None:
                 rec_writer.write(view_cache)
 
