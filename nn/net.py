@@ -77,6 +77,8 @@ MAX_REFL = 30.0
 SNR_THRESH = 4.0
 NOISE_BIAS = 3.0
 CROSSTALK_MEAN_COEF = 0.66
+# 距离下限(米): 小于该值的候选距离会被钳到该值, 避免近距离重心溢出/负值
+MIN_DIST_M = 0.4
 
 # peak mask 的偏置: 用于 sign(x - peak_val + PEAK_EPS) 在 peak 位置输出 1
 PEAK_EPS = 0.4
@@ -130,11 +132,16 @@ class Network(nn.Module):
         return torch.relu(torch.sign(hist - crosstalk_threshold))
 
     def _dist_per_bin(self, hist):
-        """用三邻域重心算 62 路候选距离, 输出 (B, 62, H, W)."""
+        """用三邻域重心算 62 路候选距离, 输出 (B, 62, H, W).
+
+        小于 MIN_DIST_M 的距离统一钳到 MIN_DIST_M, 避免近距离场景下重心偏移
+        造成的负值或异常小值污染下游 reflectance (dist^2) 等计算.
+        """
         tilt = F.conv2d(hist, self.tilt_kernel)
         total = F.conv2d(hist, self.total_kernel) + 1.0  # +1 防止除 0
         centroid = tilt / total + self.bin_index
-        return centroid * DIST_SCALE_M + DIST_BIAS
+        dist = centroid * DIST_SCALE_M + DIST_BIAS
+        return torch.clamp(dist, min=MIN_DIST_M)
 
     def _snr_and_mask(self, signal_per_bin, noise):
         """每 bin 的 SNR = signal / noise, 以及 SNR mask = (snr > SNR_THRESH)."""
