@@ -19,8 +19,9 @@ nn/net.py
    得到归一化系数 k = PULSES / sat_value, 并构造归一化后的 hist_k = hist * k.
 
    两份直方图各司其职:
-   - 原始 hist  : 用于距离重心 (dist_per_bin) 和 argmax 选峰 bin, 保持原始形状信息
-   - 归一化 hist_k: 用于 snr / crosstalk / reflect 三路, 使阈值在不同脉冲数下一致
+   - 原始 hist  : 用于距离重心 (dist_per_bin)、argmax 选峰 bin, 以及 SNR 计算
+                  (SNR 反映的是原始光子统计噪声, 必须用未做饱和补偿的 10bit 直方图)
+   - 归一化 hist_k: 用于 crosstalk / reflect 两路, 使阈值在不同脉冲数下一致
 
 2) 用 1x1 conv 在原始 hist 上并行算出 62 路候选距离 (每 bin 都做三邻域重心细化):
       tilt[i]  =  x[i+1] - x[i-1]                 (右邻 - 左邻)
@@ -28,14 +29,17 @@ nn/net.py
       centroid =  tilt / (total + 1) + i          (clip 到 [1, 60])
       dist_per_bin = centroid * DIST_SCALE_M + DIST_BIAS       (B, 62, H, W)
 
-3) 在 hist_k 上算每 bin 的信号量 (形状都是 (B, 62, H, W)):
-      signal_per_bin      = hist_k - mean(hist_k, dim=1)
-      snr_per_bin         = signal_per_bin / (sqrt(mean) + NOISE_BIAS)
-      reflectance_per_bin = dist_per_bin^2 * signal_per_bin / REFLECT_K
+3) 每 bin 的信号量 (形状都是 (B, 62, H, W)):
+      # SNR 用原始 hist 算 (保留真实光子噪声统计)
+      signal_raw_per_bin  = hist   - mean(hist,   dim=1)
+      snr_per_bin         = signal_raw_per_bin / (sqrt(mean(hist))   + NOISE_BIAS)
+      # reflect 用归一化 hist_k 算 (脉冲数无关)
+      signal_k_per_bin    = hist_k - mean(hist_k, dim=1)
+      reflectance_per_bin = dist_per_bin^2 * signal_k_per_bin / REFLECT_K
 
-4) 三路 per-bin mask (都是 (B, 62, H, W), 0/1), 全部基于 hist_k:
+4) 三路 per-bin mask (都是 (B, 62, H, W), 0/1):
       crosstalk_mask : hist_k > mean(hist_k) * CROSSTALK_MEAN_COEF
-      snr_mask       : snr_per_bin         > SNR_THRESH
+      snr_mask       : snr_per_bin         > SNR_THRESH         (基于原始 hist)
       reflect_mask   : reflectance_per_bin > REFLECT_THRESH
    三者相乘得到 per-bin 的 valid_mask.
 
@@ -176,13 +180,18 @@ class Network(nn.Module):
         # ---- 1) 距离重心 & argmax 门控, 都用原始 hist ----
         dist_per_bin = self._dist_per_bin(hist)  # (B, 62, H, W)
 
-        # ---- 2) 每 bin 的信号量 / 噪声 (基于归一化 hist_k) ----
-        mean_k         = torch.mean(hist_k, dim=1, keepdim=True)    # (B, 1, H, W)
-        signal_per_bin = hist_k - mean_k                            # (B, 62, H, W)
-        noise          = torch.sqrt(mean_k) + NOISE_BIAS            # (B, 1, H, W)
+        # ---- 2a) SNR 用原始 hist (10bit, 未做饱和补偿) 计算 ----
+        # SNR 描述的是真实光子统计噪声, 必须基于原始计数, 否则 hist_k 放大后
+        # 信号和 sqrt(噪声) 都被同一个 k 拉伸, 比值会被夸大, 失去物理意义.
+        mean_raw           = torch.mean(hist, dim=1, keepdim=True)  # (B, 1, H, W)
+        signal_raw_per_bin = hist - mean_raw                        # (B, 62, H, W)
+        noise_raw          = torch.sqrt(mean_raw) + NOISE_BIAS      # (B, 1, H, W)
+        snr_per_bin, snr_mask = self._snr_and_mask(signal_raw_per_bin, noise_raw)
 
-        snr_per_bin,         snr_mask     = self._snr_and_mask(signal_per_bin, noise)
-        reflectance_per_bin, reflect_mask = self._reflectance_and_mask(signal_per_bin, dist_per_bin)
+        # ---- 2b) 反射率用归一化 hist_k 算 (脉冲数无关, 阈值统一) ----
+        mean_k             = torch.mean(hist_k, dim=1, keepdim=True)  # (B, 1, H, W)
+        signal_k_per_bin   = hist_k - mean_k                          # (B, 62, H, W)
+        reflectance_per_bin, reflect_mask = self._reflectance_and_mask(signal_k_per_bin, dist_per_bin)
 
         # ---- 3) 三路 per-bin mask ----
         crosstalk_mask = self._crosstalk_mask(hist_k)                                   # (B, 62, H, W)
