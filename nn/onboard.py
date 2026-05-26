@@ -24,8 +24,12 @@ TOF_W = 40
 PIXELS = TOF_H * TOF_W
 OUT_C = 5
 
-SHOW_W = 520
-SHOW_H = 390
+# 单图显示长短边；ROTATE_90 时自动交换宽高
+SHOW_LONG = 520
+SHOW_SHORT = 390
+# 显示方向开关：先按原始方向，再决定是否顺时针旋转 90°，最后是否水平镜像
+ROTATE_90 = 1
+MIRROR = 0
 HEADER_H = 56
 REC_FPS = 20.0
 
@@ -145,17 +149,53 @@ def _with_text(img_bgr: np.ndarray, text: str, y: int = 24) -> np.ndarray:
     return img_bgr
 
 
-def _pixel_to_disp_xy(px: int, py: int, show_w: int, show_h: int) -> tuple[int, int]:
-    dx = int(np.clip((int(px) + 0.5) * max(show_w, 1) / TOF_W, 0, max(show_w, 1) - 1))
-    dy = int(np.clip((int(py) + 0.5) * max(show_h, 1) / TOF_H, 0, max(show_h, 1) - 1))
+def _get_show_size(rotate_90: bool) -> tuple[int, int]:
+    """返回单图显示尺寸 (W, H)；旋转后同步切换宽高。"""
+    if rotate_90:
+        return SHOW_SHORT, SHOW_LONG
+    return SHOW_LONG, SHOW_SHORT
+
+
+def _orient_for_display(img: np.ndarray, rotate_90: bool, mirror: bool) -> np.ndarray:
+    """按开关变换显示方向：先(可选)顺时针旋转 90°，再(可选)水平镜像。"""
+    import cv2  # type: ignore
+
+    if rotate_90:
+        img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    if mirror:
+        img = cv2.flip(img, 1)
+    return img
+
+
+def _pixel_to_disp_xy(px: int, py: int, show_w: int, show_h: int, rotate_90: bool, mirror: bool) -> tuple[int, int]:
+    sw = max(int(show_w), 1)
+    sh = max(int(show_h), 1)
+    px_i = int(np.clip(px, 0, TOF_W - 1))
+    py_i = int(np.clip(py, 0, TOF_H - 1))
+    if rotate_90:
+        rx = (TOF_H - 1 - py_i) + 0.5
+        dx = int(np.clip(rx * sw / TOF_H, 0, sw - 1))
+        dy = int(np.clip((px_i + 0.5) * sh / TOF_W, 0, sh - 1))
+    else:
+        dx = int(np.clip((px_i + 0.5) * sw / TOF_W, 0, sw - 1))
+        dy = int(np.clip((py_i + 0.5) * sh / TOF_H, 0, sh - 1))
+    if mirror:
+        dx = sw - 1 - dx
     return dx, dy
 
 
-def _disp_xy_to_pixel(dx: int, dy: int, show_w: int, show_h: int) -> tuple[int, int]:
+def _disp_xy_to_pixel(dx: int, dy: int, show_w: int, show_h: int, rotate_90: bool, mirror: bool) -> tuple[int, int]:
     sw = max(int(show_w), 1)
     sh = max(int(show_h), 1)
-    px = int(np.clip(dx * TOF_W / sw, 0, TOF_W - 1))
-    py = int(np.clip(dy * TOF_H / sh, 0, TOF_H - 1))
+    if mirror:
+        dx = sw - 1 - int(dx)
+    if rotate_90:
+        rx = int(dx) * TOF_H / sw
+        py = int(np.clip((TOF_H - 1) - rx, 0, TOF_H - 1))
+        px = int(np.clip(int(dy) * TOF_W / sh, 0, TOF_W - 1))
+    else:
+        px = int(np.clip(int(dx) * TOF_W / sw, 0, TOF_W - 1))
+        py = int(np.clip(int(dy) * TOF_H / sh, 0, TOF_H - 1))
     return px, py
 
 
@@ -182,6 +222,10 @@ def main() -> int:
     print(f"[adb]  pull: {REMOTE_OUTPUT_PATH}")
     print("[mask] dist: conf<=0.5 -> black")
     print(f"[rec]  save mp4 to {RECORD_DIR}")
+
+    rotate_90 = bool(ROTATE_90)
+    mirror = bool(MIRROR)
+    show_w, show_h = _get_show_size(rotate_90)
 
     cv2.namedWindow("ONBOARD_REALTIME", cv2.WINDOW_AUTOSIZE)
     mouse = {"x": 0, "y": 0}
@@ -232,17 +276,17 @@ def main() -> int:
                 ui_cnt = 0
                 fps_tick = now
 
-            dist_big = cv2.resize(_colorize_depth_realtime(dist, conf), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
-            conf_big = cv2.resize(_colorize_gray01(conf), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
-            reflect_big = cv2.resize(_colorize_gray01(reflect), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
-            snr_big = cv2.resize(_colorize_snr(snr, conf > 0.5), (SHOW_W, SHOW_H), interpolation=cv2.INTER_NEAREST)
+            dist_big = cv2.resize(_orient_for_display(_colorize_depth_realtime(dist, conf), rotate_90, mirror), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
+            conf_big = cv2.resize(_orient_for_display(_colorize_gray01(conf), rotate_90, mirror), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
+            reflect_big = cv2.resize(_orient_for_display(_colorize_gray01(reflect), rotate_90, mirror), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
+            snr_big = cv2.resize(_orient_for_display(_colorize_snr(snr, conf > 0.5), rotate_90, mirror), (show_w, show_h), interpolation=cv2.INTER_NEAREST)
 
-            mx = int(np.clip(mouse.get("x", 0), 0, SHOW_W * 2 - 1))
-            my = int(np.clip(int(mouse.get("y", 0)) - int(HEADER_H), 0, SHOW_H * 2 - 1))
-            tile_x0 = 0 if mx < SHOW_W else SHOW_W
-            tile_y0 = 0 if my < SHOW_H else SHOW_H
-            px, py = _disp_xy_to_pixel(mx - tile_x0, my - tile_y0, SHOW_W, SHOW_H)
-            dx, dy = _pixel_to_disp_xy(px, py, SHOW_W, SHOW_H)
+            mx = int(np.clip(mouse.get("x", 0), 0, show_w * 2 - 1))
+            my = int(np.clip(int(mouse.get("y", 0)) - int(HEADER_H), 0, show_h * 2 - 1))
+            tile_x0 = 0 if mx < show_w else show_w
+            tile_y0 = 0 if my < show_h else show_h
+            px, py = _disp_xy_to_pixel(mx - tile_x0, my - tile_y0, show_w, show_h, rotate_90, mirror)
+            dx, dy = _pixel_to_disp_xy(px, py, show_w, show_h, rotate_90, mirror)
 
             for img in [dist_big, conf_big, reflect_big, snr_big]:
                 _draw_marker(img, dx, dy)
@@ -260,7 +304,7 @@ def main() -> int:
 
             view = np.vstack(
                 [
-                    np.zeros((HEADER_H, SHOW_W * 2, 3), dtype=np.uint8),
+                    np.zeros((HEADER_H, show_w * 2, 3), dtype=np.uint8),
                     np.hstack([dist_big, snr_big]),
                     np.hstack([reflect_big, conf_big]),
                 ]
@@ -268,8 +312,8 @@ def main() -> int:
             cv2.putText(view, hover1, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
             cv2.putText(view, hover2, (10, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
             if rec_writer is not None:
-                cv2.circle(view, (SHOW_W * 2 - 24, 20), 7, (0, 0, 255), -1, cv2.LINE_AA)
-                cv2.putText(view, "REC", (SHOW_W * 2 - 72, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 0, 255), 2, cv2.LINE_AA)
+                cv2.circle(view, (show_w * 2 - 24, 20), 7, (0, 0, 255), -1, cv2.LINE_AA)
+                cv2.putText(view, "REC", (show_w * 2 - 72, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 0, 255), 2, cv2.LINE_AA)
 
             if frame_idx < 0:
                 cv2.putText(view, "NO DATA", (10, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 255), 2, cv2.LINE_AA)

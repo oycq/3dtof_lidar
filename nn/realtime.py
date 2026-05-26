@@ -48,7 +48,9 @@ LOG_BASE = 1.06
 # 单图显示长短边；是否旋转时会自动交换宽高
 SHOW_LONG = 520
 SHOW_SHORT = 390
+# 显示方向开关：先按原始方向，再决定是否顺时针旋转 90°，最后是否水平镜像
 ROTATE_90 = 1
+MIRROR = 0
 HEADER_H = 56
 HIST_BINS = 62
 HIST_W = 640
@@ -259,13 +261,27 @@ def _get_show_size(rotate_90: bool) -> Tuple[int, int]:
     return SHOW_LONG, SHOW_SHORT
 
 
-def _disp_xy_to_pixel(dx: int, dy: int, show_w: int, show_h: int, rotate_90: bool) -> Tuple[int, int]:
-    """显示坐标 -> ToF 像素坐标。"""
+def _orient_for_display(img: np.ndarray, rotate_90: bool, mirror: bool) -> np.ndarray:
+    """按开关变换显示方向：先(可选)顺时针旋转 90°，再(可选)水平镜像。"""
+    import cv2  # type: ignore
+
+    if rotate_90:
+        img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    if mirror:
+        img = cv2.flip(img, 1)
+    return img
+
+
+def _disp_xy_to_pixel(dx: int, dy: int, show_w: int, show_h: int, rotate_90: bool, mirror: bool) -> Tuple[int, int]:
+    """显示坐标 -> ToF 像素坐标（按显示开关做反变换）。"""
     sw = max(int(show_w), 1)
     sh = max(int(show_h), 1)
+    if mirror:
+        dx = sw - 1 - int(dx)
     if rotate_90:
-        # 与项目里旧版四宫格一致：rot90CW + flipH，等价于转置。
-        py = int(np.clip(dx * TOF_H / sw, 0, TOF_H - 1))
+        # 顺时针旋转后：display x ↔ TOF_H 维(行的反向), display y ↔ TOF_W 维(列)
+        rx = dx * TOF_H / sw
+        py = int(np.clip((TOF_H - 1) - rx, 0, TOF_H - 1))
         px = int(np.clip(dy * TOF_W / sh, 0, TOF_W - 1))
     else:
         px = int(np.clip(dx * TOF_W / sw, 0, TOF_W - 1))
@@ -273,29 +289,22 @@ def _disp_xy_to_pixel(dx: int, dy: int, show_w: int, show_h: int, rotate_90: boo
     return px, py
 
 
-def _pixel_to_disp_xy(px: int, py: int, show_w: int, show_h: int, rotate_90: bool) -> Tuple[int, int]:
-    """ToF 像素坐标 -> 显示坐标。"""
+def _pixel_to_disp_xy(px: int, py: int, show_w: int, show_h: int, rotate_90: bool, mirror: bool) -> Tuple[int, int]:
+    """ToF 像素坐标 -> 显示坐标（按显示开关做正变换）。"""
     sw = max(int(show_w), 1)
     sh = max(int(show_h), 1)
     px_i = int(np.clip(px, 0, TOF_W - 1))
     py_i = int(np.clip(py, 0, TOF_H - 1))
     if rotate_90:
-        dx = int(np.clip((py_i + 0.5) * sw / TOF_H, 0, sw - 1))
+        rx = (TOF_H - 1 - py_i) + 0.5  # 旋转后图像中的 x 坐标(基于 TOF_H 维)
+        dx = int(np.clip(rx * sw / TOF_H, 0, sw - 1))
         dy = int(np.clip((px_i + 0.5) * sh / TOF_W, 0, sh - 1))
     else:
         dx = int(np.clip((px_i + 0.5) * sw / TOF_W, 0, sw - 1))
         dy = int(np.clip((py_i + 0.5) * sh / TOF_H, 0, sh - 1))
+    if mirror:
+        dx = sw - 1 - dx
     return dx, dy
-
-
-def _orient_for_display(img: np.ndarray, rotate_90: bool) -> np.ndarray:
-    """按显示选项变换方向；旋转模式与旧版四宫格保持一致。"""
-    if not rotate_90:
-        return img
-
-    import cv2  # type: ignore
-
-    return cv2.flip(cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE), 1)
 
 
 def _draw_marker(img_bgr: np.ndarray, x: int, y: int) -> np.ndarray:
@@ -571,6 +580,7 @@ def _render_view(
     show_w: int,
     show_h: int,
     rotate_90: bool,
+    mirror: bool,
     bag_dist_m: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
     """渲染面板 + 直方图 + bins 长条。
@@ -593,7 +603,7 @@ def _render_view(
 
     dist_for_disp = np.where(conf > 0.5, dist, 0.0)
     dist_big = cv2.resize(
-        _orient_for_display(_colorize_depth(dist_for_disp), rotate_90),
+        _orient_for_display(_colorize_depth(dist_for_disp), rotate_90, mirror),
         (show_w, show_h), interpolation=cv2.INTER_NEAREST,
     )
 
@@ -602,19 +612,19 @@ def _render_view(
         0, 255,
     ).astype(np.uint8)
     peak_bgr = cv2.cvtColor(
-        cv2.resize(_orient_for_display(peak_u8, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
+        cv2.resize(_orient_for_display(peak_u8, rotate_90, mirror), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
         cv2.COLOR_GRAY2BGR,
     )
 
     refl_u8 = np.clip(np.rint(np.clip(reflectance, 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
     refl_bgr = cv2.cvtColor(
-        cv2.resize(_orient_for_display(refl_u8, rotate_90), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
+        cv2.resize(_orient_for_display(refl_u8, rotate_90, mirror), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
         cv2.COLOR_GRAY2BGR,
     )
 
     if bag_dist_m is not None:
         bag_panel = cv2.resize(
-            _orient_for_display(_colorize_depth(bag_dist_m), rotate_90),
+            _orient_for_display(_colorize_depth(bag_dist_m), rotate_90, mirror),
             (show_w, show_h), interpolation=cv2.INTER_NEAREST,
         )
 
@@ -622,8 +632,8 @@ def _render_view(
     my = int(np.clip(mouse_y - HEADER_H, 0, show_h * 2 - 1))
     tile_x0 = 0 if mx < show_w else show_w
     tile_y0 = 0 if my < show_h else show_h
-    px, py = _disp_xy_to_pixel(mx - tile_x0, my - tile_y0, show_w, show_h, rotate_90)
-    dx, dy = _pixel_to_disp_xy(px, py, show_w, show_h, rotate_90)
+    px, py = _disp_xy_to_pixel(mx - tile_x0, my - tile_y0, show_w, show_h, rotate_90, mirror)
+    dx, dy = _pixel_to_disp_xy(px, py, show_w, show_h, rotate_90, mirror)
 
     panels = [dist_big, peak_bgr, refl_bgr]
     if bag_dist_m is not None:
@@ -755,6 +765,7 @@ def _run_bag_mode(bag_path_str: str) -> int:
 
     cv2.setUseOptimized(True)
     rotate_90 = bool(ROTATE_90)
+    mirror = bool(MIRROR)
     show_w, show_h = _get_show_size(rotate_90)
 
     bag_path = Path(bag_path_str).resolve()
@@ -842,7 +853,7 @@ def _run_bag_mode(bag_path_str: str) -> int:
         view, hist_img, strip_img, px, py = _render_view(
             all_dist[idx], all_conf[idx], all_peak[idx], all_refl[idx],
             hist.astype(np.float32), mouse["x"], mouse["y"],
-            show_w, show_h, rotate_90,
+            show_w, show_h, rotate_90, mirror,
             bag_dist_m=bag_dist_m,
         )
 
@@ -890,6 +901,7 @@ def main() -> int:
 
     # ---- ADB 实时模式 ----
     rotate_90 = bool(ROTATE_90)
+    mirror = bool(MIRROR)
     show_w, show_h = _get_show_size(rotate_90)
 
     try:
@@ -1004,7 +1016,7 @@ def main() -> int:
             if need_redraw:
                 view, hist_new, strip_new, px, py = _render_view(
                     cached_pred_depth, cached_conf, cached_peak, cached_reflectance,
-                    cached_in, mouse_xy[0], mouse_xy[1], show_w, show_h, rotate_90,
+                    cached_in, mouse_xy[0], mouse_xy[1], show_w, show_h, rotate_90, mirror,
                 )
 
                 dt_fps = now - fps_tick
