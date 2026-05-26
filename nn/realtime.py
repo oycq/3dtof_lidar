@@ -770,11 +770,9 @@ def _run_bag_mode(bag_path_str: str) -> int:
     bag_depth_map = _load_bag_depth_map(bag_path)
 
     nn_dir = Path(__file__).resolve().parent
-    root = nn_dir.parent
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
-    if str(nn_dir) not in sys.path:
-        sys.path.insert(0, str(nn_dir))
+    if str(nn_dir) in sys.path:
+        sys.path.remove(str(nn_dir))
+    sys.path.insert(0, str(nn_dir))
     from net import Network
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -906,11 +904,9 @@ def main() -> int:
         raise RuntimeError("missing dependency torch") from e
 
     nn_dir = Path(__file__).resolve().parent
-    root = nn_dir.parent
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
-    if str(nn_dir) not in sys.path:
-        sys.path.insert(0, str(nn_dir))
+    if str(nn_dir) in sys.path:
+        sys.path.remove(str(nn_dir))
+    sys.path.insert(0, str(nn_dir))
 
     from net import Network  # noqa: E402
 
