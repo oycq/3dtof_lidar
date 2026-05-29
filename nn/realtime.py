@@ -280,8 +280,9 @@ def _disp_xy_to_pixel(dx: int, dy: int, show_w: int, show_h: int, rotate_90: boo
         dx = sw - 1 - int(dx)
     if rotate_90:
         # 顺时针旋转后：display x ↔ TOF_H 维(行的反向), display y ↔ TOF_W 维(列)
-        rx = dx * TOF_H / sw
-        py = int(np.clip((TOF_H - 1) - rx, 0, TOF_H - 1))
+        # 必须先 floor 列号再做反向减法，否则与逆变换/INTER_NEAREST 显示差 1
+        col = int(np.clip(dx * TOF_H / sw, 0, TOF_H - 1))
+        py = int(np.clip((TOF_H - 1) - col, 0, TOF_H - 1))
         px = int(np.clip(dy * TOF_W / sh, 0, TOF_W - 1))
     else:
         px = int(np.clip(dx * TOF_W / sw, 0, TOF_W - 1))
