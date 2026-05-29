@@ -75,13 +75,16 @@ REFLECT_THRESH = 0.025
 # 反射率上限: 避免反射率太高,导致int16量化精度不够
 MAX_REFL = 30.0
 SNR_THRESH = 4.0
-NOISE_BIAS = 3.0
+NOISE_BIAS = 1
 CROSSTALK_MEAN_COEF = 0.66
 # 距离下限(米): 小于该值的候选距离会被钳到该值, 避免近距离重心溢出/负值
 MIN_DIST_M = 0.4
 
 # peak mask 的偏置: 用于 sign(x - peak_val + PEAK_EPS) 在 peak 位置输出 1
 PEAK_EPS = 0.4
+
+# 计算 bin 维均值(背景噪声)时只统计最后 30 个 bin
+MEAN_TAIL_BINS = 30
 
 
 class Network(nn.Module):
@@ -190,14 +193,14 @@ class Network(nn.Module):
         # ---- 2a) SNR 用原始 hist (10bit, 未做饱和补偿) 计算 ----
         # SNR 描述的是真实光子统计噪声, 必须基于原始计数, 否则 hist_k 放大后
         # 信号和 sqrt(噪声) 都被同一个 k 拉伸, 比值会被夸大, 失去物理意义.
-        mean_raw           = torch.mean(hist, dim=1, keepdim=True)  # (B, 1, H, W)
+        _, hist_tail       = torch.split(hist, [62 - MEAN_TAIL_BINS, MEAN_TAIL_BINS], dim=1)  # 只取最后 30 个 bin
+        mean_raw           = torch.mean(hist_tail, dim=1, keepdim=True)  # (B, 1, H, W)
         signal_raw_per_bin = hist - mean_raw                        # (B, 62, H, W)
         noise_raw          = torch.sqrt(mean_raw) + NOISE_BIAS      # (B, 1, H, W)
         snr_per_bin, snr_mask = self._snr_and_mask(signal_raw_per_bin, noise_raw)
 
         # ---- 2b) 反射率用归一化 hist_k 算 (脉冲数无关, 阈值统一) ----
-        mean_k             = torch.mean(hist_k, dim=1, keepdim=True)  # (B, 1, H, W)
-        signal_k_per_bin   = hist_k - mean_k                          # (B, 62, H, W)
+        signal_k_per_bin   = signal_raw_per_bin * k                   # (B, 62, H, W)
         reflectance_per_bin, reflect_mask = self._reflectance_and_mask(signal_k_per_bin, dist_per_bin)
 
         # ---- 3) 三路 per-bin mask ----
