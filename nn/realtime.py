@@ -5,12 +5,11 @@
 nn/realtime.py
 
 实时读取 tof.raw（内置 ToFRealtimeServer 采集线程），
-运行模型并实时显示 4 张图：
-- DIST: 预测距离（伪彩）
-- SNR: 信噪比（灰度）
-- PEAK: 峰值（灰度）
-- REFLECT: 反射率（灰度）
-- HIST: 鼠标悬停点的输入直方图（实时刷新）
+运行模型并在【单个仪表盘窗口】中显示：
+- 主视图: 预测距离(伪彩) / 峰值 / 反射率
+- BINS:   鼠标悬停像素的 bins 表格
+- HIST:   鼠标悬停像素的输入直方图（实时刷新）
+- 右下角: 操作指引 + 深度色条图例
 
 交互：
 - 鼠标悬停：显示 dist/snr/conf/peak/reflectance
@@ -665,6 +664,140 @@ def _render_view(
     return view, hist_img, strip_img, px, py
 
 
+# ======================== 单窗口仪表盘合成 ========================
+
+DASH_PAD = 14
+DASH_GAP = 14
+DASH_BANNER_H = 46
+DASH_BG = (24, 22, 20)               # 深色背景 (BGR)
+DASH_PANEL_BG = (34, 31, 28)
+DASH_PANEL_BORDER = (78, 72, 66)
+DASH_ACCENT = (60, 190, 255)         # 强调色（暖橙）
+DASH_TITLE_COLOR = (244, 244, 246)
+DASH_SUB_COLOR = (172, 172, 182)
+
+# 主视图在合成画布中的固定偏移（鼠标坐标换算用）
+MAIN_OFFSET_X = DASH_PAD
+MAIN_OFFSET_Y = DASH_BANNER_H + DASH_PAD
+
+REALTIME_HINTS = [
+    "SPACE   start / stop REC",
+    "0       save raw frame",
+    "Hover   inspect pixel",
+    "ESC / Q quit",
+]
+BAG_HINTS = [
+    "A / D   prev / next frame",
+    "SPACE   play / pause",
+    "Slider  seek frame",
+    "Hover   inspect pixel",
+    "ESC / Q quit",
+]
+
+
+def _draw_info_card(canvas: np.ndarray, x: int, y: int, w: int, h: int, lines: list[str]) -> None:
+    """在右下角绘制操作指引卡 + 深度色条图例。"""
+    import cv2  # type: ignore
+
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), DASH_PANEL_BG, -1)
+    cv2.rectangle(canvas, (x - 1, y - 1), (x + w, y + h), DASH_PANEL_BORDER, 1, cv2.LINE_AA)
+    cv2.rectangle(canvas, (x, y), (x + w, y + 30), (46, 42, 38), -1)
+    cv2.putText(canvas, "GUIDE", (x + 12, y + 21),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.56, DASH_ACCENT, 1, cv2.LINE_AA)
+
+    ty = y + 30 + 28
+    for ln in lines:
+        cv2.putText(canvas, ln, (x + 16, ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (214, 214, 220), 1, cv2.LINE_AA)
+        ty += 28
+
+    legend_h = 18
+    legend_y = ty + 12
+    if legend_y + legend_h + 26 <= y + h:
+        cv2.putText(canvas, "DEPTH (JET)", (x + 16, legend_y - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, DASH_SUB_COLOR, 1, cv2.LINE_AA)
+        lx0 = x + 16
+        lx1 = x + w - 16
+        if lx1 > lx0:
+            grad = np.linspace(255, 0, lx1 - lx0).astype(np.uint8).reshape(1, -1)
+            bar = cv2.applyColorMap(np.repeat(grad, legend_h, axis=0), cv2.COLORMAP_JET)
+            canvas[legend_y:legend_y + legend_h, lx0:lx1] = bar
+            cv2.rectangle(canvas, (lx0 - 1, legend_y - 1), (lx1, legend_y + legend_h),
+                          DASH_PANEL_BORDER, 1, cv2.LINE_AA)
+            cv2.putText(canvas, "near", (lx0, legend_y + legend_h + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, DASH_SUB_COLOR, 1, cv2.LINE_AA)
+            (tw, _), _ = cv2.getTextSize("far", cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+            cv2.putText(canvas, "far", (lx1 - tw, legend_y + legend_h + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, DASH_SUB_COLOR, 1, cv2.LINE_AA)
+
+
+def _compose_dashboard(
+    view: np.ndarray,
+    hist_img: np.ndarray,
+    strip_img: np.ndarray,
+    status_text: str = "",
+    hint_lines: list[str] | None = None,
+) -> np.ndarray:
+    """把主视图 / 直方图 / bins 表格合成到单张深色仪表盘画布。
+
+    布局：
+        ┌── banner ───────────────────────────────┐
+        │ NN ToF Realtime              <status>    │
+        ├──────────┬────────┬──────────────────────┤
+        │  MAIN    │  BINS  │  HIST                 │
+        │ (2x2)    │ (table)│  ───────              │
+        │          │        │  GUIDE / legend       │
+        └──────────┴────────┴──────────────────────┘
+    主视图固定置于 (MAIN_OFFSET_X, MAIN_OFFSET_Y)，鼠标坐标据此换算。
+    """
+    import cv2  # type: ignore
+
+    mh, mw = view.shape[:2]
+    sh, sw = strip_img.shape[:2]
+    hh, hw = hist_img.shape[:2]
+
+    pad, gap, banner = DASH_PAD, DASH_GAP, DASH_BANNER_H
+    content_h = max(mh, sh, hh)
+
+    main_x, main_y = pad, banner + pad
+    strip_x, strip_y = main_x + mw + gap, banner + pad
+    hist_x, hist_y = strip_x + sw + gap, banner + pad
+
+    canvas_w = hist_x + hw + pad
+    canvas_h = banner + pad + content_h + pad
+
+    canvas = np.empty((canvas_h, canvas_w, 3), dtype=np.uint8)
+    canvas[:] = DASH_BG
+
+    cv2.rectangle(canvas, (0, 0), (canvas_w, banner), (38, 35, 32), -1)
+    cv2.line(canvas, (0, banner - 1), (canvas_w, banner - 1), DASH_ACCENT, 2, cv2.LINE_AA)
+    cv2.circle(canvas, (pad + 6, banner // 2), 6, DASH_ACCENT, -1, cv2.LINE_AA)
+    cv2.putText(canvas, "NN  ToF  Realtime", (pad + 22, 31),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.82, DASH_TITLE_COLOR, 2, cv2.LINE_AA)
+    if status_text:
+        (tw, _), _ = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 1)
+        cv2.putText(canvas, status_text, (canvas_w - tw - pad, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, DASH_SUB_COLOR, 1, cv2.LINE_AA)
+
+    def place(img: np.ndarray, x: int, y: int) -> None:
+        ih, iw = img.shape[:2]
+        canvas[y:y + ih, x:x + iw] = img
+        cv2.rectangle(canvas, (x - 1, y - 1), (x + iw, y + ih), DASH_PANEL_BORDER, 1, cv2.LINE_AA)
+
+    place(view, main_x, main_y)
+    place(strip_img, strip_x, strip_y)
+    place(hist_img, hist_x, hist_y)
+
+    info_x = hist_x
+    info_y = hist_y + hh + gap
+    info_w = hw
+    info_h = (main_y + mh) - info_y
+    if info_h > 70 and hint_lines:
+        _draw_info_card(canvas, info_x, info_y, info_w, info_h, hint_lines)
+
+    return canvas
+
+
 # ======================== BAG/MCAP 解析 ========================
 
 def _parse_vp_tof_info(payload: bytes):
@@ -807,11 +940,7 @@ def _run_bag_mode(bag_path_str: str) -> int:
     print("[OK] 推理完成")
 
     win = "NN_REALTIME"
-    hist_win = "HIST"
-    strip_win = "BINS"
     cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow(hist_win, cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow(strip_win, cv2.WINDOW_AUTOSIZE)
     cv2.createTrackbar("frame", win, 0, n - 1, lambda _: None)
 
     mouse: dict = {"x": 0, "y": 0}
@@ -853,7 +982,8 @@ def _run_bag_mode(bag_path_str: str) -> int:
 
         view, hist_img, strip_img, px, py = _render_view(
             all_dist[idx], all_conf[idx], all_peak[idx], all_refl[idx],
-            hist.astype(np.float32), mouse["x"], mouse["y"],
+            hist.astype(np.float32),
+            mouse["x"] - MAIN_OFFSET_X, mouse["y"] - MAIN_OFFSET_Y,
             show_w, show_h, rotate_90, mirror,
             bag_dist_m=bag_dist_m,
         )
@@ -870,9 +1000,9 @@ def _run_bag_mode(bag_path_str: str) -> int:
         _with_text(view[:HEADER_H], hover1, y=22)
         _with_text(view[:HEADER_H], hover2, y=46)
 
-        cv2.imshow(win, view)
-        cv2.imshow(hist_win, hist_img)
-        cv2.imshow(strip_win, strip_img)
+        status = f"frame {idx}/{n - 1}   {'PLAY' if playing else 'PAUSE'}"
+        canvas = _compose_dashboard(view, hist_img, strip_img, status, BAG_HINTS)
+        cv2.imshow(win, canvas)
 
         key = cv2.waitKeyEx(20)
         if key in (27, ord("q"), ord("Q")):
@@ -928,8 +1058,6 @@ def main() -> int:
     net.eval()
 
     cv2.namedWindow("NN_REALTIME", cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow("HIST", cv2.WINDOW_AUTOSIZE)
-    cv2.namedWindow("BINS", cv2.WINDOW_AUTOSIZE)
     mouse = {"x": 0, "y": 0}
 
     def on_mouse(event: int, x: int, y: int, flags: int, userdata: object) -> None:
@@ -951,9 +1079,7 @@ def main() -> int:
     cached_reflectance: np.ndarray | None = None
     cached_conf: np.ndarray | None = None
     last_mouse_xy = (-1, -1)
-    view_cache: np.ndarray | None = None
-    hist_cache: np.ndarray | None = None
-    strip_cache: np.ndarray | None = None
+    frame_cache: np.ndarray | None = None
 
     io_fps = 0.0
     infer_fps = 0.0
@@ -1008,16 +1134,16 @@ def main() -> int:
             need_redraw = (
                 got_new_frame
                 or (mouse_xy != last_mouse_xy)
-                or (view_cache is None)
-                or (hist_cache is None)
-                or (strip_cache is None)
+                or (frame_cache is None)
                 or (rec_on != last_rec_on)
             )
 
             if need_redraw:
                 view, hist_new, strip_new, px, py = _render_view(
                     cached_pred_depth, cached_conf, cached_peak, cached_reflectance,
-                    cached_in, mouse_xy[0], mouse_xy[1], show_w, show_h, rotate_90, mirror,
+                    cached_in,
+                    mouse_xy[0] - MAIN_OFFSET_X, mouse_xy[1] - MAIN_OFFSET_Y,
+                    show_w, show_h, rotate_90, mirror,
                 )
 
                 dt_fps = now - fps_tick
@@ -1052,18 +1178,18 @@ def main() -> int:
                         1,
                         cv2.LINE_AA,
                     )
-                view_cache = view
-                hist_cache = hist_new
-                strip_cache = strip_new
+                status = (
+                    f"io {io_fps:.1f} | infer {infer_fps:.1f} | ui {ui_fps:.1f} fps"
+                    + ("   * REC" if rec_on else "")
+                )
+                frame_cache = _compose_dashboard(view, hist_new, strip_new, status, REALTIME_HINTS)
                 last_mouse_xy = mouse_xy
                 last_rec_on = rec_on
 
             ui_cnt += 1
-            cv2.imshow("NN_REALTIME", view_cache)
-            cv2.imshow("HIST", hist_cache)
-            cv2.imshow("BINS", strip_cache)
-            if rec_writer is not None and view_cache is not None:
-                rec_writer.write(view_cache)
+            cv2.imshow("NN_REALTIME", frame_cache)
+            if rec_writer is not None and frame_cache is not None:
+                rec_writer.write(frame_cache)
 
             k = int(cv2.waitKey(1) & 0xFF)
             if k == 32:  # Space: toggle recording
@@ -1073,7 +1199,7 @@ def main() -> int:
                         RECORD_DIR.mkdir(parents=True, exist_ok=True)
                         rec_path = str(RECORD_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
                         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                        writer = cv2.VideoWriter(rec_path, fourcc, max(float(REC_FPS), 1.0), (view_cache.shape[1], view_cache.shape[0]))
+                        writer = cv2.VideoWriter(rec_path, fourcc, max(float(REC_FPS), 1.0), (frame_cache.shape[1], frame_cache.shape[0]))
                         if not writer.isOpened():
                             writer.release()
                             raise RuntimeError("VideoWriter open failed")
