@@ -689,14 +689,28 @@ REALTIME_HINTS = [
 BAG_HINTS = [
     "A / D   prev / next frame",
     "SPACE   play / pause",
-    "Slider  seek frame",
+    "Drag    seek (bar below)",
     "Hover   inspect pixel",
     "ESC / Q quit",
 ]
 
 
-def _draw_info_card(canvas: np.ndarray, x: int, y: int, w: int, h: int, lines: list[str]) -> None:
-    """在右下角绘制操作指引卡 + 深度色条图例。"""
+def _draw_info_card(
+    canvas: np.ndarray,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    lines: list[str],
+    progress_frac: float | None = None,
+    progress_label: str = "",
+    bar_rect_out: dict | None = None,
+) -> None:
+    """在右下角绘制操作指引卡 + 深度色条图例（可选：底部进度条）。
+
+    progress_frac: 0..1 时在图例下方绘制进度条（用于 BAG 回放拖动）。
+    bar_rect_out:  若提供，写入进度条可点击区域 {x0,y0,x1,y1}（画布坐标）。
+    """
     import cv2  # type: ignore
 
     cv2.rectangle(canvas, (x, y), (x + w, y + h), DASH_PANEL_BG, -1)
@@ -713,6 +727,7 @@ def _draw_info_card(canvas: np.ndarray, x: int, y: int, w: int, h: int, lines: l
 
     legend_h = 18
     legend_y = ty + 12
+    legend_bottom = legend_y + legend_h + 18
     if legend_y + legend_h + 26 <= y + h:
         cv2.putText(canvas, "DEPTH (JET)", (x + 16, legend_y - 4),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, DASH_SUB_COLOR, 1, cv2.LINE_AA)
@@ -730,6 +745,53 @@ def _draw_info_card(canvas: np.ndarray, x: int, y: int, w: int, h: int, lines: l
             cv2.putText(canvas, "far", (lx1 - tw, legend_y + legend_h + 18),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, DASH_SUB_COLOR, 1, cv2.LINE_AA)
 
+    if progress_frac is not None:
+        _draw_progress_bar(
+            canvas, x, w, legend_bottom + 22, y + h,
+            float(progress_frac), progress_label, bar_rect_out,
+        )
+
+
+def _draw_progress_bar(
+    canvas: np.ndarray,
+    x: int,
+    w: int,
+    top_y: int,
+    card_bottom: int,
+    frac: float,
+    label: str,
+    bar_rect_out: dict | None,
+) -> None:
+    """在信息卡底部绘制可拖动进度条（BAG 回放用）。"""
+    import cv2  # type: ignore
+
+    bar_h = 14
+    bx0 = x + 16
+    bx1 = x + w - 16
+    by0 = int(top_y)
+    by1 = by0 + bar_h
+    if bx1 <= bx0 or by1 + 6 > card_bottom:
+        return
+
+    if label:
+        cv2.putText(canvas, label, (bx0, by0 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, DASH_SUB_COLOR, 1, cv2.LINE_AA)
+
+    f = float(np.clip(frac, 0.0, 1.0))
+    cv2.rectangle(canvas, (bx0, by0), (bx1, by1), (52, 48, 44), -1)
+    fx = bx0 + int(round((bx1 - bx0) * f))
+    if fx > bx0:
+        cv2.rectangle(canvas, (bx0, by0), (fx, by1), DASH_ACCENT, -1)
+    cv2.rectangle(canvas, (bx0 - 1, by0 - 1), (bx1, by1), DASH_PANEL_BORDER, 1, cv2.LINE_AA)
+    cv2.circle(canvas, (int(np.clip(fx, bx0, bx1)), by0 + bar_h // 2), 7,
+               DASH_TITLE_COLOR, -1, cv2.LINE_AA)
+
+    if bar_rect_out is not None:
+        bar_rect_out["x0"] = bx0
+        bar_rect_out["x1"] = bx1
+        bar_rect_out["y0"] = by0
+        bar_rect_out["y1"] = by1
+
 
 def _compose_dashboard(
     view: np.ndarray,
@@ -737,6 +799,9 @@ def _compose_dashboard(
     strip_img: np.ndarray,
     status_text: str = "",
     hint_lines: list[str] | None = None,
+    progress_frac: float | None = None,
+    progress_label: str = "",
+    bar_rect_out: dict | None = None,
 ) -> np.ndarray:
     """把主视图 / 直方图 / bins 表格合成到单张深色仪表盘画布。
 
@@ -793,7 +858,12 @@ def _compose_dashboard(
     info_w = hw
     info_h = (main_y + mh) - info_y
     if info_h > 70 and hint_lines:
-        _draw_info_card(canvas, info_x, info_y, info_w, info_h, hint_lines)
+        _draw_info_card(
+            canvas, info_x, info_y, info_w, info_h, hint_lines,
+            progress_frac=progress_frac,
+            progress_label=progress_label,
+            bar_rect_out=bar_rect_out,
+        )
 
     return canvas
 
@@ -941,13 +1011,37 @@ def _run_bag_mode(bag_path_str: str) -> int:
 
     win = "NN_REALTIME"
     cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
-    cv2.createTrackbar("frame", win, 0, n - 1, lambda _: None)
 
     mouse: dict = {"x": 0, "y": 0}
+    bar_rect: dict = {}          # 进度条画布坐标，由 _compose_dashboard 回填
+    seek: dict = {"idx": None}   # 拖动进度条产生的目标帧
+
+    def _seek_from_x(mx: int) -> None:
+        x0 = bar_rect.get("x0")
+        x1 = bar_rect.get("x1")
+        if x0 is None or x1 is None or x1 <= x0:
+            return
+        frac = (float(mx) - float(x0)) / float(x1 - x0)
+        seek["idx"] = int(round(float(np.clip(frac, 0.0, 1.0)) * (n - 1)))
+
+    def _in_bar(x: int, y: int) -> bool:
+        if bar_rect.get("y0") is None:
+            return False
+        return (
+            bar_rect["x0"] - 8 <= x <= bar_rect["x1"] + 8
+            and bar_rect["y0"] - 8 <= y <= bar_rect["y1"] + 8
+        )
 
     def on_mouse(event: int, x: int, y: int, flags: int, userdata: object) -> None:
-        if int(event) == int(cv2.EVENT_MOUSEMOVE):
-            mouse["x"], mouse["y"] = int(x), int(y)
+        mouse["x"], mouse["y"] = int(x), int(y)
+        if int(event) == int(cv2.EVENT_LBUTTONDOWN) and _in_bar(x, y):
+            _seek_from_x(x)
+        elif (
+            int(event) == int(cv2.EVENT_MOUSEMOVE)
+            and (int(flags) & int(cv2.EVENT_FLAG_LBUTTON))
+            and _in_bar(x, y)
+        ):
+            _seek_from_x(x)
 
     cv2.setMouseCallback(win, on_mouse)
 
@@ -958,9 +1052,10 @@ def _run_bag_mode(bag_path_str: str) -> int:
     print(f"[INFO] 共 {n} 帧, A/D ← → 切帧, 空格 播放/暂停, ESC 退出")
 
     while True:
-        tb_pos = cv2.getTrackbarPos("frame", win)
-        if tb_pos != idx and not playing:
-            idx = max(0, min(tb_pos, n - 1))
+        if seek["idx"] is not None:
+            idx = max(0, min(int(seek["idx"]), n - 1))
+            seek["idx"] = None
+            playing = False
 
         now_ms = int(cv2.getTickCount() * 1000 / cv2.getTickFrequency())
         if playing and now_ms >= next_play_ms:
@@ -968,7 +1063,6 @@ def _run_bag_mode(bag_path_str: str) -> int:
                 idx += 1
             else:
                 playing = False
-            cv2.setTrackbarPos("frame", win, idx)
             next_play_ms = now_ms + play_interval_ms
 
         header, hist = frames[idx]
@@ -1001,7 +1095,13 @@ def _run_bag_mode(bag_path_str: str) -> int:
         _with_text(view[:HEADER_H], hover2, y=46)
 
         status = f"frame {idx}/{n - 1}   {'PLAY' if playing else 'PAUSE'}"
-        canvas = _compose_dashboard(view, hist_img, strip_img, status, BAG_HINTS)
+        progress_frac = (idx / (n - 1)) if n > 1 else 0.0
+        canvas = _compose_dashboard(
+            view, hist_img, strip_img, status, BAG_HINTS,
+            progress_frac=progress_frac,
+            progress_label=f"FRAME  {idx}/{n - 1}",
+            bar_rect_out=bar_rect,
+        )
         cv2.imshow(win, canvas)
 
         key = cv2.waitKeyEx(20)
@@ -1012,10 +1112,8 @@ def _run_bag_mode(bag_path_str: str) -> int:
             next_play_ms = int(cv2.getTickCount() * 1000 / cv2.getTickFrequency())
         if key in (2424832, ord("a"), ord("A")) and idx > 0:
             idx -= 1
-            cv2.setTrackbarPos("frame", win, idx)
         if key in (2555904, ord("d"), ord("D")) and idx < n - 1:
             idx += 1
-            cv2.setTrackbarPos("frame", win, idx)
 
     cv2.destroyAllWindows()
     return 0
