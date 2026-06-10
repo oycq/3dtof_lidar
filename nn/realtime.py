@@ -80,13 +80,29 @@ LOCAL_RAW_PATH = LOCAL_CACHE_DIR / "tof.raw"
 ADB_PULL_TIMEOUT_S = 0.9
 
 # BAG/MCAP 模式常量 (--bag)
-_VPI_HEADER_FMT = "<B3xIQB1xHIIfff"
-_VPI_HEADER_SIZE = struct.calcsize(_VPI_HEADER_FMT)  # 40
 _BAG_PIXELS = TOF_H * TOF_W
 _BAG_RAW_U16_COUNT = _BAG_PIXELS * TOF_C
 _BAG_RAW_BYTES = _BAG_RAW_U16_COUNT * 2
 _BAG_RESERVED_BYTES = 8 * 2
-_BAG_PAYLOAD_SIZE = _VPI_HEADER_SIZE + _BAG_RAW_BYTES + _BAG_RESERVED_BYTES
+
+# ---- 旧协议 V1: header(40) -> tof_raw -> reserved(16) ----
+# 字段顺序: is_valid, frame_id, timestamp, work_mode, bin_mode, light_count,
+#           expo_time, pulse_width, rx_temp, tx_temp
+_VPI_HEADER_FMT = "<B3xIQB1xHIIfff"
+_VPI_HEADER_SIZE = struct.calcsize(_VPI_HEADER_FMT)  # 40
+_BAG_PAYLOAD_SIZE = _VPI_HEADER_SIZE + _BAG_RAW_BYTES + _BAG_RESERVED_BYTES  # 153656
+
+# ---- 新协议 V2: header(40) -> reserved(16) -> tof_metadata -> tof_raw ----
+# 字段顺序: timestamp, is_valid, work_mode, bin_mode, frame_id, light_count,
+#           expo_time, pulse_width, rx_temp, tx_temp, vspad(新增)
+# tof_metadata[TOF_W * TOF_BIN_MAX] = 40*64 = 2560 u16 = 5120B，插在 raw 之前
+_VPI_HEADER_FMT_V2 = "<QBBHIIIffff"
+_VPI_HEADER_SIZE_V2 = struct.calcsize(_VPI_HEADER_FMT_V2)  # 40
+_BAG_METADATA_BYTES = (TOF_W * TOF_C) * 2  # 5120
+_BAG_PAYLOAD_SIZE_V2 = (
+    _VPI_HEADER_SIZE_V2 + _BAG_RESERVED_BYTES + _BAG_METADATA_BYTES + _BAG_RAW_BYTES
+)  # 158776
+
 _BAG_RAW_TOPIC = "sensor/vp_tof_info"
 _BAG_PLAY_HZ = 10.0
 
@@ -111,6 +127,7 @@ class TofInfoHeader:
     pulse_width: float
     rx_temp: float
     tx_temp: float
+    vspad: float = 0.0  # V2 新增；V1 包无此字段，默认 0.0
 
 
 @dataclass(frozen=True)
@@ -202,7 +219,7 @@ class ToFRealtimeServer:
                     continue
                 out = LOCAL_RAW_PATH.read_bytes()
                 if len(out) >= expected:
-                    return bytes(out[:expected])
+                    return bytes(out)
             except Exception:
                 pass
             if k < retr:
@@ -242,15 +259,15 @@ class ToFRealtimeServer:
 
 
 def tof_histograms_from_u16(raw_u16: np.ndarray) -> np.ndarray:
-    """从包含头部的 tof.raw(uint16) 解析 (30,40,64) 直方图。"""
-    header_words = int(TOF_RAW_HEADER_BYTES // 2)
-    if raw_u16.size <= header_words:
-        return np.zeros((TOF_H, TOF_W, TOF_C), dtype=np.uint16)
-    data = raw_u16[header_words:]
+    """从 tof.raw(uint16) 解析 (30,40,64) 直方图。
+
+    直接取末尾的 30*40*64 个值，无需关心前面头部到底有多少字节，
+    兼容不同头部长度的数据源。
+    """
     expected = TOF_H * TOF_W * TOF_C
-    if data.size < expected:
+    if raw_u16.size < expected:
         return np.zeros((TOF_H, TOF_W, TOF_C), dtype=np.uint16)
-    return data[:expected].reshape((TOF_H, TOF_W, TOF_C)).astype(np.uint16, copy=False)
+    return raw_u16[-expected:].reshape((TOF_H, TOF_W, TOF_C)).astype(np.uint16, copy=False)
 
 
 def _get_show_size(rotate_90: bool) -> Tuple[int, int]:
@@ -871,16 +888,39 @@ def _compose_dashboard(
 # ======================== BAG/MCAP 解析 ========================
 
 def _parse_vp_tof_info(payload: bytes):
-    """解析 VpTofInfo 消息，返回 (TofInfoHeader, hist(30,40,64)) 或 None。"""
-    if len(payload) < _BAG_PAYLOAD_SIZE:
+    """解析 VpTofInfo 消息，返回 (TofInfoHeader, hist(30,40,64)) 或 None。
+
+    自动兼容两种协议（按 payload 长度判别，新包比旧包多 tof_metadata 5120B）：
+      - V2(新): header(40) -> reserved(16) -> tof_metadata(5120) -> tof_raw
+                字段顺序变化，且新增 vspad。raw 偏移 = 40+16+5120 = 5176。
+      - V1(旧): header(40) -> tof_raw -> reserved(16)。raw 偏移 = 40。
+    """
+    n = len(payload)
+    if n >= _BAG_PAYLOAD_SIZE_V2:
+        # 新协议 V2
+        vals = struct.unpack_from(_VPI_HEADER_FMT_V2, payload, 0)
+        header = TofInfoHeader(
+            is_valid=vals[1], frame_id=vals[4], timestamp_us=vals[0],
+            work_mode=vals[2], bin_mode=vals[3], light_count=vals[5],
+            expo_time=vals[6], pulse_width=vals[7], rx_temp=vals[8], tx_temp=vals[9],
+            vspad=vals[10],
+        )
+        raw_off = _VPI_HEADER_SIZE_V2 + _BAG_RESERVED_BYTES + _BAG_METADATA_BYTES  # 5176
+    elif n >= _BAG_PAYLOAD_SIZE:
+        # 旧协议 V1
+        vals = struct.unpack_from(_VPI_HEADER_FMT, payload, 0)
+        header = TofInfoHeader(
+            is_valid=vals[0], frame_id=vals[1], timestamp_us=vals[2],
+            work_mode=vals[3], bin_mode=vals[4], light_count=vals[5],
+            expo_time=vals[6], pulse_width=vals[7], rx_temp=vals[8], tx_temp=vals[9],
+        )
+        raw_off = _VPI_HEADER_SIZE
+    else:
         return None
-    vals = struct.unpack_from(_VPI_HEADER_FMT, payload, 0)
-    header = TofInfoHeader(
-        is_valid=vals[0], frame_id=vals[1], timestamp_us=vals[2],
-        work_mode=vals[3], bin_mode=vals[4], light_count=vals[5],
-        expo_time=vals[6], pulse_width=vals[7], rx_temp=vals[8], tx_temp=vals[9],
-    )
-    raw_all = np.frombuffer(payload[_VPI_HEADER_SIZE:_VPI_HEADER_SIZE + _BAG_RAW_BYTES], dtype="<u2")
+
+    raw_all = np.frombuffer(payload[raw_off:raw_off + _BAG_RAW_BYTES], dtype="<u2")
+    if raw_all.size < _BAG_PIXELS * TOF_C:
+        return None
     hist = raw_all[:_BAG_PIXELS * TOF_C].reshape(TOF_H, TOF_W, TOF_C).copy()
     return header, hist
 
