@@ -74,7 +74,7 @@ else:
 REFLECT_THRESH = 0.025
 # 反射率上限: 避免反射率太高,导致int16量化精度不够
 MAX_REFL = 30.0
-SNR_THRESH = 4.0
+SNR_THRESH = 5.0
 NOISE_BIAS = 1
 CROSSTALK_MEAN_COEF = 0.66
 # 距离下限(米): 小于该值的候选距离会被钳到该值, 避免近距离重心溢出/负值
