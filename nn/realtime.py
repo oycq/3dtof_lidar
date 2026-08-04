@@ -733,56 +733,29 @@ DASH_SUB_COLOR = (172, 172, 182)
 MAIN_OFFSET_X = DASH_PAD
 MAIN_OFFSET_Y = DASH_BANNER_H + DASH_PAD
 
-REALTIME_HINTS = [
-    "SPACE   start / stop REC",
-    "0       save raw frame",
-    "Hover   inspect pixel",
-    "ESC / Q quit",
-]
-BAG_HINTS = [
-    "A / D   prev / next frame",
-    "SPACE   play / pause",
-    "Drag    seek (bar below)",
-    "Hover   inspect pixel",
-    "ESC / Q quit",
-]
-
-
-def _draw_info_card(
+def _draw_seek_card(
     canvas: np.ndarray,
     x: int,
     y: int,
     w: int,
     h: int,
-    lines: list[str],
-    progress_frac: float | None = None,
+    progress_frac: float,
     progress_label: str = "",
     bar_rect_out: dict | None = None,
 ) -> None:
-    """在右下角绘制操作指引卡（可选：底部进度条）。
+    """在右下角绘制 BAG 回放进度条卡片。
 
-    progress_frac: 0..1 时在指引下方绘制进度条（用于 BAG 回放拖动）。
-    bar_rect_out:  若提供，写入进度条可点击区域 {x0,y0,x1,y1}（画布坐标）。
+    bar_rect_out: 若提供，写入进度条可点击区域 {x0,y0,x1,y1}（画布坐标）。
     """
     import cv2  # type: ignore
 
     cv2.rectangle(canvas, (x, y), (x + w, y + h), DASH_PANEL_BG, -1)
     cv2.rectangle(canvas, (x - 1, y - 1), (x + w, y + h), DASH_PANEL_BORDER, 1, cv2.LINE_AA)
-    cv2.rectangle(canvas, (x, y), (x + w, y + 30), (46, 42, 38), -1)
-    cv2.putText(canvas, "GUIDE", (x + 12, y + 21),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.56, DASH_ACCENT, 1, cv2.LINE_AA)
 
-    ty = y + 30 + 28
-    for ln in lines:
-        cv2.putText(canvas, ln, (x + 16, ty),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (214, 214, 220), 1, cv2.LINE_AA)
-        ty += 28
-
-    if progress_frac is not None:
-        _draw_progress_bar(
-            canvas, x, w, ty + 16, y + h,
-            float(progress_frac), progress_label, bar_rect_out,
-        )
+    _draw_progress_bar(
+        canvas, x, w, y + (h - 14) // 2, y + h,
+        float(progress_frac), progress_label, bar_rect_out,
+    )
 
 
 def _draw_progress_bar(
@@ -831,7 +804,6 @@ def _compose_dashboard(
     hist_img: np.ndarray,
     strip_img: np.ndarray,
     status_text: str = "",
-    hint_lines: list[str] | None = None,
     hover_lines: list[str] | None = None,
     progress_frac: float | None = None,
     progress_label: str = "",
@@ -845,7 +817,7 @@ def _compose_dashboard(
         ├──────────┬────────┬──────────────────────┤
         │  MAIN    │  BINS  │  HOVER INFO           │
         │ (2x2)    │ (table)│  HIST                 │
-        │          │        │  GUIDE / legend       │
+        │          │        │  SEEK BAR (bag)       │
         └──────────┴────────┴──────────────────────┘
     主视图固定置于 (MAIN_OFFSET_X, MAIN_OFFSET_Y)，鼠标坐标据此换算。
     """
@@ -910,10 +882,10 @@ def _compose_dashboard(
     info_y = hist_y + hh + gap
     info_w = hw
     info_h = (main_y + mh) - info_y
-    if info_h > 70 and hint_lines:
-        _draw_info_card(
-            canvas, info_x, info_y, info_w, info_h, hint_lines,
-            progress_frac=progress_frac,
+    if info_h > 40 and progress_frac is not None:
+        _draw_seek_card(
+            canvas, info_x, info_y, info_w, info_h,
+            float(progress_frac),
             progress_label=progress_label,
             bar_rect_out=bar_rect_out,
         )
@@ -1172,7 +1144,7 @@ def _run_bag_mode(bag_path_str: str) -> int:
         status = f"frame {idx}/{n - 1}   {'PLAY' if playing else 'PAUSE'}"
         progress_frac = (idx / (n - 1)) if n > 1 else 0.0
         canvas = _compose_dashboard(
-            view, hist_img, strip_img, status, BAG_HINTS,
+            view, hist_img, strip_img, status,
             hover_lines=hover_lines,
             progress_frac=progress_frac,
             progress_label=f"FRAME  {idx}/{n - 1}",
@@ -1356,7 +1328,7 @@ def main() -> int:
                     + ("   * REC" if rec_on else "")
                 )
                 frame_cache = _compose_dashboard(
-                    view, hist_new, strip_new, status, REALTIME_HINTS,
+                    view, hist_new, strip_new, status,
                     hover_lines=hover_lines,
                 )
                 last_mouse_xy = mouse_xy
