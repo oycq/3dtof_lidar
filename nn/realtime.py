@@ -9,10 +9,11 @@ nn/realtime.py
 - 主视图: 预测距离(伪彩) / 峰值 / 反射率
 - BINS:   鼠标悬停像素的 bins 表格
 - HIST:   鼠标悬停像素的输入直方图（实时刷新）
-- 右下角: 操作指引 + 深度色条图例
+- HIST 上方: 悬停像素的 dist/snr/peak/reflectance
+- 右下角: 操作指引
 
 交互：
-- 鼠标悬停：显示 dist/snr/conf/peak/reflectance
+- 鼠标悬停：显示 dist/snr/peak/reflectance
 - 空格：开始/停止录制 mp4；按 0：保存当前帧 tof.raw 到 r/tmp
 - ESC 退出
 """
@@ -50,7 +51,6 @@ SHOW_SHORT = 390
 # 显示方向开关：先按原始方向，再决定是否顺时针旋转 90°，最后是否水平镜像
 ROTATE_90 = 1
 MIRROR = 0
-HEADER_H = 56
 HIST_BINS = 62
 HIST_W = 640
 HIST_H = 280
@@ -335,15 +335,23 @@ def _draw_marker(img_bgr: np.ndarray, x: int, y: int) -> np.ndarray:
     return img_bgr
 
 
-def _with_text(img_bgr: np.ndarray, text: str, y: int = 24) -> np.ndarray:
+def _with_text(img_bgr: np.ndarray, text: str, y: int = 24, *, align: str = "left") -> np.ndarray:
     import cv2  # type: ignore
 
-    cv2.putText(img_bgr, text, (10, int(y)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale, thickness = 0.48, 1
+    if align == "right":
+        (tw, _), _ = cv2.getTextSize(text, font, scale, thickness)
+        x = max(int(img_bgr.shape[1] - tw - 10), 0)
+    else:
+        x = 10
+    cv2.putText(img_bgr, text, (x, int(y)), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
     return img_bgr
 
 
 def _render_histogram_bgr(
     bins: np.ndarray,
+    effective_bin: int = -1,
     w: int = HIST_W,
     h: int = HIST_H,
 ) -> np.ndarray:
@@ -360,9 +368,9 @@ def _render_histogram_bgr(
     if sat_value == 0.0:
         sat_value = PULSES
     vmax_raw = float(np.max(b_draw)) if b_draw.size > 0 else 0.0
-    vmax_eq_sat = vmax_raw * PULSES / sat_value
+    value = vmax_raw * float(PULSES) / sat_value
 
-    x0, y0 = 14, 128
+    x0, y0 = 14, 80
     x1, y1 = img.shape[1] - 10, img.shape[0] - 18
     vmax = 1.0 if (not np.isfinite(vmax_raw) or vmax_raw <= 0.0) else vmax_raw
     cv2.rectangle(img, (x0, y0), (x1, y1), (80, 80, 80), 1, cv2.LINE_AA)
@@ -375,12 +383,12 @@ def _render_histogram_bgr(
         if xr <= xl:
             continue
         yt = y1 - hh
-        cv2.rectangle(img, (xl, yt), (xr, y1), (255, 220, 0), -1)
+        bar_color = (0, 140, 255) if i == int(effective_bin) else (255, 220, 0)
+        cv2.rectangle(img, (xl, yt), (xr, y1), bar_color, -1)
         cv2.rectangle(img, (xl, yt), (xr, y1), (30, 30, 30), 1)
-    img = _with_text(img, "RAW_HIST (only 0-61 bins)", y=24)
-    img = _with_text(img, f"max={vmax_raw:.3f}", y=48)
-    img = _with_text(img, f"sat_value={sat_value:.3f}", y=72)
-    img = _with_text(img, f"max_eq_sat={vmax_eq_sat:.3f}", y=96)
+    active_text = str(int(effective_bin)) if effective_bin >= 0 else "INVALID"
+    img = _with_text(img, f"RAW_HIST (0-61)  effective_bin={active_text}", y=24)
+    img = _with_text(img, f"value={value:.3f}", y=48)
     return img
 
 
@@ -388,6 +396,7 @@ def _render_bins_strip_bgr(
     bins: np.ndarray,
     px: int,
     py: int,
+    effective_bin: int = -1,
     w: int = STRIP_W,
     h: int = STRIP_H,
 ) -> np.ndarray:
@@ -395,7 +404,7 @@ def _render_bins_strip_bgr(
 
     eq_val = bin_raw * PULSES / sat_value
     sat_value = b[62] * TAIL_BASE + b[63]（为 0 时取 PULSES）
-    argmax 行用亮绿色高亮。
+    原始 argmax 行用亮绿色高亮，模型最终生效的 bin 用橙色高亮。
     """
     import cv2  # type: ignore
 
@@ -427,13 +436,13 @@ def _render_bins_strip_bgr(
     # 标题
     cv2.putText(
         img,
-        f"pixel=({int(px)},{int(py)})  sat={sat_value:.1f}",
+        f"pixel=({int(px)},{int(py)})  effective={effective_bin if effective_bin >= 0 else 'INVALID'}",
         (8, 16),
         cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1, cv2.LINE_AA,
     )
     cv2.putText(
         img,
-        f"peak_raw={vmax_raw:.1f}  peak_eq={float(eq[argmax_idx]) if argmax_idx >= 0 else 0:.1f}",
+        f"sat={sat_value:.1f}  peak_eq={float(eq[argmax_idx]) if argmax_idx >= 0 else 0:.1f}",
         (8, 32),
         cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1, cv2.LINE_AA,
     )
@@ -446,7 +455,12 @@ def _render_bins_strip_bgr(
 
     for i in range(n_show):
         y_text = header_h + i * row_h + row_h - 4
-        color = (80, 255, 80) if i == argmax_idx else (220, 220, 220)
+        if i == int(effective_bin):
+            color = (0, 165, 255)
+        elif i == argmax_idx:
+            color = (80, 255, 80)
+        else:
+            color = (220, 220, 220)
         if i % 2 == 0:
             cv2.rectangle(
                 img,
@@ -462,6 +476,28 @@ def _render_bins_strip_bgr(
         )
 
     return img
+
+
+def _effective_bin_from_output(
+    bins: np.ndarray,
+    peak: float,
+    conf: float,
+) -> int:
+    """根据网络输出 peak 反查最终被 one_hot_mask 选中的 bin。"""
+    if conf <= 0.5 or not np.isfinite(peak):
+        return -1
+
+    b = np.asarray(bins, dtype=np.float32).reshape(-1)
+    if b.size < TOF_C:
+        return -1
+    sat_value = float(b[62]) * TAIL_BASE + float(b[63])
+    if sat_value <= 0.0 or not np.isfinite(sat_value):
+        return -1
+
+    eq = b[:STRIP_BINS] * float(PULSES) / sat_value
+    if not np.all(np.isfinite(eq)):
+        return -1
+    return int(np.argmin(np.abs(eq - float(peak))))
 
 
 def _colorize_gray01(x: np.ndarray) -> np.ndarray:
@@ -614,7 +650,6 @@ def _render_view(
         bag_dist_m: 可选，(H,W) float32 距离(米)，来自 bag 中 alg/dtof_depth。
 
     Returns: (view_bgr, hist_bgr, strip_bgr, tof_px, tof_py)
-        view_bgr 的前 HEADER_H 行为空白，留给调用方写 hover 文本。
     """
     import cv2
 
@@ -646,7 +681,7 @@ def _render_view(
         )
 
     mx = int(np.clip(mouse_x, 0, show_w * 2 - 1))
-    my = int(np.clip(mouse_y - HEADER_H, 0, show_h * 2 - 1))
+    my = int(np.clip(mouse_y, 0, show_h * 2 - 1))
     tile_x0 = 0 if mx < show_w else show_w
     tile_y0 = 0 if my < show_h else show_h
     px, py = _disp_xy_to_pixel(mx - tile_x0, my - tile_y0, show_w, show_h, rotate_90, mirror)
@@ -670,14 +705,15 @@ def _render_view(
         row1 = np.hstack([dist_big, np.zeros((show_h, show_w, 3), dtype=np.uint8)])
     row2 = np.hstack([peak_bgr, refl_bgr])
 
-    view = np.vstack([
-        np.zeros((HEADER_H, show_w * 2, 3), dtype=np.uint8),
-        row1,
-        row2,
-    ])
+    view = np.vstack([row1, row2])
 
-    hist_img = _render_histogram_bgr(hists[py, px, :])
-    strip_img = _render_bins_strip_bgr(hists[py, px, :], px, py)
+    effective_bin = _effective_bin_from_output(
+        hists[py, px, :],
+        float(peak[py, px]),
+        float(conf[py, px]),
+    )
+    hist_img = _render_histogram_bgr(hists[py, px, :], effective_bin=effective_bin)
+    strip_img = _render_bins_strip_bgr(hists[py, px, :], px, py, effective_bin=effective_bin)
     return view, hist_img, strip_img, px, py
 
 
@@ -723,9 +759,9 @@ def _draw_info_card(
     progress_label: str = "",
     bar_rect_out: dict | None = None,
 ) -> None:
-    """在右下角绘制操作指引卡 + 深度色条图例（可选：底部进度条）。
+    """在右下角绘制操作指引卡（可选：底部进度条）。
 
-    progress_frac: 0..1 时在图例下方绘制进度条（用于 BAG 回放拖动）。
+    progress_frac: 0..1 时在指引下方绘制进度条（用于 BAG 回放拖动）。
     bar_rect_out:  若提供，写入进度条可点击区域 {x0,y0,x1,y1}（画布坐标）。
     """
     import cv2  # type: ignore
@@ -742,29 +778,9 @@ def _draw_info_card(
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (214, 214, 220), 1, cv2.LINE_AA)
         ty += 28
 
-    legend_h = 18
-    legend_y = ty + 12
-    legend_bottom = legend_y + legend_h + 18
-    if legend_y + legend_h + 26 <= y + h:
-        cv2.putText(canvas, "DEPTH (JET)", (x + 16, legend_y - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, DASH_SUB_COLOR, 1, cv2.LINE_AA)
-        lx0 = x + 16
-        lx1 = x + w - 16
-        if lx1 > lx0:
-            grad = np.linspace(255, 0, lx1 - lx0).astype(np.uint8).reshape(1, -1)
-            bar = cv2.applyColorMap(np.repeat(grad, legend_h, axis=0), cv2.COLORMAP_JET)
-            canvas[legend_y:legend_y + legend_h, lx0:lx1] = bar
-            cv2.rectangle(canvas, (lx0 - 1, legend_y - 1), (lx1, legend_y + legend_h),
-                          DASH_PANEL_BORDER, 1, cv2.LINE_AA)
-            cv2.putText(canvas, "near", (lx0, legend_y + legend_h + 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, DASH_SUB_COLOR, 1, cv2.LINE_AA)
-            (tw, _), _ = cv2.getTextSize("far", cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-            cv2.putText(canvas, "far", (lx1 - tw, legend_y + legend_h + 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, DASH_SUB_COLOR, 1, cv2.LINE_AA)
-
     if progress_frac is not None:
         _draw_progress_bar(
-            canvas, x, w, legend_bottom + 22, y + h,
+            canvas, x, w, ty + 16, y + h,
             float(progress_frac), progress_label, bar_rect_out,
         )
 
@@ -816,6 +832,7 @@ def _compose_dashboard(
     strip_img: np.ndarray,
     status_text: str = "",
     hint_lines: list[str] | None = None,
+    hover_lines: list[str] | None = None,
     progress_frac: float | None = None,
     progress_label: str = "",
     bar_rect_out: dict | None = None,
@@ -826,8 +843,8 @@ def _compose_dashboard(
         ┌── banner ───────────────────────────────┐
         │ NN ToF Realtime              <status>    │
         ├──────────┬────────┬──────────────────────┤
-        │  MAIN    │  BINS  │  HIST                 │
-        │ (2x2)    │ (table)│  ───────              │
+        │  MAIN    │  BINS  │  HOVER INFO           │
+        │ (2x2)    │ (table)│  HIST                 │
         │          │        │  GUIDE / legend       │
         └──────────┴────────┴──────────────────────┘
     主视图固定置于 (MAIN_OFFSET_X, MAIN_OFFSET_Y)，鼠标坐标据此换算。
@@ -837,13 +854,19 @@ def _compose_dashboard(
     mh, mw = view.shape[:2]
     sh, sw = strip_img.shape[:2]
     hh, hw = hist_img.shape[:2]
+    hover = [ln for ln in (hover_lines or []) if ln]
+    hover_row_h = 22
+    hover_h = (10 + len(hover) * hover_row_h + 8) if hover else 0
 
     pad, gap, banner = DASH_PAD, DASH_GAP, DASH_BANNER_H
-    content_h = max(mh, sh, hh)
+    right_h = hover_h + (gap if hover_h else 0) + hh
+    content_h = max(mh, sh, right_h)
 
     main_x, main_y = pad, banner + pad
     strip_x, strip_y = main_x + mw + gap, banner + pad
-    hist_x, hist_y = strip_x + sw + gap, banner + pad
+    hist_x = strip_x + sw + gap
+    hover_y = banner + pad
+    hist_y = hover_y + hover_h + (gap if hover_h else 0)
 
     canvas_w = hist_x + hw + pad
     canvas_h = banner + pad + content_h + pad
@@ -868,6 +891,19 @@ def _compose_dashboard(
 
     place(view, main_x, main_y)
     place(strip_img, strip_x, strip_y)
+
+    if hover_h > 0:
+        cv2.rectangle(canvas, (hist_x, hover_y), (hist_x + hw, hover_y + hover_h), DASH_PANEL_BG, -1)
+        cv2.rectangle(
+            canvas, (hist_x - 1, hover_y - 1), (hist_x + hw, hover_y + hover_h),
+            DASH_PANEL_BORDER, 1, cv2.LINE_AA,
+        )
+        for i, ln in enumerate(hover):
+            cv2.putText(
+                canvas, ln, (hist_x + 12, hover_y + 10 + (i + 1) * hover_row_h - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, DASH_TITLE_COLOR, 1, cv2.LINE_AA,
+            )
+
     place(hist_img, hist_x, hist_y)
 
     info_x = hist_x
@@ -1122,22 +1158,22 @@ def _run_bag_mode(bag_path_str: str) -> int:
             bag_dist_m=bag_dist_m,
         )
 
-        bag_d_str = ""
+        hover_lines = [
+            f"dist {float(all_dist[idx][py, px]):.3f}m",
+        ]
         if bag_dist_m is not None:
-            bag_d_str = f"  bag_dist {float(bag_dist_m[py, px]):.3f}m"
-        hover1 = (
-            f"idx={idx}/{n - 1}  frame_id={header.frame_id}  "
-            f"dist {float(all_dist[idx][py, px]):.3f}m{bag_d_str}  snr {float(all_snr[idx][py, px]):.3f}  "
-            f"conf {float(all_conf[idx][py, px]):.0f}  peak {float(all_peak[idx][py, px]):.3f}"
-        )
-        hover2 = f"reflectance {float(all_refl[idx][py, px]) * 100.0:.3f}%"
-        _with_text(view[:HEADER_H], hover1, y=22)
-        _with_text(view[:HEADER_H], hover2, y=46)
+            hover_lines.append(f"bag_dist {float(bag_dist_m[py, px]):.3f}m")
+        hover_lines.extend([
+            f"snr {float(all_snr[idx][py, px]):.3f}",
+            f"peak {float(all_peak[idx][py, px]):.3f}",
+            f"reflectance {float(all_refl[idx][py, px]) * 100.0:.3f}%",
+        ])
 
         status = f"frame {idx}/{n - 1}   {'PLAY' if playing else 'PAUSE'}"
         progress_frac = (idx / (n - 1)) if n > 1 else 0.0
         canvas = _compose_dashboard(
             view, hist_img, strip_img, status, BAG_HINTS,
+            hover_lines=hover_lines,
             progress_frac=progress_frac,
             progress_label=f"FRAME  {idx}/{n - 1}",
             bar_rect_out=bar_rect,
@@ -1295,13 +1331,12 @@ def main() -> int:
                     ui_cnt = 0
                     fps_tick = now
 
-                hover1 = (
-                    f"io_fps {io_fps:.1f}  infer_fps {infer_fps:.1f}  ui_fps {ui_fps:.1f}  "
-                    f"dist {float(cached_pred_depth[py, px]):.3f}m  snr {float(cached_snr[py, px]):.3f}  conf {float(cached_conf[py, px]):.0f}  peak {float(cached_peak[py, px]):.3f}"
-                )
-                hover2 = f"reflectance {float(cached_reflectance[py, px]) * 100.0:.3f}%"
-                _with_text(view[:HEADER_H], hover1, y=22)
-                _with_text(view[:HEADER_H], hover2, y=46)
+                hover_lines = [
+                    f"dist {float(cached_pred_depth[py, px]):.3f}m",
+                    f"snr {float(cached_snr[py, px]):.3f}",
+                    f"peak {float(cached_peak[py, px]):.3f}",
+                    f"reflectance {float(cached_reflectance[py, px]) * 100.0:.3f}%",
+                ]
                 if rec_writer is not None:
                     cv2.circle(view, (show_w * 2 - 24, 20), 7, (0, 0, 255), -1, cv2.LINE_AA)
                     cv2.putText(view, "REC", (show_w * 2 - 72, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 0, 255), 2, cv2.LINE_AA)
@@ -1309,7 +1344,7 @@ def main() -> int:
                     cv2.putText(
                         view,
                         f"rec err: {rec_err}",
-                        (10, HEADER_H - 8),
+                        (10, 20),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.42,
                         (0, 0, 255),
@@ -1320,7 +1355,10 @@ def main() -> int:
                     f"io {io_fps:.1f} | infer {infer_fps:.1f} | ui {ui_fps:.1f} fps"
                     + ("   * REC" if rec_on else "")
                 )
-                frame_cache = _compose_dashboard(view, hist_new, strip_new, status, REALTIME_HINTS)
+                frame_cache = _compose_dashboard(
+                    view, hist_new, strip_new, status, REALTIME_HINTS,
+                    hover_lines=hover_lines,
+                )
                 last_mouse_xy = mouse_xy
                 last_rec_on = rec_on
 
