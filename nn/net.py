@@ -10,7 +10,7 @@ nn/net.py
 - snr: 信噪比
 - reflectance: 反射率
 - conf: 置信度(0/1)
-- peak: 峰值信号 (原始 hist at 峰值 bin)
+- peak: 峰值信号 (归一化 hist_k 的 bin 维最大值)
 
 流程:
 1) 拆分前 62 个有效 bin 与最后两个饱和 bin:
@@ -50,7 +50,8 @@ nn/net.py
       dist        = Σ one_hot_mask * dist_per_bin
       reflectance = Σ one_hot_mask * reflectance_per_bin
       snr         = Σ one_hot_mask * snr_per_bin
-      peak        = Σ one_hot_mask * gated_hist    (= amax(gated_hist), 无效像素为 0)
+   peak 则不走 one-hot, 直接取归一化直方图的最大值:
+      peak        = amax(hist_k, dim=1)
 
 7) conf = amax(valid_mask, dim=1), 即任一 bin 通过 3 路 mask 即为有效像素
 """
@@ -215,7 +216,7 @@ class Network(nn.Module):
         dist        = torch.sum(one_hot_mask * dist_per_bin,        dim=1, keepdim=True)
         reflectance = torch.sum(one_hot_mask * reflectance_per_bin, dim=1, keepdim=True)
         snr         = torch.sum(one_hot_mask * snr_per_bin,         dim=1, keepdim=True)
-        peak        = torch.sum(one_hot_mask * hist_k,          dim=1, keepdim=True)  # = amax(gated_hist)
+        peak        = torch.amax(hist_k,                            dim=1, keepdim=True)
 
         # ---- 6) conf: 该像素任一 bin 通过 3 路 mask 即为有效 ----
         conf = torch.amax(valid_mask, dim=1, keepdim=True)
