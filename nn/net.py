@@ -14,8 +14,7 @@ nn/net.py
 
 流程:
 1) 拆分前 62 个有效 bin 与最后两个饱和 bin:
-      sat_value = bin64 * 1024 + bin63
-      若 sat_value <= 0, 则赋值为 50000
+      sat_value = bin63 * 1024 + bin64
    得到归一化系数 k = PULSES / sat_value, 并构造归一化后的 hist_k = hist * k.
 
    两份直方图各司其职:
@@ -60,19 +59,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-IS_6321 = True
 DIST_SCALE_M = 0.6
 TAIL_BASE = 1024.0
 PULSES = 50000.0
 
-if IS_6321:
-    REFLECT_K = 156250.0 / 3
-    DIST_BIAS = 0.25
-    DIST_BIAS = -2.14
-else:
-    REFLECT_K = 156250.0
-    DIST_BIAS = 0.6
-REFLECT_THRESH = 0.025
+REFLECT_K = 104533
+DIST_BIAS = -2.14
+REFLECT_THRESH = 0.015
+
 # 反射率上限: 避免反射率太高,导致int16量化精度不够
 MAX_REFL = 30.0
 SNR_THRESH = 5.0
@@ -119,12 +113,7 @@ class Network(nn.Module):
         return hist, raw_bin_63, raw_bin_64
 
     def _caculate_sat_value(self, raw_bin_63, raw_bin_64):
-        if IS_6321:
-            sat_value = raw_bin_63 * TAIL_BASE + raw_bin_64  # 6321
-        else:
-            sat_value = raw_bin_64 * TAIL_BASE + raw_bin_63  # 1860
-            sat_value = torch.where(sat_value > 0, sat_value, torch.full_like(sat_value, PULSES))  # 1860
-        return sat_value
+        return raw_bin_63 * TAIL_BASE + raw_bin_64
 
     def _crosstalk_mask(self, hist):
         """窜光抑制: 只输出 (B,62,H,W) 的 0/1 mask, 不改变 hist 本身."""
