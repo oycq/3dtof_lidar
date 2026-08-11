@@ -10,12 +10,13 @@ nn/realtime.py
 - BINS:   鼠标悬停像素的 bins 表格
 - HIST:   鼠标悬停像素的输入直方图（实时刷新）
 - HIST 上方: 悬停像素的 dist/snr/peak/reflectance
-- 右下角: 操作指引
+- 距离色条: 近红远蓝；右下角文字输入可调最近/最远距离与最小/最大亮度；悬停色条可查询距离
 
 交互：
-- 鼠标悬停：显示 dist/snr/peak/reflectance
+- 鼠标悬停：显示 dist/snr/peak/reflectance；悬停色条查询该颜色对应距离
+- 右下角输入框：最近距离(m) / 最远距离(m) / 最小亮度 / 最大亮度（点击后键盘输入，Enter 确认）
 - 空格：开始/停止录制 mp4；按 0：保存当前帧 tof.raw 到 r/tmp
-- ESC 退出
+- ESC 退出（输入框聚焦时 ESC 取消编辑）
 """
 
 from __future__ import annotations
@@ -43,6 +44,13 @@ NUM_BINS = 64
 VALID_BINS = 63
 INVALID_BIN = 63
 MAX_VALID_M = 35.0
+DEPTH_COLOR_NEAR_M = 0.0   # 红色对应距离(米)
+DEPTH_COLOR_FAR_M = 25.0   # 蓝色对应距离(米)
+DEPTH_COLOR_TB_MAX_DM = 350  # trackbar 上限：0.1m 单位 → 35.0m
+CBAR_W = 84                  # 距离色条宽度
+PEAK_DISP_LO = 0.0           # PEAK 灰度显示下限默认
+PEAK_DISP_HI = 5000.0        # PEAK 灰度显示上限默认
+PEAK_DISP_ABS_MAX = 1_000_000.0  # 亮度输入允许的最大值（不再卡死在 5000）
 LOG_BASE = 1.06
 
 # 单图显示长短边；是否旋转时会自动交换宽高
@@ -57,6 +65,9 @@ HIST_H = 280
 STRIP_BINS = 62   # 表格显示 bins 0..61
 STRIP_W = 240     # 图像宽度（函数内动态计算高度，此值仅作默认参数）
 STRIP_H = 0       # 高度由行数自动决定，此常量不再用于绘制
+# 显示用 peak：不再用网络 peak，而是 hist_k 在 bin [LO, HI] 的最大值
+PEAK_BIN_LO = 5
+PEAK_BIN_HI = 60  # inclusive
 TARGET_FPS = 25.0
 FPS_STAT_INTERVAL_S = 0.5
 REC_FPS = 20.0
@@ -64,6 +75,9 @@ REC_FPS = 20.0
 EPS = 1e-6
 TAIL_BASE = 1024.0
 PULSES = 50000.0
+DIST_SCALE_M = 0.6   # 与 net.py 一致，用于反查有效测距 bin
+DIST_BIAS = -2.14
+MIN_DIST_M = 0.4
 DISP_GAMMA = 1.2
 SUM_GATE_MAX = 20000.0
 SUM_GATE_SNR_DIV = 3.0
@@ -245,7 +259,7 @@ class ToFRealtimeServer:
                 time.sleep(fail_sleep)
                 continue
             if self._min_peak_count > 0.0:
-                peak = float(np.max(hists[:, :, :HIST_BINS]))
+                peak = float(np.max(hists[:, :, PEAK_BIN_LO : PEAK_BIN_HI + 1]))
                 if peak < self._min_peak_count:
                     time.sleep(fail_sleep)
                     continue
@@ -367,12 +381,17 @@ def _render_histogram_bgr(
     sat_value = tail_63 * TAIL_BASE + tail_64
     if sat_value == 0.0:
         sat_value = PULSES
-    vmax_raw = float(np.max(b_draw)) if b_draw.size > 0 else 0.0
+    # peak: 仅统计 bin [PEAK_BIN_LO, PEAK_BIN_HI] 的最大值（只用于数值显示，不标色）
+    peak_slice = b_draw[PEAK_BIN_LO : PEAK_BIN_HI + 1]
+    vmax_raw = float(np.max(peak_slice)) if peak_slice.size > 0 else 0.0
+    peak_bin = int(PEAK_BIN_LO + int(np.argmax(peak_slice))) if peak_slice.size > 0 else -1
     value = vmax_raw * float(PULSES) / sat_value
 
     x0, y0 = 14, 80
     x1, y1 = img.shape[1] - 10, img.shape[0] - 18
-    vmax = 1.0 if (not np.isfinite(vmax_raw) or vmax_raw <= 0.0) else vmax_raw
+    # 直方图柱高仍按全量程归一，便于看近场/尾部；peak 数值单独按区间算
+    vmax_draw = float(np.max(b_draw)) if b_draw.size > 0 else 0.0
+    vmax = 1.0 if (not np.isfinite(vmax_draw) or vmax_draw <= 0.0) else vmax_draw
     cv2.rectangle(img, (x0, y0), (x1, y1), (80, 80, 80), 1, cv2.LINE_AA)
     bar_w = max(int((x1 - x0) / max(b_draw.size, 1)), 1)
     for i, v in enumerate(b_draw):
@@ -388,7 +407,11 @@ def _render_histogram_bgr(
         cv2.rectangle(img, (xl, yt), (xr, y1), (30, 30, 30), 1)
     active_text = str(int(effective_bin)) if effective_bin >= 0 else "INVALID"
     img = _with_text(img, f"RAW_HIST (0-61)  effective_bin={active_text}", y=24)
-    img = _with_text(img, f"value={value:.3f}", y=48)
+    img = _with_text(
+        img,
+        f"peak(bin{PEAK_BIN_LO}-{PEAK_BIN_HI})={value:.3f}  @bin={peak_bin}",
+        y=48,
+    )
     return img
 
 
@@ -404,7 +427,7 @@ def _render_bins_strip_bgr(
 
     eq_val = bin_raw * PULSES / sat_value
     sat_value = b[62] * TAIL_BASE + b[63]（为 0 时取 PULSES）
-    原始 argmax 行用亮绿色高亮，模型最终生效的 bin 用橙色高亮。
+    网络真实选中的测距 bin（effective）用橙色高亮；无有效 conf 则不标橙。
     """
     import cv2  # type: ignore
 
@@ -423,8 +446,12 @@ def _render_bins_strip_bgr(
     # eq_val = raw * PULSES / sat_value
     eq = b_draw * float(PULSES) / sat_value
 
-    argmax_idx = int(np.argmax(b_draw)) if n_show > 0 else -1
-    vmax_raw = float(b_draw[argmax_idx]) if argmax_idx >= 0 else 0.0
+    # peak 数值：仅在 bin [PEAK_BIN_LO, PEAK_BIN_HI] 内取最大值（不标色）
+    lo = max(0, min(PEAK_BIN_LO, n_show - 1))
+    hi = max(lo, min(PEAK_BIN_HI, n_show - 1))
+    peak_slice = b_draw[lo : hi + 1]
+    argmax_idx = int(lo + int(np.argmax(peak_slice))) if peak_slice.size > 0 else -1
+    peak_eq = float(eq[argmax_idx]) if argmax_idx >= 0 else 0.0
 
     # 每行行高
     row_h = 16
@@ -442,7 +469,7 @@ def _render_bins_strip_bgr(
     )
     cv2.putText(
         img,
-        f"sat={sat_value:.1f}  peak_eq={float(eq[argmax_idx]) if argmax_idx >= 0 else 0:.1f}",
+        f"sat={sat_value:.1f}  peak_eq({PEAK_BIN_LO}-{PEAK_BIN_HI})={peak_eq:.1f} @{argmax_idx}",
         (8, 32),
         cv2.FONT_HERSHEY_SIMPLEX, 0.44, (200, 200, 200), 1, cv2.LINE_AA,
     )
@@ -455,12 +482,7 @@ def _render_bins_strip_bgr(
 
     for i in range(n_show):
         y_text = header_h + i * row_h + row_h - 4
-        if i == int(effective_bin):
-            color = (0, 165, 255)
-        elif i == argmax_idx:
-            color = (80, 255, 80)
-        else:
-            color = (220, 220, 220)
+        color = (0, 165, 255) if i == int(effective_bin) else (220, 220, 220)
         if i % 2 == 0:
             cv2.rectangle(
                 img,
@@ -478,26 +500,42 @@ def _render_bins_strip_bgr(
     return img
 
 
+def _dist_per_bin_pixel(hist62: np.ndarray) -> np.ndarray:
+    """与 net.py _dist_per_bin 一致：每 bin 的三邻域重心距离 (62,)。"""
+    x = np.asarray(hist62, dtype=np.float32).reshape(-1)
+    if x.size < 62:
+        x = np.pad(x, (0, 62 - int(x.size)), mode="constant")
+    x = x[:62]
+    anchors = np.clip(np.arange(62, dtype=np.int32), 1, 60)
+    left = x[anchors - 1]
+    center = x[anchors]
+    right = x[anchors + 1]
+    centroid = (right - left) / (left + center + right + 1.0) + anchors.astype(np.float32)
+    dist = centroid * float(DIST_SCALE_M) + float(DIST_BIAS)
+    return np.maximum(dist, float(MIN_DIST_M)).astype(np.float32, copy=False)
+
+
 def _effective_bin_from_output(
     bins: np.ndarray,
-    peak: float,
+    dist_m: float,
     conf: float,
 ) -> int:
-    """根据网络输出 peak 反查最终被 one_hot_mask 选中的 bin。"""
-    if conf <= 0.5 or not np.isfinite(peak):
+    """反查网络 one_hot 选中的测距 bin。
+
+    有有效 conf 时，在 62 路 dist_per_bin 中找与输出 dist 最接近的 bin；
+    conf 无效则返回 -1（直方图/表格不标橙色）。
+    """
+    if conf <= 0.5 or (not np.isfinite(dist_m)) or float(dist_m) <= 0.0:
         return -1
 
     b = np.asarray(bins, dtype=np.float32).reshape(-1)
-    if b.size < TOF_C:
-        return -1
-    sat_value = float(b[62]) * TAIL_BASE + float(b[63])
-    if sat_value <= 0.0 or not np.isfinite(sat_value):
+    if b.size < HIST_BINS:
         return -1
 
-    eq = b[:STRIP_BINS] * float(PULSES) / sat_value
-    if not np.all(np.isfinite(eq)):
+    d_per = _dist_per_bin_pixel(b[:HIST_BINS])
+    if not np.all(np.isfinite(d_per)):
         return -1
-    return int(np.argmin(np.abs(eq - float(peak))))
+    return int(np.argmin(np.abs(d_per - float(dist_m))))
 
 
 def _colorize_gray01(x: np.ndarray) -> np.ndarray:
@@ -506,12 +544,12 @@ def _colorize_gray01(x: np.ndarray) -> np.ndarray:
 
 
 def _render_input_intensity_u8(hists: np.ndarray) -> np.ndarray:
-    """(H,W,64) -> (H,W) uint8，最大 bin 亮度图。"""
+    """(H,W,64) -> (H,W) uint8，最大 bin 亮度图（仅 bin 6-60）。"""
     h = np.asarray(hists, dtype=np.float32)
     if h.shape != (TOF_H, TOF_W, TOF_C):
         raise ValueError(f"bad hists shape: {h.shape}")
 
-    max_bin = np.max(h[:, :, :HIST_BINS], axis=2)
+    max_bin = np.max(h[:, :, PEAK_BIN_LO : PEAK_BIN_HI + 1], axis=2)
     sat_value = h[:, :, 62] * TAIL_BASE + h[:, :, 63]
     sat_value = np.where(sat_value > 0.0, sat_value, float(PULSES))
 
@@ -539,8 +577,72 @@ def _compute_snr_from_input(hists: np.ndarray) -> np.ndarray:
     return snr.astype(np.float32, copy=False)
 
 
-def _colorize_depth(depth_m: np.ndarray) -> np.ndarray:
-    """(H,W) depth(m) -> BGR (JET), 直接按 y=1.8/x 做伪彩映射。"""
+def _normalize_depth_color_range(near_m: float, far_m: float) -> tuple[float, float]:
+    """规范化红/蓝端点距离；两端至少相差 0.1m。"""
+    near = float(near_m) if np.isfinite(near_m) else float(DEPTH_COLOR_NEAR_M)
+    far = float(far_m) if np.isfinite(far_m) else float(DEPTH_COLOR_FAR_M)
+    near = float(np.clip(near, 0.0, float(DEPTH_COLOR_TB_MAX_DM) / 10.0))
+    far = float(np.clip(far, 0.0, float(DEPTH_COLOR_TB_MAX_DM) / 10.0))
+    if abs(far - near) < 0.1:
+        far = min(near + 0.1, float(DEPTH_COLOR_TB_MAX_DM) / 10.0)
+        if abs(far - near) < 0.1:
+            near = max(far - 0.1, 0.0)
+    return near, far
+
+
+def _default_disp_ctrl() -> dict:
+    """显示控制状态：距离色域 + PEAK 灰度范围 + 输入框编辑。"""
+    return {
+        "near_m": float(DEPTH_COLOR_NEAR_M),
+        "far_m": float(DEPTH_COLOR_FAR_M),
+        "peak_lo": float(PEAK_DISP_LO),
+        "peak_hi": float(PEAK_DISP_HI),
+        "focus": None,   # near_m / far_m / peak_lo / peak_hi
+        "edit": "",
+        "drag": None,    # seek 拖动
+    }
+
+
+def _normalize_peak_disp_range(lo: float, hi: float) -> tuple[float, float]:
+    """规范化 PEAK 显示范围；两端至少相差 1，亮度上限放宽到 PEAK_DISP_ABS_MAX。"""
+    lo_v = float(lo) if np.isfinite(lo) else float(PEAK_DISP_LO)
+    hi_v = float(hi) if np.isfinite(hi) else float(PEAK_DISP_HI)
+    lo_v = float(np.clip(lo_v, 0.0, float(PEAK_DISP_ABS_MAX)))
+    hi_v = float(np.clip(hi_v, 0.0, float(PEAK_DISP_ABS_MAX)))
+    if abs(hi_v - lo_v) < 1.0:
+        hi_v = min(lo_v + 1.0, float(PEAK_DISP_ABS_MAX))
+        if abs(hi_v - lo_v) < 1.0:
+            lo_v = max(hi_v - 1.0, 0.0)
+    return lo_v, hi_v
+
+
+def _sync_disp_ctrl(ctrl: dict) -> None:
+    near, far = _normalize_depth_color_range(ctrl.get("near_m", DEPTH_COLOR_NEAR_M), ctrl.get("far_m", DEPTH_COLOR_FAR_M))
+    lo, hi = _normalize_peak_disp_range(ctrl.get("peak_lo", PEAK_DISP_LO), ctrl.get("peak_hi", PEAK_DISP_HI))
+    ctrl["near_m"] = near
+    ctrl["far_m"] = far
+    ctrl["peak_lo"] = lo
+    ctrl["peak_hi"] = hi
+
+
+def _peak_to_u8(
+    peak: np.ndarray,
+    lo: float = PEAK_DISP_LO,
+    hi: float = PEAK_DISP_HI,
+) -> np.ndarray:
+    """peak 标量图 -> uint8 灰度，[lo, hi] 线性映射到 [0, 255]。"""
+    lo, hi = _normalize_peak_disp_range(lo, hi)
+    p = np.asarray(peak, dtype=np.float32)
+    t = (p - lo) / (hi - lo)
+    return np.clip(np.rint(t * 255.0), 0, 255).astype(np.uint8)
+
+
+def _colorize_depth(
+    depth_m: np.ndarray,
+    near_m: float = DEPTH_COLOR_NEAR_M,
+    far_m: float = DEPTH_COLOR_FAR_M,
+) -> np.ndarray:
+    """(H,W) depth(m) -> BGR (JET)，near..far 线性均匀映射（近红远蓝）。"""
     import cv2  # type: ignore
 
     d = np.asarray(depth_m, dtype=np.float32)
@@ -548,10 +650,12 @@ def _colorize_depth(depth_m: np.ndarray) -> np.ndarray:
     if not np.any(valid):
         return np.zeros((TOF_H, TOF_W, 3), dtype=np.uint8)
 
+    near_m, far_m = _normalize_depth_color_range(near_m, far_m)
+    span = far_m - near_m
     u8 = np.zeros((TOF_H, TOF_W), dtype=np.uint8)
-    d_valid = np.maximum(d[valid], EPS)
-    y = 1.8 / d_valid
-    u8[valid] = np.clip(np.rint(y * 255.0), 0, 255).astype(np.uint8)
+    # 近红远蓝：near -> 255, far -> 0（near>far 时自动反向）
+    t = (d[valid] - near_m) / span
+    u8[valid] = np.clip(np.rint(255.0 * (1.0 - t)), 0, 255).astype(np.uint8)
     bgr = cv2.applyColorMap(u8, cv2.COLORMAP_JET)
     bgr[~valid] = (0, 0, 0)
     return bgr
@@ -590,19 +694,37 @@ def _make_range_snr_mask(depth_m: np.ndarray, snr: np.ndarray) -> np.ndarray:
     return valid & (s > thr)
 
 
+def _compute_peak_map(hists: np.ndarray) -> np.ndarray:
+    """显示用 peak = max(hist_k[PEAK_BIN_LO..PEAK_BIN_HI])。
+
+    hist_k = hist * PULSES / sat_value，sat_value = bin62*1024 + bin63。
+    """
+    h = np.asarray(hists, dtype=np.float32)
+    if h.ndim != 3 or h.shape[2] < TOF_C:
+        raise ValueError(f"bad hists shape: {h.shape}")
+    sat_value = h[:, :, 62] * TAIL_BASE + h[:, :, 63]
+    sat_value = np.where(sat_value > 0.0, sat_value, float(PULSES))
+    hist_k = h[:, :, PEAK_BIN_LO : PEAK_BIN_HI + 1] * (float(PULSES) / sat_value[..., None])
+    return np.max(hist_k, axis=2).astype(np.float32, copy=False)
+
+
 def _run_infer(net, device, hists: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """hist (H,W,64) -> pred_depth, snr, conf, peak, reflectance."""
+    """hist (H,W,64) -> pred_depth, snr, conf, peak, reflectance.
+
+    peak 不取网络输出，改为 bin [PEAK_BIN_LO, PEAK_BIN_HI] 上 hist_k 的最大值。
+    """
     import torch
 
     h = np.asarray(hists, dtype=np.float32)
     with torch.inference_mode():
         inp = torch.from_numpy(h).permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=torch.float32, non_blocking=True)
-        dist_t, conf_t, peak_t, reflectance_t, snr_t = net(inp)
+        dist_t, conf_t, _peak_t, reflectance_t, snr_t = net(inp)
         pred_depth = dist_t[0, 0].cpu().numpy().astype(np.float32, copy=False)
         snr = snr_t[0, 0].cpu().numpy().astype(np.float32, copy=False)
         conf = conf_t[0, 0].cpu().numpy().astype(np.float32, copy=False)
-        peak = peak_t[0, 0].cpu().numpy().astype(np.float32, copy=False)
         reflectance = reflectance_t[0, 0].cpu().numpy().astype(np.float32, copy=False)
+
+    peak = _compute_peak_map(h)
 
     invalid = (~np.isfinite(pred_depth)) | (pred_depth <= 0.0)
     if np.any(invalid):
@@ -635,6 +757,10 @@ def _render_view(
     rotate_90: bool,
     mirror: bool,
     bag_dist_m: np.ndarray | None = None,
+    depth_near_m: float = DEPTH_COLOR_NEAR_M,
+    depth_far_m: float = DEPTH_COLOR_FAR_M,
+    peak_lo: float = PEAK_DISP_LO,
+    peak_hi: float = PEAK_DISP_HI,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
     """渲染面板 + 直方图 + bins 长条。
 
@@ -648,6 +774,8 @@ def _render_view(
 
     Args:
         bag_dist_m: 可选，(H,W) float32 距离(米)，来自 bag 中 alg/dtof_depth。
+        depth_near_m / depth_far_m: 距离伪彩红/蓝端点(米)。
+        peak_lo / peak_hi: PEAK 灰度显示范围。
 
     Returns: (view_bgr, hist_bgr, strip_bgr, tof_px, tof_py)
     """
@@ -655,14 +783,11 @@ def _render_view(
 
     dist_for_disp = np.where(conf > 0.5, dist, 0.0)
     dist_big = cv2.resize(
-        _orient_for_display(_colorize_depth(dist_for_disp), rotate_90, mirror),
+        _orient_for_display(_colorize_depth(dist_for_disp, depth_near_m, depth_far_m), rotate_90, mirror),
         (show_w, show_h), interpolation=cv2.INTER_NEAREST,
     )
 
-    peak_u8 = np.clip(
-        np.power(peak / max(float(peak.mean()), EPS) * (50.0 / 255.0), 1.0 / 1.5) * 255.0,
-        0, 255,
-    ).astype(np.uint8)
+    peak_u8 = _peak_to_u8(peak, peak_lo, peak_hi)
     peak_bgr = cv2.cvtColor(
         cv2.resize(_orient_for_display(peak_u8, rotate_90, mirror), (show_w, show_h), interpolation=cv2.INTER_NEAREST),
         cv2.COLOR_GRAY2BGR,
@@ -676,7 +801,7 @@ def _render_view(
 
     if bag_dist_m is not None:
         bag_panel = cv2.resize(
-            _orient_for_display(_colorize_depth(bag_dist_m), rotate_90, mirror),
+            _orient_for_display(_colorize_depth(bag_dist_m, depth_near_m, depth_far_m), rotate_90, mirror),
             (show_w, show_h), interpolation=cv2.INTER_NEAREST,
         )
 
@@ -694,7 +819,7 @@ def _render_view(
         _draw_marker(img, dx, dy)
 
     _with_text(dist_big, "DISTANCE")
-    _with_text(peak_bgr, "PEAK")
+    _with_text(peak_bgr, f"PEAK [{peak_lo:.0f},{peak_hi:.0f}]")
     _with_text(refl_bgr, "REFLECTANCE")
     if bag_dist_m is not None:
         _with_text(bag_panel, "BAG_DIST")
@@ -709,7 +834,7 @@ def _render_view(
 
     effective_bin = _effective_bin_from_output(
         hists[py, px, :],
-        float(peak[py, px]),
+        float(dist[py, px]),
         float(conf[py, px]),
     )
     hist_img = _render_histogram_bgr(hists[py, px, :], effective_bin=effective_bin)
@@ -732,6 +857,83 @@ DASH_SUB_COLOR = (172, 172, 182)
 # 主视图在合成画布中的固定偏移（鼠标坐标换算用）
 MAIN_OFFSET_X = DASH_PAD
 MAIN_OFFSET_Y = DASH_BANNER_H + DASH_PAD
+
+
+def _render_depth_colorbar(
+    h: int,
+    near_m: float,
+    far_m: float,
+    w: int = CBAR_W,
+    query_m: float | None = None,
+) -> tuple[np.ndarray, dict]:
+    """绘制竖直距离色条（上红下蓝），返回 (图像, ramp 局部几何)。"""
+    import cv2  # type: ignore
+
+    near_m, far_m = _normalize_depth_color_range(near_m, far_m)
+    img = np.zeros((max(int(h), 1), max(int(w), 1), 3), dtype=np.uint8)
+    img[:] = DASH_PANEL_BG
+
+    top_pad, bot_pad = 36, 36
+    bar_x0, bar_w = 10, 18
+    y0 = top_pad
+    y1 = max(y0 + 1, int(h) - bot_pad)
+    ramp_h = y1 - y0
+
+    ramp = np.linspace(255.0, 0.0, ramp_h, dtype=np.float32).reshape(-1, 1)
+    u8 = np.clip(np.rint(ramp), 0, 255).astype(np.uint8)
+    u8 = np.repeat(u8, bar_w, axis=1)
+    cmap = cv2.applyColorMap(u8, cv2.COLORMAP_JET)
+    img[y0:y1, bar_x0:bar_x0 + bar_w] = cmap
+    cv2.rectangle(img, (bar_x0 - 1, y0 - 1), (bar_x0 + bar_w, y1), DASH_PANEL_BORDER, 1, cv2.LINE_AA)
+
+    cv2.putText(img, "RED", (bar_x0 + bar_w + 6, 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (60, 80, 255), 1, cv2.LINE_AA)
+    cv2.putText(img, f"{near_m:.1f}m", (bar_x0 + bar_w + 4, 32),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, DASH_TITLE_COLOR, 1, cv2.LINE_AA)
+    cv2.putText(img, f"{far_m:.1f}m", (bar_x0 + bar_w + 4, int(h) - 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, DASH_TITLE_COLOR, 1, cv2.LINE_AA)
+    cv2.putText(img, "BLUE", (bar_x0 + bar_w + 4, int(h) - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (255, 180, 80), 1, cv2.LINE_AA)
+
+    geom = {
+        "y0": y0,
+        "y1": y1,
+        "x0": bar_x0,
+        "x1": bar_x0 + bar_w,
+        "near_m": near_m,
+        "far_m": far_m,
+    }
+
+    if query_m is not None and np.isfinite(query_m):
+        span = far_m - near_m
+        frac = float(np.clip((float(query_m) - near_m) / span, 0.0, 1.0))
+        qy = int(round(y0 + frac * (ramp_h - 1)))
+        cv2.line(img, (2, qy), (bar_x0 + bar_w + 2, qy), (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(
+            img, f"{float(query_m):.2f}m",
+            (2, max(14, qy - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA,
+        )
+
+    return img, geom
+
+
+def _cbar_query_m(mouse_x: int, mouse_y: int, cbar_rect: dict) -> float | None:
+    """若鼠标在色条 ramp 上，返回该位置对应距离；否则 None。"""
+    x0 = cbar_rect.get("x0")
+    x1 = cbar_rect.get("x1")
+    y0 = cbar_rect.get("y0")
+    y1 = cbar_rect.get("y1")
+    if x0 is None or x1 is None or y0 is None or y1 is None or y1 <= y0:
+        return None
+    if not (x0 - 6 <= mouse_x <= x1 + 40 and y0 <= mouse_y <= y1):
+        return None
+    frac = (float(mouse_y) - float(y0)) / float(y1 - y0)
+    frac = float(np.clip(frac, 0.0, 1.0))
+    near_m = float(cbar_rect.get("near_m", DEPTH_COLOR_NEAR_M))
+    far_m = float(cbar_rect.get("far_m", DEPTH_COLOR_FAR_M))
+    return near_m + frac * (far_m - near_m)
+
 
 def _draw_seek_card(
     canvas: np.ndarray,
@@ -799,6 +1001,303 @@ def _draw_progress_bar(
         bar_rect_out["y1"] = by1
 
 
+_FIELD_LABELS = {
+    "near_m": "最近距离 (m)",
+    "far_m": "最远距离 (m)",
+    "peak_lo": "最小亮度",
+    "peak_hi": "最大亮度",
+}
+_FIELD_KEYS = ("near_m", "far_m", "peak_lo", "peak_hi")
+_CN_FONT_CANDIDATES = (
+    r"C:\Windows\Fonts\msyh.ttc",
+    r"C:\Windows\Fonts\msyh.ttf",
+    r"C:\Windows\Fonts\simhei.ttf",
+    r"C:\Windows\Fonts\simsun.ttc",
+)
+
+
+def _get_cn_font(size: int = 16):
+    try:
+        from PIL import ImageFont  # type: ignore
+    except Exception:
+        return None
+    for path in _CN_FONT_CANDIDATES:
+        try:
+            return ImageFont.truetype(path, size=size)
+        except Exception:
+            continue
+    try:
+        from PIL import ImageFont  # type: ignore
+        return ImageFont.load_default()
+    except Exception:
+        return None
+
+
+def _draw_label_text(
+    canvas: np.ndarray,
+    text: str,
+    x: int,
+    y: int,
+    color_bgr: tuple[int, int, int] = DASH_SUB_COLOR,
+    size: int = 15,
+) -> None:
+    """绘制中文/英文标签；优先 PIL，失败回退 OpenCV ASCII。"""
+    import cv2  # type: ignore
+
+    font = _get_cn_font(size)
+    if font is None:
+        cv2.putText(
+            canvas, text, (x, y + size - 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.42, color_bgr, 1, cv2.LINE_AA,
+        )
+        return
+    try:
+        from PIL import Image, ImageDraw  # type: ignore
+
+        h, w = canvas.shape[:2]
+        # 只在局部贴文字，避免整图画布往返
+        tw = max(8, int(font.getlength(text)) + 4) if hasattr(font, "getlength") else 180
+        th = size + 8
+        x0 = max(0, min(x, w - 1))
+        y0 = max(0, min(y, h - 1))
+        x1 = max(x0 + 1, min(w, x0 + tw))
+        y1 = max(y0 + 1, min(h, y0 + th))
+        patch = canvas[y0:y1, x0:x1]
+        if patch.size == 0:
+            return
+        rgb = cv2.cvtColor(patch, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb)
+        draw = ImageDraw.Draw(img)
+        rgb_color = (int(color_bgr[2]), int(color_bgr[1]), int(color_bgr[0]))
+        draw.text((2, 1), text, font=font, fill=rgb_color)
+        canvas[y0:y1, x0:x1] = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+    except Exception:
+        cv2.putText(
+            canvas, text, (x, y + size - 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.42, color_bgr, 1, cv2.LINE_AA,
+        )
+
+
+def _format_disp_value(key: str, value: float) -> str:
+    if key in ("near_m", "far_m"):
+        return f"{float(value):.1f}"
+    return f"{int(round(float(value)))}"
+
+
+def _begin_field_edit(ctrl: dict, key: str) -> None:
+    if key not in _FIELD_KEYS:
+        return
+    ctrl["focus"] = key
+    ctrl["edit"] = _format_disp_value(key, float(ctrl.get(key, 0.0)))
+    ctrl["drag"] = None
+
+
+def _cancel_field_edit(ctrl: dict) -> None:
+    ctrl["focus"] = None
+    ctrl["edit"] = ""
+
+
+def _commit_field_edit(ctrl: dict) -> bool:
+    """提交当前输入框；成功返回 True。"""
+    key = ctrl.get("focus")
+    if key not in _FIELD_KEYS:
+        return False
+    raw = str(ctrl.get("edit", "")).strip()
+    if raw == "" or raw in (".", "-", "-."):
+        _cancel_field_edit(ctrl)
+        return False
+    try:
+        val = float(raw)
+    except Exception:
+        _cancel_field_edit(ctrl)
+        return False
+    if key in ("near_m", "far_m"):
+        ctrl[key] = round(val, 1)
+    else:
+        ctrl[key] = float(int(round(val)))
+    _sync_disp_ctrl(ctrl)
+    _cancel_field_edit(ctrl)
+    return True
+
+
+def _handle_disp_key(ctrl: dict, key_code: int) -> bool:
+    """输入框键盘处理；返回 True 表示已消费该按键。"""
+    focus = ctrl.get("focus")
+    if focus is None:
+        return False
+
+    k = int(key_code) & 0xFF
+    # Enter
+    if k in (13, 10):
+        _commit_field_edit(ctrl)
+        return True
+    # Esc
+    if k == 27:
+        _cancel_field_edit(ctrl)
+        return True
+    # Backspace
+    if k in (8, 127):
+        ctrl["edit"] = str(ctrl.get("edit", ""))[:-1]
+        return True
+    # digits / dot
+    if ord("0") <= k <= ord("9"):
+        edit = str(ctrl.get("edit", ""))
+        if len(edit) < 12:
+            ctrl["edit"] = edit + chr(k)
+        return True
+    if k == ord(".") and focus in ("near_m", "far_m"):
+        edit = str(ctrl.get("edit", ""))
+        if "." not in edit and len(edit) < 12:
+            ctrl["edit"] = edit + "."
+        return True
+    # 编辑中吞掉空格等其它键，避免误触发播放/录像
+    return True
+
+
+def _draw_text_field(
+    canvas: np.ndarray,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    label: str,
+    value_text: str,
+    focused: bool,
+    accent_bgr: tuple[int, int, int],
+    rect_out: dict | None = None,
+) -> None:
+    """绘制带标签的文字输入框。"""
+    import cv2  # type: ignore
+
+    _draw_label_text(canvas, label, x, y, DASH_SUB_COLOR, size=14)
+    box_y = y + 20
+    box_h = h - 22
+    fill = (44, 40, 36) if not focused else (58, 48, 36)
+    border = accent_bgr if focused else DASH_PANEL_BORDER
+    cv2.rectangle(canvas, (x, box_y), (x + w, box_y + box_h), fill, -1)
+    cv2.rectangle(canvas, (x, box_y), (x + w, box_y + box_h), border, 1, cv2.LINE_AA)
+    if focused:
+        cv2.rectangle(canvas, (x + 1, box_y + 1), (x + w - 1, box_y + box_h - 1), accent_bgr, 1, cv2.LINE_AA)
+
+    show = value_text + ("|" if focused else "")
+    cv2.putText(
+        canvas, show, (x + 10, box_y + box_h - 10),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.55, DASH_TITLE_COLOR, 1, cv2.LINE_AA,
+    )
+
+    if rect_out is not None:
+        rect_out["x0"] = x
+        rect_out["x1"] = x + w
+        rect_out["y0"] = box_y
+        rect_out["y1"] = box_y + box_h
+
+
+def _draw_disp_control_card(
+    canvas: np.ndarray,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    near_m: float,
+    far_m: float,
+    peak_lo: float,
+    peak_hi: float,
+    progress_frac: float | None = None,
+    progress_label: str = "",
+    bar_rect_out: dict | None = None,
+    field_rects_out: dict | None = None,
+    focus_key: str | None = None,
+    edit_text: str = "",
+) -> None:
+    """右下角显示控制卡：可选 seek + 四个文字输入框。"""
+    import cv2  # type: ignore
+
+    if w < 180 or h < 100:
+        return
+
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), DASH_PANEL_BG, -1)
+    cv2.rectangle(canvas, (x - 1, y - 1), (x + w, y + h), DASH_PANEL_BORDER, 1, cv2.LINE_AA)
+
+    pad_x = 14
+    cur_y = y + 18
+    _draw_label_text(canvas, "显示范围", x + pad_x, cur_y - 2, DASH_ACCENT, size=16)
+    # 标题与下方内容拉开，避免和 FRAME 标签重叠
+    cur_y += 30
+
+    if progress_frac is not None:
+        # 先留出 FRAME 文字高度，再画进度条
+        if progress_label:
+            _draw_label_text(
+                canvas, progress_label, x + pad_x, cur_y, DASH_TITLE_COLOR, size=14,
+            )
+            cur_y += 22
+        bar_h = 14
+        _draw_progress_bar(
+            canvas, x, w, cur_y, y + h,
+            float(progress_frac), "", bar_rect_out,
+        )
+        cur_y += bar_h + 22
+
+    near_m, far_m = _normalize_depth_color_range(near_m, far_m)
+    peak_lo, peak_hi = _normalize_peak_disp_range(peak_lo, peak_hi)
+    values = {
+        "near_m": near_m,
+        "far_m": far_m,
+        "peak_lo": peak_lo,
+        "peak_hi": peak_hi,
+    }
+    accents = {
+        "near_m": (60, 80, 255),
+        "far_m": (220, 160, 60),
+        "peak_lo": (120, 200, 140),
+        "peak_hi": (120, 200, 140),
+    }
+
+    gap = 12
+    col_w = (w - pad_x * 2 - gap) // 2
+    row_h = 54
+    row_gap = 12
+    positions = (
+        ("near_m", 0, 0),
+        ("far_m", 1, 0),
+        ("peak_lo", 0, 1),
+        ("peak_hi", 1, 1),
+    )
+
+    if field_rects_out is not None:
+        field_rects_out.clear()
+
+    for key, col, row in positions:
+        fx = x + pad_x + col * (col_w + gap)
+        fy = cur_y + row * (row_h + row_gap)
+        if fy + row_h > y + h - 24:
+            continue
+        focused = focus_key == key
+        text = edit_text if focused else _format_disp_value(key, float(values[key]))
+        rect: dict = {}
+        _draw_text_field(
+            canvas, fx, fy, col_w, row_h,
+            _FIELD_LABELS[key], text, focused, accents[key], rect_out=rect,
+        )
+        if field_rects_out is not None and rect:
+            field_rects_out[key] = rect
+
+    tip_y = y + h - 12
+    tip = "点击输入  Enter确认  Esc取消"
+    if focus_key:
+        tip = f"正在编辑: {_FIELD_LABELS.get(str(focus_key), '')}"
+    _draw_label_text(canvas, tip, x + pad_x, tip_y - 14, (140, 140, 150), size=13)
+
+
+def _hit_field_key(x: int, y: int, field_rects: dict) -> str | None:
+    for key, r in field_rects.items():
+        if r.get("x0") is None:
+            continue
+        if int(r["x0"]) <= x <= int(r["x1"]) and int(r["y0"]) <= y <= int(r["y1"]):
+            return str(key)
+    return None
+
+
 def _compose_dashboard(
     view: np.ndarray,
     hist_img: np.ndarray,
@@ -808,17 +1307,26 @@ def _compose_dashboard(
     progress_frac: float | None = None,
     progress_label: str = "",
     bar_rect_out: dict | None = None,
+    depth_near_m: float = DEPTH_COLOR_NEAR_M,
+    depth_far_m: float = DEPTH_COLOR_FAR_M,
+    peak_lo: float = PEAK_DISP_LO,
+    peak_hi: float = PEAK_DISP_HI,
+    cbar_rect_out: dict | None = None,
+    field_rects_out: dict | None = None,
+    focus_key: str | None = None,
+    edit_text: str = "",
+    mouse_xy: tuple[int, int] | None = None,
 ) -> np.ndarray:
-    """把主视图 / 直方图 / bins 表格合成到单张深色仪表盘画布。
+    """把主视图 / 色条 / 直方图 / bins 表格合成到单张深色仪表盘画布。
 
     布局：
-        ┌── banner ───────────────────────────────┐
-        │ NN ToF Realtime              <status>    │
-        ├──────────┬────────┬──────────────────────┤
-        │  MAIN    │  BINS  │  HOVER INFO           │
-        │ (2x2)    │ (table)│  HIST                 │
-        │          │        │  SEEK BAR (bag)       │
-        └──────────┴────────┴──────────────────────┘
+        ┌── banner ──────────────────────────────────────┐
+        │ NN ToF Realtime                     <status>    │
+        ├──────────┬──────┬────────┬─────────────────────┤
+        │  MAIN    │ CBAR │  BINS  │  HOVER INFO          │
+        │ (2x2)    │色条  │ (table)│  HIST                │
+        │          │      │        │  显示范围输入(右下)   │
+        └──────────┴──────┴────────┴─────────────────────┘
     主视图固定置于 (MAIN_OFFSET_X, MAIN_OFFSET_Y)，鼠标坐标据此换算。
     """
     import cv2  # type: ignore
@@ -828,14 +1336,37 @@ def _compose_dashboard(
     hh, hw = hist_img.shape[:2]
     hover = [ln for ln in (hover_lines or []) if ln]
     hover_row_h = 22
-    hover_h = (10 + len(hover) * hover_row_h + 8) if hover else 0
+    # +1 预留色条查询行 cmap Xm
+    hover_h = (10 + (len(hover) + 1) * hover_row_h + 8) if hover else 0
 
     pad, gap, banner = DASH_PAD, DASH_GAP, DASH_BANNER_H
     right_h = hover_h + (gap if hover_h else 0) + hh
     content_h = max(mh, sh, right_h)
 
+    # 先用鼠标位置对色条做一次查询（几何与放置一致）
+    cbar_x = pad + mw + gap
+    cbar_y = banner + pad
+    prelim_near, prelim_far = _normalize_depth_color_range(depth_near_m, depth_far_m)
+    query_m = None
+    if mouse_xy is not None:
+        # 色条 ramp 在局部坐标，需先合成后再精确查询；这里用与 _render 相同的局部几何预估
+        local = {
+            "x0": cbar_x + 10,
+            "x1": cbar_x + 10 + 18,
+            "y0": cbar_y + 36,
+            "y1": cbar_y + max(37, mh - 36),
+            "near_m": prelim_near,
+            "far_m": prelim_far,
+        }
+        query_m = _cbar_query_m(int(mouse_xy[0]), int(mouse_xy[1]), local)
+
+    cbar_img, cbar_geom = _render_depth_colorbar(
+        mh, depth_near_m, depth_far_m, w=CBAR_W, query_m=query_m,
+    )
+    cw = int(cbar_img.shape[1])
+
     main_x, main_y = pad, banner + pad
-    strip_x, strip_y = main_x + mw + gap, banner + pad
+    strip_x, strip_y = cbar_x + cw + gap, banner + pad
     hist_x = strip_x + sw + gap
     hover_y = banner + pad
     hist_y = hover_y + hover_h + (gap if hover_h else 0)
@@ -862,7 +1393,16 @@ def _compose_dashboard(
         cv2.rectangle(canvas, (x - 1, y - 1), (x + iw, y + ih), DASH_PANEL_BORDER, 1, cv2.LINE_AA)
 
     place(view, main_x, main_y)
+    place(cbar_img, cbar_x, cbar_y)
     place(strip_img, strip_x, strip_y)
+
+    if cbar_rect_out is not None:
+        cbar_rect_out["x0"] = cbar_x + int(cbar_geom["x0"])
+        cbar_rect_out["x1"] = cbar_x + int(cbar_geom["x1"])
+        cbar_rect_out["y0"] = cbar_y + int(cbar_geom["y0"])
+        cbar_rect_out["y1"] = cbar_y + int(cbar_geom["y1"])
+        cbar_rect_out["near_m"] = float(cbar_geom["near_m"])
+        cbar_rect_out["far_m"] = float(cbar_geom["far_m"])
 
     if hover_h > 0:
         cv2.rectangle(canvas, (hist_x, hover_y), (hist_x + hw, hover_y + hover_h), DASH_PANEL_BG, -1)
@@ -870,7 +1410,10 @@ def _compose_dashboard(
             canvas, (hist_x - 1, hover_y - 1), (hist_x + hw, hover_y + hover_h),
             DASH_PANEL_BORDER, 1, cv2.LINE_AA,
         )
-        for i, ln in enumerate(hover):
+        lines = list(hover)
+        if query_m is not None:
+            lines.append(f"cmap {float(query_m):.2f}m")
+        for i, ln in enumerate(lines):
             cv2.putText(
                 canvas, ln, (hist_x + 12, hover_y + 10 + (i + 1) * hover_row_h - 4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, DASH_TITLE_COLOR, 1, cv2.LINE_AA,
@@ -882,12 +1425,19 @@ def _compose_dashboard(
     info_y = hist_y + hh + gap
     info_w = hw
     info_h = (main_y + mh) - info_y
-    if info_h > 40 and progress_frac is not None:
-        _draw_seek_card(
+    if info_h > 80:
+        _draw_disp_control_card(
             canvas, info_x, info_y, info_w, info_h,
-            float(progress_frac),
+            near_m=depth_near_m,
+            far_m=depth_far_m,
+            peak_lo=peak_lo,
+            peak_hi=peak_hi,
+            progress_frac=progress_frac,
             progress_label=progress_label,
             bar_rect_out=bar_rect_out,
+            field_rects_out=field_rects_out,
+            focus_key=focus_key,
+            edit_text=edit_text,
         )
 
     return canvas
@@ -1062,6 +1612,9 @@ def _run_bag_mode(bag_path_str: str) -> int:
 
     mouse: dict = {"x": 0, "y": 0}
     bar_rect: dict = {}          # 进度条画布坐标，由 _compose_dashboard 回填
+    cbar_rect: dict = {}         # 距离色条 ramp 画布坐标
+    field_rects: dict = {}       # 显示范围输入框命中区
+    disp_ctrl = _default_disp_ctrl()
     seek: dict = {"idx": None}   # 拖动进度条产生的目标帧
 
     def _seek_from_x(mx: int) -> None:
@@ -1082,14 +1635,22 @@ def _run_bag_mode(bag_path_str: str) -> int:
 
     def on_mouse(event: int, x: int, y: int, flags: int, userdata: object) -> None:
         mouse["x"], mouse["y"] = int(x), int(y)
-        if int(event) == int(cv2.EVENT_LBUTTONDOWN) and _in_bar(x, y):
-            _seek_from_x(x)
-        elif (
-            int(event) == int(cv2.EVENT_MOUSEMOVE)
-            and (int(flags) & int(cv2.EVENT_FLAG_LBUTTON))
-            and _in_bar(x, y)
-        ):
-            _seek_from_x(x)
+        ev = int(event)
+        if ev == int(cv2.EVENT_LBUTTONDOWN):
+            key = _hit_field_key(x, y, field_rects)
+            if key is not None:
+                _begin_field_edit(disp_ctrl, key)
+            else:
+                if disp_ctrl.get("focus") is not None:
+                    _commit_field_edit(disp_ctrl)
+                if _in_bar(x, y):
+                    disp_ctrl["drag"] = "seek"
+                    _seek_from_x(x)
+        elif ev == int(cv2.EVENT_MOUSEMOVE) and (int(flags) & int(cv2.EVENT_FLAG_LBUTTON)):
+            if disp_ctrl.get("drag") == "seek":
+                _seek_from_x(x)
+        elif ev == int(cv2.EVENT_LBUTTONUP):
+            disp_ctrl["drag"] = None
 
     cv2.setMouseCallback(win, on_mouse)
 
@@ -1097,7 +1658,7 @@ def _run_bag_mode(bag_path_str: str) -> int:
     play_interval_ms = int(round(1000.0 / _BAG_PLAY_HZ))
     next_play_ms = 0
     idx = 0
-    print(f"[INFO] 共 {n} 帧, A/D ← → 切帧, 空格 播放/暂停, ESC 退出")
+    print(f"[INFO] 共 {n} 帧, A/D ← → 切帧, 空格 播放/暂停, 右下角输入显示范围, ESC 退出")
 
     while True:
         if seek["idx"] is not None:
@@ -1114,6 +1675,11 @@ def _run_bag_mode(bag_path_str: str) -> int:
             next_play_ms = now_ms + play_interval_ms
 
         header, hist = frames[idx]
+        _sync_disp_ctrl(disp_ctrl)
+        depth_near_m = float(disp_ctrl["near_m"])
+        depth_far_m = float(disp_ctrl["far_m"])
+        peak_lo = float(disp_ctrl["peak_lo"])
+        peak_hi = float(disp_ctrl["peak_hi"])
 
         bag_dist_m = None
         bag_depth_entry = bag_depth_map.get(header.frame_id)
@@ -1128,6 +1694,10 @@ def _run_bag_mode(bag_path_str: str) -> int:
             mouse["x"] - MAIN_OFFSET_X, mouse["y"] - MAIN_OFFSET_Y,
             show_w, show_h, rotate_90, mirror,
             bag_dist_m=bag_dist_m,
+            depth_near_m=depth_near_m,
+            depth_far_m=depth_far_m,
+            peak_lo=peak_lo,
+            peak_hi=peak_hi,
         )
 
         hover_lines = [
@@ -1149,10 +1719,23 @@ def _run_bag_mode(bag_path_str: str) -> int:
             progress_frac=progress_frac,
             progress_label=f"FRAME  {idx}/{n - 1}",
             bar_rect_out=bar_rect,
+            depth_near_m=depth_near_m,
+            depth_far_m=depth_far_m,
+            peak_lo=peak_lo,
+            peak_hi=peak_hi,
+            cbar_rect_out=cbar_rect,
+            field_rects_out=field_rects,
+            focus_key=disp_ctrl.get("focus"),
+            edit_text=str(disp_ctrl.get("edit", "")),
+            mouse_xy=(int(mouse["x"]), int(mouse["y"])),
         )
         cv2.imshow(win, canvas)
 
         key = cv2.waitKeyEx(20)
+        if key < 0:
+            continue
+        if _handle_disp_key(disp_ctrl, key):
+            continue
         if key in (27, ord("q"), ord("Q")):
             break
         if key == ord(" "):
@@ -1205,12 +1788,19 @@ def main() -> int:
 
     cv2.namedWindow("NN_REALTIME", cv2.WINDOW_AUTOSIZE)
     mouse = {"x": 0, "y": 0}
+    field_rects: dict = {}
+    disp_ctrl = _default_disp_ctrl()
 
     def on_mouse(event: int, x: int, y: int, flags: int, userdata: object) -> None:
-        if int(event) != int(cv2.EVENT_MOUSEMOVE):
-            return
         mouse["x"] = int(x)
         mouse["y"] = int(y)
+        ev = int(event)
+        if ev == int(cv2.EVENT_LBUTTONDOWN):
+            key = _hit_field_key(x, y, field_rects)
+            if key is not None:
+                _begin_field_edit(disp_ctrl, key)
+            elif disp_ctrl.get("focus") is not None:
+                _commit_field_edit(disp_ctrl)
 
     cv2.setMouseCallback("NN_REALTIME", on_mouse)
 
@@ -1225,6 +1815,7 @@ def main() -> int:
     cached_reflectance: np.ndarray | None = None
     cached_conf: np.ndarray | None = None
     last_mouse_xy = (-1, -1)
+    last_color_range: tuple = (None, None, None, None)
     frame_cache: np.ndarray | None = None
 
     io_fps = 0.0
@@ -1277,11 +1868,19 @@ def main() -> int:
 
             mouse_xy = (int(mouse.get("x", 0)), int(mouse.get("y", 0)))
             rec_on = rec_writer is not None
+            _sync_disp_ctrl(disp_ctrl)
+            depth_near_m = float(disp_ctrl["near_m"])
+            depth_far_m = float(disp_ctrl["far_m"])
+            peak_lo = float(disp_ctrl["peak_lo"])
+            peak_hi = float(disp_ctrl["peak_hi"])
+            color_range = (depth_near_m, depth_far_m, peak_lo, peak_hi)
             need_redraw = (
                 got_new_frame
                 or (mouse_xy != last_mouse_xy)
                 or (frame_cache is None)
                 or (rec_on != last_rec_on)
+                or (color_range != last_color_range)
+                or (disp_ctrl.get("focus") is not None)
             )
 
             if need_redraw:
@@ -1290,6 +1889,10 @@ def main() -> int:
                     cached_in,
                     mouse_xy[0] - MAIN_OFFSET_X, mouse_xy[1] - MAIN_OFFSET_Y,
                     show_w, show_h, rotate_90, mirror,
+                    depth_near_m=depth_near_m,
+                    depth_far_m=depth_far_m,
+                    peak_lo=peak_lo,
+                    peak_hi=peak_hi,
                 )
 
                 dt_fps = now - fps_tick
@@ -1330,9 +1933,18 @@ def main() -> int:
                 frame_cache = _compose_dashboard(
                     view, hist_new, strip_new, status,
                     hover_lines=hover_lines,
+                    depth_near_m=depth_near_m,
+                    depth_far_m=depth_far_m,
+                    peak_lo=peak_lo,
+                    peak_hi=peak_hi,
+                    field_rects_out=field_rects,
+                    focus_key=disp_ctrl.get("focus"),
+                    edit_text=str(disp_ctrl.get("edit", "")),
+                    mouse_xy=mouse_xy,
                 )
                 last_mouse_xy = mouse_xy
                 last_rec_on = rec_on
+                last_color_range = color_range
 
             ui_cnt += 1
             cv2.imshow("NN_REALTIME", frame_cache)
@@ -1340,6 +1952,8 @@ def main() -> int:
                 rec_writer.write(frame_cache)
 
             k = int(cv2.waitKey(1) & 0xFF)
+            if k != 255 and _handle_disp_key(disp_ctrl, k):
+                continue
             if k == 32:  # Space: toggle recording
                 if rec_writer is None:
                     rec_err = ""
