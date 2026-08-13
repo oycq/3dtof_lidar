@@ -52,7 +52,8 @@ nn/net.py
    peak 则不走 one-hot, 直接取归一化直方图的最大值:
       peak        = amax(hist_k, dim=1)
 
-7) conf = amax(valid_mask, dim=1), 即任一 bin 通过 3 路 mask 即为有效像素
+7) conf = amax(valid_mask, dim=1), 再乘 _alias_mask(snr_per_bin):
+      首/末 bin SNR>3, 或 SNR>2 的 bin 数超过 16, 判为混叠无效
 """
 
 import torch
@@ -80,6 +81,11 @@ PEAK_EPS = 0.4
 
 # 计算 bin 维均值(背景噪声)时只统计最后 30 个 bin
 MEAN_TAIL_BINS = 30
+
+# 混叠判定: 首/末 bin SNR 过高, 或高 SNR bin 过多, 视为回波跨拍缠绕
+ALIAS_EDGE_SNR = 3.0
+ALIAS_SPREAD_SNR = 2.0
+ALIAS_SPREAD_MAX = 16.0
 
 
 class Network(nn.Module):
@@ -141,6 +147,21 @@ class Network(nn.Module):
         snr  = signal_per_bin / noise
         mask = torch.relu(torch.sign(snr - SNR_THRESH))
         return snr, mask
+
+    def _alias_mask(self, snr_per_bin):
+        """混叠判定, 输出 (B, 1, H, W) 的 0/1 mask, 1=无混叠(有效), 0=混叠(无效).
+
+        无效条件(满足任一即混叠):
+          1) 第一个 bin 或最后一个 bin 的 SNR > ALIAS_EDGE_SNR
+          2) SNR > ALIAS_SPREAD_SNR 的 bin 个数超过 ALIAS_SPREAD_MAX
+        """
+        snr_first, _, snr_last = torch.split(snr_per_bin, [1, 60, 1], dim=1)
+        edge_hit = torch.relu(torch.sign(snr_first - ALIAS_EDGE_SNR)) + \
+                   torch.relu(torch.sign(snr_last - ALIAS_EDGE_SNR))
+        spread_cnt = torch.sum(
+            torch.relu(torch.sign(snr_per_bin - ALIAS_SPREAD_SNR)), dim=1, keepdim=True)
+        spread_hit = torch.relu(torch.sign(spread_cnt - ALIAS_SPREAD_MAX))
+        return torch.relu(torch.sign(0.5 - edge_hit - spread_hit))
 
     def _reflectance_and_mask(self, signal_per_bin, dist_per_bin):
         """每 bin 的反射率 = dist^2 * signal / K, 以及 reflect mask = (reflect > REFLECT_THRESH).
@@ -207,8 +228,9 @@ class Network(nn.Module):
         snr         = torch.sum(one_hot_mask * snr_per_bin,         dim=1, keepdim=True)
         peak        = torch.amax(hist_k,                            dim=1, keepdim=True)
 
-        # ---- 6) conf: 该像素任一 bin 通过 3 路 mask 即为有效 ----
+        # ---- 6) conf: 该像素任一 bin 通过 3 路 mask 即为有效, 再乘混叠 mask ----
         conf = torch.amax(valid_mask, dim=1, keepdim=True)
+        conf = conf * self._alias_mask(snr_per_bin)
 
         return dist, conf, peak, reflectance, snr
 
