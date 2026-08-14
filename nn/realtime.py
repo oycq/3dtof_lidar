@@ -22,12 +22,14 @@ nn/realtime.py
 from __future__ import annotations
 
 import argparse
+import os
 import struct
 import sys
 import time
 import threading
 import subprocess
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -119,6 +121,8 @@ _BAG_PAYLOAD_SIZE_V2 = (
 
 _BAG_RAW_TOPIC = "sensor/vp_tof_info"
 _BAG_PLAY_HZ = 10.0
+_BAG_LOAD_WORKERS = max(1, min(os.cpu_count() or 4, 16))
+_BAG_INFER_BATCH = 64
 
 # BAG 深度 topic (alg/dtof_depth) 常量
 _BAG_DEPTH_TOPIC = "alg/dtof_depth"
@@ -698,14 +702,15 @@ def _compute_peak_map(hists: np.ndarray) -> np.ndarray:
     """显示用 peak = max(hist_k[PEAK_BIN_LO..PEAK_BIN_HI])。
 
     hist_k = hist * PULSES / sat_value，sat_value = bin62*1024 + bin63。
+    支持 (H,W,64) 或 (N,H,W,64)。
     """
     h = np.asarray(hists, dtype=np.float32)
-    if h.ndim != 3 or h.shape[2] < TOF_C:
+    if h.ndim not in (3, 4) or h.shape[-1] < TOF_C:
         raise ValueError(f"bad hists shape: {h.shape}")
-    sat_value = h[:, :, 62] * TAIL_BASE + h[:, :, 63]
+    sat_value = h[..., 62] * TAIL_BASE + h[..., 63]
     sat_value = np.where(sat_value > 0.0, sat_value, float(PULSES))
-    hist_k = h[:, :, PEAK_BIN_LO : PEAK_BIN_HI + 1] * (float(PULSES) / sat_value[..., None])
-    return np.max(hist_k, axis=2).astype(np.float32, copy=False)
+    hist_k = h[..., PEAK_BIN_LO : PEAK_BIN_HI + 1] * (float(PULSES) / sat_value[..., None])
+    return np.max(hist_k, axis=-1).astype(np.float32, copy=False)
 
 
 def _run_infer(net, device, hists: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -740,6 +745,43 @@ def _run_infer(net, device, hists: np.ndarray) -> tuple[np.ndarray, np.ndarray, 
         reflectance[invalid] = 0.0
 
     return pred_depth, snr, conf, peak, reflectance
+
+
+def _run_infer_batch(
+    net, device, hists_nhwc: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """hist (N,H,W,64) -> dist/snr/conf/peak/refl，各 (N,H,W)。"""
+    import torch
+
+    h = np.asarray(hists_nhwc, dtype=np.float32)
+    if h.ndim != 4 or h.shape[1:] != (TOF_H, TOF_W, TOF_C):
+        raise ValueError(f"bad batch hists shape: {h.shape}")
+    with torch.inference_mode():
+        inp = torch.from_numpy(h).permute(0, 3, 1, 2).to(
+            device=device, dtype=torch.float32, non_blocking=True,
+        )
+        dist_t, conf_t, _peak_t, reflectance_t, snr_t = net(inp)
+        dist = dist_t[:, 0].cpu().numpy().astype(np.float32, copy=False)
+        snr = snr_t[:, 0].cpu().numpy().astype(np.float32, copy=False)
+        conf = conf_t[:, 0].cpu().numpy().astype(np.float32, copy=False)
+        reflectance = reflectance_t[:, 0].cpu().numpy().astype(np.float32, copy=False)
+
+    peak = _compute_peak_map(h)
+
+    invalid = (~np.isfinite(dist)) | (dist <= 0.0)
+    if np.any(invalid):
+        dist = dist.copy()
+        snr = snr.copy()
+        conf = conf.copy()
+        peak = peak.copy()
+        reflectance = reflectance.copy()
+        dist[invalid] = 0.0
+        snr[invalid] = 0.0
+        conf[invalid] = 0.0
+        peak[invalid] = 0.0
+        reflectance[invalid] = 0.0
+
+    return dist, snr, conf, peak, reflectance
 
 
 # ======================== 共用渲染 ========================
@@ -1496,53 +1538,86 @@ def _parse_vp_dtof_depth(payload: bytes):
     return frame_id, dist, conf
 
 
-def _load_bag_depth_map(bag_path: Path) -> dict:
-    """从 BAG/MCAP 加载 alg/dtof_depth topic，返回 {frame_id: (dist_mm, conf)}。"""
-    from mcap.reader import NonSeekingReader, make_reader
+def _parse_mcap_message(topic: str, payload: bytes):
+    """按 topic 解析一条消息，无法识别则返回 None。"""
+    if topic == _BAG_RAW_TOPIC:
+        return _parse_vp_tof_info(payload)
+    if topic == _BAG_DEPTH_TOPIC:
+        return _parse_vp_dtof_depth(payload)
+    return None
 
-    depth_map: dict = {}
-    print(f"[INFO] 加载 bag depth ({_BAG_DEPTH_TOPIC}): {bag_path.name}")
 
-    def consume(msg_iter):
-        for _, channel, message in msg_iter:
-            if (channel.topic or "") != _BAG_DEPTH_TOPIC:
-                continue
-            parsed = _parse_vp_dtof_depth(message.data)
-            if parsed:
-                fid, dist_mm, conf = parsed
-                depth_map[fid] = (dist_mm, conf)
+def _mcap_chunk_jobs(bag_path: Path, topics: set[str]):
+    """读取 summary，返回 (chunk 偏移列表, channel_id->topic)；无索引则 None。"""
+    from mcap.reader import make_reader
 
     with bag_path.open("rb") as f:
         try:
-            consume(make_reader(f).iter_messages())
+            summary = make_reader(f).get_summary()
         except Exception:
-            f.seek(0)
-            try:
-                consume(NonSeekingReader(f).iter_messages(log_time_order=False))
-            except Exception:
-                pass
-    print(f"[OK] bag depth 帧数: {len(depth_map)}")
-    return depth_map
+            return None
+    if summary is None or not summary.chunk_indexes:
+        return None
+    channel_topics = {cid: (ch.topic or "") for cid, ch in summary.channels.items()}
+    offsets: list[int] = []
+    for chunk_index in summary.chunk_indexes:
+        for channel_id in chunk_index.message_index_offsets:
+            if channel_topics.get(channel_id) in topics:
+                offsets.append(int(chunk_index.chunk_start_offset))
+                break
+    if not offsets:
+        return None
+    return offsets, channel_topics
 
 
-def _load_bag_frames(bag_path: Path) -> list:
-    """从 BAG/MCAP 文件加载所有 VpTofInfo 帧，返回 [(TofInfoHeader, hist), ...]。"""
-    from mcap.exceptions import EndOfFile
+def _parse_mcap_chunk_range(
+    bag_path: str,
+    offsets: list[int],
+    channel_topics: dict[int, str],
+    wanted: tuple[str, ...],
+) -> tuple[dict[str, list], dict[str, int]]:
+    """顺序解析一段 chunk，解压与 numpy 拷贝可与其它线程并行。"""
+    from mcap.data_stream import ReadDataStream
+    from mcap.records import Chunk, Message
+    from mcap.stream_reader import breakup_chunk
+
+    wanted_set = set(wanted)
+    out: dict[str, list] = {t: [] for t in wanted}
+    cnt: dict[str, int] = {t: 0 for t in wanted}
+    with open(bag_path, "rb") as f:
+        for off in offsets:
+            f.seek(off + 1 + 8)
+            chunk = Chunk.read(ReadDataStream(f))
+            for record in breakup_chunk(chunk):
+                if not isinstance(record, Message):
+                    continue
+                topic = channel_topics.get(record.channel_id, "")
+                if topic not in wanted_set:
+                    continue
+                cnt[topic] += 1
+                parsed = _parse_mcap_message(topic, record.data)
+                if parsed is not None:
+                    out[topic].append(parsed)
+    return out, cnt
+
+
+def _load_bag_topics_sequential(bag_path: Path, topics: tuple[str, ...]) -> tuple[dict[str, list], dict[str, int]]:
+    """无 chunk 索引时的单线程顺序读取。"""
     from mcap.reader import NonSeekingReader, make_reader
 
-    frames: list = []
-    print(f"[INFO] 扫描: {bag_path}")
-    cnt = 0
+    wanted = set(topics)
+    out: dict[str, list] = {t: [] for t in topics}
+    cnt: dict[str, int] = {t: 0 for t in topics}
 
-    def consume(msg_iter):
-        nonlocal cnt
+    def consume(msg_iter) -> None:
         for _, channel, message in msg_iter:
-            if (channel.topic or "") != _BAG_RAW_TOPIC:
+            topic = channel.topic or ""
+            if topic not in wanted:
                 continue
-            cnt += 1
-            parsed = _parse_vp_tof_info(message.data)
-            if parsed:
-                frames.append(parsed)
+            cnt[topic] += 1
+            parsed = _parse_mcap_message(topic, message.data)
+            if parsed is not None:
+                out[topic].append(parsed)
 
     with bag_path.open("rb") as f:
         try:
@@ -1554,7 +1629,84 @@ def _load_bag_frames(bag_path: Path) -> list:
                 consume(NonSeekingReader(f).iter_messages(log_time_order=False))
             except Exception as exc2:
                 print(f"[WARN] {bag_path.name}: 顺序读取结束 ({exc2})，已保留可读帧")
-    print(f"[OK] {bag_path.name}: topic帧={cnt}, 有效帧={len(frames)}")
+    return out, cnt
+
+
+def _split_even(items: list[int], n: int) -> list[list[int]]:
+    n = max(1, min(n, len(items)))
+    size = (len(items) + n - 1) // n
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+def _finalize_bag_topics(
+    out: dict[str, list], cnt: dict[str, int],
+) -> tuple[dict[str, list], dict[str, int]]:
+    if _BAG_RAW_TOPIC in out:
+        out[_BAG_RAW_TOPIC].sort(key=lambda x: (x[0].timestamp_us, x[0].frame_id))
+    return out, cnt
+
+
+def _load_bag_topics(bag_path: Path, topics: tuple[str, ...]) -> tuple[dict[str, list], dict[str, int]]:
+    """按 chunk 并行加载若干 topic；无索引则回退顺序读取。"""
+    jobs = _mcap_chunk_jobs(bag_path, set(topics))
+    if jobs is None:
+        return _finalize_bag_topics(*_load_bag_topics_sequential(bag_path, topics))
+
+    offsets, channel_topics = jobs
+    n_workers = min(_BAG_LOAD_WORKERS, len(offsets))
+    groups = _split_even(offsets, n_workers)
+    print(
+        f"[INFO] 并行加载 {bag_path.name}: chunks={len(offsets)} workers={len(groups)}"
+    )
+    out: dict[str, list] = {t: [] for t in topics}
+    cnt: dict[str, int] = {t: 0 for t in topics}
+    try:
+        with ThreadPoolExecutor(max_workers=len(groups)) as ex:
+            futs = [
+                ex.submit(
+                    _parse_mcap_chunk_range,
+                    str(bag_path),
+                    group,
+                    channel_topics,
+                    topics,
+                )
+                for group in groups
+            ]
+            for fut in futs:
+                part, part_cnt = fut.result()
+                for topic in topics:
+                    out[topic].extend(part.get(topic, []))
+                    cnt[topic] += int(part_cnt.get(topic, 0))
+    except Exception as exc:
+        print(f"[WARN] 并行加载失败 ({exc})，改为顺序读取")
+        return _finalize_bag_topics(*_load_bag_topics_sequential(bag_path, topics))
+
+    return _finalize_bag_topics(out, cnt)
+
+
+def _depth_list_to_map(items: list) -> dict:
+    depth_map: dict = {}
+    for parsed in items:
+        fid, dist_mm, conf = parsed
+        depth_map[fid] = (dist_mm, conf)
+    return depth_map
+
+
+def _load_bag_depth_map(bag_path: Path) -> dict:
+    """从 BAG/MCAP 加载 alg/dtof_depth topic，返回 {frame_id: (dist_mm, conf)}。"""
+    print(f"[INFO] 加载 bag depth ({_BAG_DEPTH_TOPIC}): {bag_path.name}")
+    loaded, cnt = _load_bag_topics(bag_path, (_BAG_DEPTH_TOPIC,))
+    depth_map = _depth_list_to_map(loaded[_BAG_DEPTH_TOPIC])
+    print(f"[OK] bag depth 帧数: {len(depth_map)} (topic={cnt[_BAG_DEPTH_TOPIC]})")
+    return depth_map
+
+
+def _load_bag_frames(bag_path: Path) -> list:
+    """从 BAG/MCAP 文件加载所有 VpTofInfo 帧，返回 [(TofInfoHeader, hist), ...]。"""
+    print(f"[INFO] 扫描: {bag_path}")
+    loaded, cnt = _load_bag_topics(bag_path, (_BAG_RAW_TOPIC,))
+    frames = loaded[_BAG_RAW_TOPIC]
+    print(f"[OK] {bag_path.name}: topic帧={cnt[_BAG_RAW_TOPIC]}, 有效帧={len(frames)}")
     return frames
 
 
@@ -1575,12 +1727,17 @@ def _run_bag_mode(bag_path_str: str) -> int:
         print(f"[ERR] 文件不存在: {bag_path}")
         return 1
 
-    frames = _load_bag_frames(bag_path)
+    print(f"[INFO] 扫描: {bag_path}")
+    loaded, cnt = _load_bag_topics(bag_path, (_BAG_RAW_TOPIC, _BAG_DEPTH_TOPIC))
+    frames = loaded[_BAG_RAW_TOPIC]
+    bag_depth_map = _depth_list_to_map(loaded[_BAG_DEPTH_TOPIC])
+    print(
+        f"[OK] {bag_path.name}: tof topic={cnt[_BAG_RAW_TOPIC]} 有效={len(frames)}, "
+        f"depth topic={cnt[_BAG_DEPTH_TOPIC]} 有效={len(bag_depth_map)}"
+    )
     if not frames:
         print("[ERR] 没有有效帧")
         return 1
-
-    bag_depth_map = _load_bag_depth_map(bag_path)
 
     nn_dir = Path(__file__).resolve().parent
     if str(nn_dir) in sys.path:
@@ -1593,18 +1750,25 @@ def _run_bag_mode(bag_path_str: str) -> int:
     net.eval()
 
     n = len(frames)
-    print(f"[INFO] 批量推理 {n} 帧...")
+    print(f"[INFO] 批量推理 {n} 帧 (batch={_BAG_INFER_BATCH}, device={device})...")
     all_dist = np.zeros((n, TOF_H, TOF_W), dtype=np.float32)
     all_snr = np.zeros_like(all_dist)
     all_conf = np.zeros_like(all_dist)
     all_peak = np.zeros_like(all_dist)
     all_refl = np.zeros_like(all_dist)
 
-    for i, (_, hist) in enumerate(frames):
-        d, s, c, p, r = _run_infer(net, device, hist.astype(np.float32))
-        all_dist[i], all_snr[i], all_conf[i], all_peak[i], all_refl[i] = d, s, c, p, r
-        if (i + 1) % 100 == 0 or i == n - 1:
-            print(f"  [{i + 1}/{n}]")
+    for start in range(0, n, _BAG_INFER_BATCH):
+        end = min(start + _BAG_INFER_BATCH, n)
+        batch_h = np.stack(
+            [frames[i][1] for i in range(start, end)], axis=0,
+        ).astype(np.float32, copy=False)
+        d, s, c, p, r = _run_infer_batch(net, device, batch_h)
+        all_dist[start:end] = d
+        all_snr[start:end] = s
+        all_conf[start:end] = c
+        all_peak[start:end] = p
+        all_refl[start:end] = r
+        print(f"  [{end}/{n}]")
     print("[OK] 推理完成")
 
     win = "NN_REALTIME"
