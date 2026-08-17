@@ -168,10 +168,11 @@ class Network(nn.Module):
     def _reflectance_and_mask(self, signal_per_bin, dist_per_bin):
         """每 bin 的反射率 = dist^2 * signal / K, 以及 reflect mask = (reflect > REFLECT_THRESH).
 
-        量化友好: signal 先 clamp 到 MAX_REFL*K/dist^2, 保证 reflect 最大 = MAX_REFL (物理上限 3000%)
+        量化友好: signal 先 clamp 到 [0, MAX_REFL*K/dist^2], 保证 reflect 落在 [0, MAX_REFL] (物理上限 3000%).
+        低于背景的 bin 会给出负 signal, 必须先 relu 掉, 否则 minimum 直接放行成大负数离群值.
         """
         dist_sq             = dist_per_bin * dist_per_bin
-        signal_clip         = torch.minimum(signal_per_bin, (MAX_REFL * REFLECT_K) / dist_sq)
+        signal_clip         = torch.minimum(torch.relu(signal_per_bin), (MAX_REFL * REFLECT_K) / dist_sq)
         reflectance_per_bin = dist_sq * signal_clip / REFLECT_K
         mask                = torch.relu(torch.sign(reflectance_per_bin - REFLECT_THRESH))
         return reflectance_per_bin, mask
