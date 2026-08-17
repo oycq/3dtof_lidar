@@ -29,9 +29,11 @@ nn/net.py
       dist_per_bin = centroid * DIST_SCALE_M + DIST_BIAS       (B, 62, H, W)
 
 3) 每 bin 的信号量 (形状都是 (B, 62, H, W)):
+      # 背景电平取首 3 个 bin 均值与末 3 个 bin 均值中的较大者
+      mean_bg             = max(mean(hist[:, :3]), mean(hist[:, -3:]))
       # SNR 用原始 hist 算 (保留真实光子噪声统计)
-      signal_raw_per_bin  = hist   - mean(hist,   dim=1)
-      snr_per_bin         = signal_raw_per_bin / (sqrt(mean(hist))   + NOISE_BIAS)
+      signal_raw_per_bin  = hist   - mean_bg
+      snr_per_bin         = signal_raw_per_bin / (sqrt(mean_bg)      + NOISE_BIAS)
       # reflect 用归一化 hist_k 算 (脉冲数无关)
       signal_k_per_bin    = hist_k - mean(hist_k, dim=1)
       reflectance_per_bin = dist_per_bin^2 * signal_k_per_bin / REFLECT_K
@@ -52,8 +54,9 @@ nn/net.py
    peak 则不走 one-hot, 直接取归一化直方图的最大值:
       peak        = amax(hist_k, dim=1)
 
-7) conf = amax(valid_mask, dim=1), 再乘 _alias_mask(snr_per_bin):
-      首 bin 或末 bin 的 SNR > 3 (3 sigma) 时判为混叠, conf 置 0
+7) conf = amax(valid_mask, dim=1), 再乘 _alias_mask(hist, one_hot_mask):
+      反解底噪电平 m 使 m + 4*sqrt(m) = 选中 bin 的计数, 高于 m 的 bin
+      超过 15 个时判为混叠, conf 置 0
 """
 
 import torch
@@ -79,11 +82,15 @@ MIN_DIST_M = 0.4
 # peak mask 的偏置: 用于 sign(x - peak_val + PEAK_EPS) 在 peak 位置输出 1
 PEAK_EPS = 0.4
 
-# 计算 bin 维均值(背景噪声)时只统计最后 30 个 bin
-MEAN_TAIL_BINS = 30
+# 计算 bin 维均值(背景噪声)时只统计首/尾各 MEAN_EDGE_BINS 个 bin,
+# 取两端均值中较大的一个作为背景电平, 避免回波恰好压在某一端时低估噪声
+MEAN_EDGE_BINS = 3
 
-# 混叠判定: 首/末 bin SNR 超过 3 sigma, 视为回波跨拍缠绕
-ALIAS_EDGE_SNR = 3.0
+# 混叠判定: 反解出底噪电平 m, 使其 ALIAS_SIGMA 倍泊松涨落恰好够到峰值 v,
+# 即 m + ALIAS_SIGMA * sqrt(m) = v; 高于 m 的 bin 超过 ALIAS_MAX_BINS 个,
+# 说明整条直方图被抬平, 没有可信的单峰, 判为混叠
+ALIAS_SIGMA = 4.0
+ALIAS_MAX_BINS = 15
 
 
 class Network(nn.Module):
@@ -140,22 +147,23 @@ class Network(nn.Module):
         dist = centroid * DIST_SCALE_M + DIST_BIAS
         return torch.clamp(dist, min=MIN_DIST_M)
 
+    def _background_mean(self, hist):
+        """背景电平: 取首 MEAN_EDGE_BINS 个 bin 与末 MEAN_EDGE_BINS 个 bin 的均值中较大者.
+
+        输出 (B, 1, H, W).
+        """
+        head, _, tail = torch.split(
+            hist, [MEAN_EDGE_BINS, 62 - 2 * MEAN_EDGE_BINS, MEAN_EDGE_BINS], dim=1
+        )
+        mean_head = torch.mean(head, dim=1, keepdim=True)
+        mean_tail = torch.mean(tail, dim=1, keepdim=True)
+        return torch.maximum(mean_head, mean_tail)
+
     def _snr_and_mask(self, signal_per_bin, noise):
         """每 bin 的 SNR = signal / noise, 以及 SNR mask = (snr > SNR_THRESH)."""
         snr  = signal_per_bin / noise
         mask = torch.relu(torch.sign(snr - SNR_THRESH))
         return snr, mask
-
-    def _alias_mask(self, snr_per_bin):
-        """混叠判定, 输出 (B, 1, H, W) 的 0/1 mask, 1=无混叠(有效), 0=混叠(无效).
-
-        无效条件: 第一个 bin 或最后一个 bin 的 SNR > ALIAS_EDGE_SNR (3 sigma),
-        说明回波压在量程边界上, 大概率是跨拍缠绕过来的.
-        """
-        snr_first, _, snr_last = torch.split(snr_per_bin, [1, 60, 1], dim=1)
-        edge_hit = torch.relu(torch.sign(snr_first - ALIAS_EDGE_SNR)) + \
-                   torch.relu(torch.sign(snr_last - ALIAS_EDGE_SNR))
-        return torch.relu(torch.sign(0.5 - edge_hit))
 
     def _reflectance_and_mask(self, signal_per_bin, dist_per_bin):
         """每 bin 的反射率 = dist^2 * signal / K, 以及 reflect mask = (reflect > REFLECT_THRESH).
@@ -167,6 +175,22 @@ class Network(nn.Module):
         reflectance_per_bin = dist_sq * signal_clip / REFLECT_K
         mask                = torch.relu(torch.sign(reflectance_per_bin - REFLECT_THRESH))
         return reflectance_per_bin, mask
+
+    def _alias_mask(self, hist, one_hot_mask):
+        """混叠判定, 输出 (B, 1, H, W) 的 0/1 mask, 1=无混叠(有效), 0=混叠(无效).
+
+        取选中 bin 的计数 v, 求底噪电平 m 使 m + ALIAS_SIGMA * sqrt(m) = v,
+        即 m 的 ALIAS_SIGMA 倍泊松涨落恰好够到峰值. 解 sqrt(m) 的二次方程得:
+            sqrt(m) = (sqrt(ALIAS_SIGMA^2 + 4v) - ALIAS_SIGMA) / 2
+        统计有多少 bin 高于 m; 超过 ALIAS_MAX_BINS 个说明没有明显单峰, 判为混叠.
+        """
+        peak_val  = torch.sum(one_hot_mask * hist, dim=1, keepdim=True)  # (B, 1, H, W)
+        sqrt_m    = (torch.sqrt(ALIAS_SIGMA * ALIAS_SIGMA + 4.0 * torch.relu(peak_val))
+                     - ALIAS_SIGMA) * 0.5
+        threshold = sqrt_m * sqrt_m
+        above     = torch.relu(torch.sign(hist - threshold))             # (B, 62, H, W)
+        count     = torch.sum(above, dim=1, keepdim=True)                # (B, 1, H, W)
+        return torch.relu(torch.sign(ALIAS_MAX_BINS + 0.5 - count))
 
     def _argmax_onehot(self, x):
         """
@@ -198,8 +222,7 @@ class Network(nn.Module):
         # ---- 2a) SNR 用原始 hist (10bit, 未做饱和补偿) 计算 ----
         # SNR 描述的是真实光子统计噪声, 必须基于原始计数, 否则 hist_k 放大后
         # 信号和 sqrt(噪声) 都被同一个 k 拉伸, 比值会被夸大, 失去物理意义.
-        _, hist_tail       = torch.split(hist, [62 - MEAN_TAIL_BINS, MEAN_TAIL_BINS], dim=1)  # 只取最后 30 个 bin
-        mean_raw           = torch.mean(hist_tail, dim=1, keepdim=True)  # (B, 1, H, W)
+        mean_raw           = self._background_mean(hist)             # (B, 1, H, W)
         signal_raw_per_bin = hist - mean_raw                        # (B, 62, H, W)
         noise_raw          = torch.sqrt(mean_raw) + NOISE_BIAS      # (B, 1, H, W)
         snr_per_bin, snr_mask = self._snr_and_mask(signal_raw_per_bin, noise_raw)
@@ -224,7 +247,7 @@ class Network(nn.Module):
 
         # ---- 6) conf: 该像素任一 bin 通过 3 路 mask 即为有效, 再乘混叠 mask ----
         conf = torch.amax(valid_mask, dim=1, keepdim=True)
-        conf = conf * self._alias_mask(snr_per_bin)
+        conf = conf * self._alias_mask(hist, one_hot_mask)
 
         return dist, conf, peak, reflectance, snr
 
