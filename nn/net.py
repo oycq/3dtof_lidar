@@ -53,8 +53,7 @@ nn/net.py
       peak        = amax(hist_k, dim=1)
 
 7) conf = amax(valid_mask, dim=1), 再乘 _alias_mask(snr_per_bin):
-      首/末 bin SNR>3, 或低 SNR(<2) 的 bin 数 < 46 (等价于 SNR>2 超过 16), 判为混叠无效
-      数低 SNR 是为了让 max 校准在正常点上就把量程撑到 ~62, 不必补混叠样本
+      首 bin 或末 bin 的 SNR > 3 (3 sigma) 时判为混叠, conf 置 0
 """
 
 import torch
@@ -83,10 +82,8 @@ PEAK_EPS = 0.4
 # 计算 bin 维均值(背景噪声)时只统计最后 30 个 bin
 MEAN_TAIL_BINS = 30
 
-# 混叠判定: 首/末 bin SNR 过高, 或高 SNR bin 过多, 视为回波跨拍缠绕
+# 混叠判定: 首/末 bin SNR 超过 3 sigma, 视为回波跨拍缠绕
 ALIAS_EDGE_SNR = 3.0
-ALIAS_SPREAD_SNR = 2.0
-ALIAS_SPREAD_MAX = 16.0
 
 
 class Network(nn.Module):
@@ -152,21 +149,13 @@ class Network(nn.Module):
     def _alias_mask(self, snr_per_bin):
         """混叠判定, 输出 (B, 1, H, W) 的 0/1 mask, 1=无混叠(有效), 0=混叠(无效).
 
-        无效条件(满足任一即混叠):
-          1) 第一个 bin 或最后一个 bin 的 SNR > ALIAS_EDGE_SNR
-          2) SNR > ALIAS_SPREAD_SNR 的 bin 个数超过 ALIAS_SPREAD_MAX
-
-        第 2 条数的是「SNR < 2 的 bin」: 正常点接近 62, max 校准会把量程撑满,
-        不依赖混叠样本. 高 SNR 数 > 16  <=>  低 SNR 数 < 46.
-        低 mask 从 SNR 独立算出, 避免被优化成 62-sum(high) 后又踩中高计数量程不足.
+        无效条件: 第一个 bin 或最后一个 bin 的 SNR > ALIAS_EDGE_SNR (3 sigma),
+        说明回波压在量程边界上, 大概率是跨拍缠绕过来的.
         """
         snr_first, _, snr_last = torch.split(snr_per_bin, [1, 60, 1], dim=1)
         edge_hit = torch.relu(torch.sign(snr_first - ALIAS_EDGE_SNR)) + \
                    torch.relu(torch.sign(snr_last - ALIAS_EDGE_SNR))
-        low_cnt = torch.sum(
-            torch.relu(torch.sign(ALIAS_SPREAD_SNR - snr_per_bin)), dim=1, keepdim=True)
-        spread_hit = torch.relu(torch.sign((62.0 - ALIAS_SPREAD_MAX) - 0.5 - low_cnt))
-        return torch.relu(torch.sign(0.5 - edge_hit - spread_hit))
+        return torch.relu(torch.sign(0.5 - edge_hit))
 
     def _reflectance_and_mask(self, signal_per_bin, dist_per_bin):
         """每 bin 的反射率 = dist^2 * signal / K, 以及 reflect mask = (reflect > REFLECT_THRESH).
