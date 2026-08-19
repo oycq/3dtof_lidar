@@ -1,39 +1,17 @@
 # Python bytecode / caches
 __pycache__/
+*.pyc
 
-# OpenPyLivox demo outputs / captured data
-*.bin
-*_IMU.bin
-*_IMU.bin.csv
-*.las
-*.pcd
-
-# Real-time server/client outputs
-*.npz
-*.pid
-*.lock
-tmp
-
-data
-combine.png
-
-cali_result
-
-train_data
-
+# 模型权重与导出产物
 *.pt
+*.onnx
 
-network.onnx
-
-factory/*.svg
-
-cali_tof_result.json
-data*.npy
-
-rank
-
-nn/xuanguang/data
-
-tmp
-
+# 采集数据与录制输出
 *.bag
+*.raw
+*.npy
+*.npz
+*.mp4
+
+# 本地缓存 / 调试临时目录
+tmp/
