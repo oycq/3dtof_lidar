@@ -250,7 +250,9 @@ class Network(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # ---- 0) 拆分: 62 个有效 bin + 2 个饱和 bin, 计算脉冲归一化系数 k ----
-        x = fq(x, 1023)
+        # 上板输入已经是 0-1023 的 int16 计数。不要对整包 x 再 fq：那会在 BPU
+        # 入口插 Cast(float)+Quantize。外壳 HzDequantize(scale=1) 按码值=计数解释；
+        # hist 仍 fq 一次，给后续 1x1 conv 挂上 scale，避免掉回 CPU float。
         hist, raw_bin_63, raw_bin_64 = self._split_hist_and_tail(x)
         hist = fq(hist, 1023)
         sat_value = fq(
