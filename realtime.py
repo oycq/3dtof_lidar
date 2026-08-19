@@ -17,6 +17,11 @@ nn/realtime.py
 - 右下角输入框：最近距离(m) / 最远距离(m) / 最小亮度 / 最大亮度（点击后键盘输入，Enter 确认）
 - 空格：开始/停止录制 mp4；按 0：保存当前帧 tof.raw 到 r/tmp
 - ESC 退出（输入框聚焦时 ESC 取消编辑）
+
+命令行：
+- `py realtime.py`              ADB 实时模式
+- `py realtime.py xxx.mcap`     BAG 回放
+- `py realtime.py cali_data`    浏览目录内所有 .raw（进度条可拖动，A/D 切帧，空格播放）
 """
 
 from __future__ import annotations
@@ -1714,14 +1719,6 @@ def _load_bag_frames(bag_path: Path) -> list:
 
 def _run_bag_mode(bag_path_str: str) -> int:
     """从 BAG/MCAP 文件读取帧，批量推理后交互式浏览。"""
-    import cv2
-    import torch
-
-    cv2.setUseOptimized(True)
-    rotate_90 = bool(ROTATE_90)
-    mirror = bool(MIRROR)
-    show_w, show_h = _get_show_size(rotate_90)
-
     bag_path = Path(bag_path_str).resolve()
     if not bag_path.exists():
         print(f"[ERR] 文件不存在: {bag_path}")
@@ -1739,6 +1736,71 @@ def _run_bag_mode(bag_path_str: str) -> int:
         print("[ERR] 没有有效帧")
         return 1
 
+    hists = [f[1] for f in frames]
+    labels = [f"frame_id {f[0].frame_id}" for f in frames]
+    bag_dists = [
+        _bag_depth_entry_to_m(bag_depth_map.get(f[0].frame_id)) for f in frames
+    ]
+    return _browse_frames(hists, labels, bag_dists)
+
+
+def _bag_depth_entry_to_m(entry) -> np.ndarray | None:
+    if entry is None:
+        return None
+    dist_mm, conf = entry
+    dist_m = dist_mm.astype(np.float32) / 1000.0
+    dist_m[conf == 0] = 0.0
+    return dist_m
+
+
+def _load_raw_dir_frames(dir_path: Path) -> list[tuple[str, np.ndarray]]:
+    """加载目录下所有 .raw 文件，返回 [(文件名, hist(30,40,64)), ...]。"""
+    files = sorted(p for p in dir_path.iterdir() if p.suffix.lower() == ".raw")
+    out: list[tuple[str, np.ndarray]] = []
+    for p in files:
+        try:
+            raw_u16 = np.frombuffer(p.read_bytes(), dtype=np.uint16)
+        except Exception as exc:
+            print(f"[WARN] 读取失败 {p.name}: {exc}")
+            continue
+        if raw_u16.size < TOF_H * TOF_W * TOF_C:
+            print(f"[WARN] 跳过 {p.name}: 数据不足 ({raw_u16.size} u16)")
+            continue
+        out.append((p.name, tof_histograms_from_u16(raw_u16)))
+    return out
+
+
+def _run_dir_mode(dir_path_str: str) -> int:
+    """浏览目录内的 .raw 文件，交互方式与 BAG 回放一致。"""
+    dir_path = Path(dir_path_str).resolve()
+    if not dir_path.is_dir():
+        print(f"[ERR] 目录不存在: {dir_path}")
+        return 1
+
+    print(f"[INFO] 扫描目录: {dir_path}")
+    frames = _load_raw_dir_frames(dir_path)
+    print(f"[OK] {dir_path.name}: 有效 raw 帧={len(frames)}")
+    if not frames:
+        print("[ERR] 目录内没有可用的 .raw 文件")
+        return 1
+
+    return _browse_frames([f[1] for f in frames], [f[0] for f in frames], None)
+
+
+def _browse_frames(
+    hists_list: list[np.ndarray],
+    labels: list[str],
+    bag_dists: list[np.ndarray | None] | None,
+) -> int:
+    """批量推理后交互式浏览一组帧（BAG 与目录模式共用）。"""
+    import cv2
+    import torch
+
+    cv2.setUseOptimized(True)
+    rotate_90 = bool(ROTATE_90)
+    mirror = bool(MIRROR)
+    show_w, show_h = _get_show_size(rotate_90)
+
     nn_dir = Path(__file__).resolve().parent
     if str(nn_dir) in sys.path:
         sys.path.remove(str(nn_dir))
@@ -1749,7 +1811,7 @@ def _run_bag_mode(bag_path_str: str) -> int:
     net = Network().to(device)
     net.eval()
 
-    n = len(frames)
+    n = len(hists_list)
     print(f"[INFO] 批量推理 {n} 帧 (batch={_BAG_INFER_BATCH}, device={device})...")
     all_dist = np.zeros((n, TOF_H, TOF_W), dtype=np.float32)
     all_snr = np.zeros_like(all_dist)
@@ -1760,7 +1822,7 @@ def _run_bag_mode(bag_path_str: str) -> int:
     for start in range(0, n, _BAG_INFER_BATCH):
         end = min(start + _BAG_INFER_BATCH, n)
         batch_h = np.stack(
-            [frames[i][1] for i in range(start, end)], axis=0,
+            [hists_list[i] for i in range(start, end)], axis=0,
         ).astype(np.float32, copy=False)
         d, s, c, p, r = _run_infer_batch(net, device, batch_h)
         all_dist[start:end] = d
@@ -1838,19 +1900,14 @@ def _run_bag_mode(bag_path_str: str) -> int:
                 playing = False
             next_play_ms = now_ms + play_interval_ms
 
-        header, hist = frames[idx]
+        hist = hists_list[idx]
         _sync_disp_ctrl(disp_ctrl)
         depth_near_m = float(disp_ctrl["near_m"])
         depth_far_m = float(disp_ctrl["far_m"])
         peak_lo = float(disp_ctrl["peak_lo"])
         peak_hi = float(disp_ctrl["peak_hi"])
 
-        bag_dist_m = None
-        bag_depth_entry = bag_depth_map.get(header.frame_id)
-        if bag_depth_entry is not None:
-            bag_dist_mm, bag_conf = bag_depth_entry
-            bag_dist_m = bag_dist_mm.astype(np.float32) / 1000.0
-            bag_dist_m[bag_conf == 0] = 0.0
+        bag_dist_m = bag_dists[idx] if bag_dists is not None else None
 
         view, hist_img, strip_img, px, py = _render_view(
             all_dist[idx], all_conf[idx], all_peak[idx], all_refl[idx],
@@ -1875,7 +1932,8 @@ def _run_bag_mode(bag_path_str: str) -> int:
             f"reflectance {float(all_refl[idx][py, px]) * 100.0:.3f}%",
         ])
 
-        status = f"frame {idx}/{n - 1}   {'PLAY' if playing else 'PAUSE'}"
+        label = labels[idx] if idx < len(labels) else ""
+        status = f"{label}   {idx}/{n - 1}   {'PLAY' if playing else 'PAUSE'}"
         progress_frac = (idx / (n - 1)) if n > 1 else 0.0
         canvas = _compose_dashboard(
             view, hist_img, strip_img, status,
@@ -1915,13 +1973,15 @@ def _run_bag_mode(bag_path_str: str) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="realtime.py — ADB 实时 / BAG 回放")
-    parser.add_argument("bag", nargs="?", default=None,
-                        help="BAG/MCAP 文件路径；不指定则默认 ADB 实时模式")
+    parser = argparse.ArgumentParser(description="realtime.py — ADB 实时 / BAG 回放 / raw 目录浏览")
+    parser.add_argument("source", nargs="?", default=None,
+                        help="BAG/MCAP 文件路径，或存放 .raw 的目录；不指定则 ADB 实时模式")
     args = parser.parse_args()
 
-    if args.bag:
-        return _run_bag_mode(args.bag)
+    if args.source:
+        if Path(args.source).is_dir():
+            return _run_dir_mode(args.source)
+        return _run_bag_mode(args.source)
 
     # ---- ADB 实时模式 ----
     rotate_90 = bool(ROTATE_90)
