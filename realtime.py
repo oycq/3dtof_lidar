@@ -22,6 +22,7 @@ nn/realtime.py
 - `py realtime.py`              ADB 实时模式
 - `py realtime.py xxx.mcap`     BAG 回放
 - `py realtime.py cali_data`    浏览目录内所有 .raw（进度条可拖动，A/D 切帧，空格播放）
+- `py realtime.py 日志目录`     自动查找 dtof_depth_bag 下的 BAG 并合并回放
 """
 
 from __future__ import annotations
@@ -1724,23 +1725,69 @@ def _run_bag_mode(bag_path_str: str) -> int:
         print(f"[ERR] 文件不存在: {bag_path}")
         return 1
 
-    print(f"[INFO] 扫描: {bag_path}")
-    loaded, cnt = _load_bag_topics(bag_path, (_BAG_RAW_TOPIC, _BAG_DEPTH_TOPIC))
-    frames = loaded[_BAG_RAW_TOPIC]
-    bag_depth_map = _depth_list_to_map(loaded[_BAG_DEPTH_TOPIC])
-    print(
-        f"[OK] {bag_path.name}: tof topic={cnt[_BAG_RAW_TOPIC]} 有效={len(frames)}, "
-        f"depth topic={cnt[_BAG_DEPTH_TOPIC]} 有效={len(bag_depth_map)}"
-    )
+    return _run_bag_paths_mode([bag_path])
+
+
+def _bag_path_sort_key(path: Path) -> tuple:
+    """让 0.bag, 1.bag, ... 10.bag 按数字顺序排列。"""
+    try:
+        stem_key: tuple = (0, int(path.stem))
+    except ValueError:
+        stem_key = (1, path.stem.lower())
+    return tuple(part.lower() for part in path.parent.parts) + stem_key
+
+
+def _discover_dtof_bags(dir_path: Path) -> list[Path]:
+    """递归查找设备日志中 dtof_depth_bag 目录里的 BAG/MCAP 文件。"""
+    bags = [
+        path
+        for path in dir_path.rglob("*")
+        if path.is_file()
+        and path.suffix.lower() in (".bag", ".mcap")
+        and any(part.lower() == "dtof_depth_bag" for part in path.parts)
+    ]
+    return sorted(bags, key=_bag_path_sort_key)
+
+
+def _run_bag_paths_mode(bag_paths: list[Path]) -> int:
+    """合并一个或多个 BAG/MCAP 文件中的 ToF raw 帧并回放。"""
+    merged_frames: list[tuple[Path, TofInfoHeader, np.ndarray]] = []
+    bag_depth_map: dict = {}
+
+    for bag_path in bag_paths:
+        print(f"[INFO] 扫描: {bag_path}")
+        try:
+            loaded, cnt = _load_bag_topics(
+                bag_path, (_BAG_RAW_TOPIC, _BAG_DEPTH_TOPIC),
+            )
+        except Exception as exc:
+            print(f"[WARN] 跳过无法读取的录包 {bag_path.name}: {exc}")
+            continue
+
+        frames = loaded[_BAG_RAW_TOPIC]
+        depth_items = loaded[_BAG_DEPTH_TOPIC]
+        bag_depth_map.update(_depth_list_to_map(depth_items))
+        merged_frames.extend((bag_path, header, hist) for header, hist in frames)
+        print(
+            f"[OK] {bag_path.name}: tof topic={cnt[_BAG_RAW_TOPIC]} 有效={len(frames)}, "
+            f"depth topic={cnt[_BAG_DEPTH_TOPIC]} 有效={len(depth_items)}"
+        )
+
+    merged_frames.sort(key=lambda item: (item[1].timestamp_us, item[1].frame_id))
+    frames = [(header, hist) for _, header, hist in merged_frames]
     if not frames:
         print("[ERR] 没有有效帧")
         return 1
 
     hists = [f[1] for f in frames]
-    labels = [f"frame_id {f[0].frame_id}" for f in frames]
+    labels = [
+        f"{bag_path.name}  frame_id {header.frame_id}"
+        for bag_path, header, _ in merged_frames
+    ]
     bag_dists = [
         _bag_depth_entry_to_m(bag_depth_map.get(f[0].frame_id)) for f in frames
     ]
+    print(f"[OK] 合并完成: BAG={len(bag_paths)}, ToF raw={len(frames)}")
     return _browse_frames(hists, labels, bag_dists)
 
 
@@ -1771,7 +1818,7 @@ def _load_raw_dir_frames(dir_path: Path) -> list[tuple[str, np.ndarray]]:
 
 
 def _run_dir_mode(dir_path_str: str) -> int:
-    """浏览目录内的 .raw 文件，交互方式与 BAG 回放一致。"""
+    """浏览目录内的 .raw，或合并设备日志 dtof_depth_bag 中的录包。"""
     dir_path = Path(dir_path_str).resolve()
     if not dir_path.is_dir():
         print(f"[ERR] 目录不存在: {dir_path}")
@@ -1779,12 +1826,17 @@ def _run_dir_mode(dir_path_str: str) -> int:
 
     print(f"[INFO] 扫描目录: {dir_path}")
     frames = _load_raw_dir_frames(dir_path)
-    print(f"[OK] {dir_path.name}: 有效 raw 帧={len(frames)}")
-    if not frames:
-        print("[ERR] 目录内没有可用的 .raw 文件")
-        return 1
+    if frames:
+        print(f"[OK] {dir_path.name}: 有效 raw 帧={len(frames)}")
+        return _browse_frames([f[1] for f in frames], [f[0] for f in frames], None)
 
-    return _browse_frames([f[1] for f in frames], [f[0] for f in frames], None)
+    bag_paths = _discover_dtof_bags(dir_path)
+    if bag_paths:
+        print(f"[INFO] 找到 dtof_depth_bag 录包 {len(bag_paths)} 个")
+        return _run_bag_paths_mode(bag_paths)
+
+    print("[ERR] 目录内没有可用的 .raw，也没有 dtof_depth_bag 录包")
+    return 1
 
 
 def _browse_frames(
@@ -1973,9 +2025,9 @@ def _browse_frames(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="realtime.py — ADB 实时 / BAG 回放 / raw 目录浏览")
+    parser = argparse.ArgumentParser(description="realtime.py — ADB 实时 / BAG 回放 / raw 或设备日志目录浏览")
     parser.add_argument("source", nargs="?", default=None,
-                        help="BAG/MCAP 文件路径，或存放 .raw 的目录；不指定则 ADB 实时模式")
+                        help="BAG/MCAP 文件、.raw 目录或含 dtof_depth_bag 的设备日志目录；不指定则 ADB 实时模式")
     args = parser.parse_args()
 
     if args.source:
