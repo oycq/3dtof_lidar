@@ -16,3 +16,4 @@ __pycache__/
 # 本地缓存 / 调试临时目录
 tmp/
 cali_data
+bag
