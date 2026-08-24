@@ -189,7 +189,7 @@ class Network(nn.Module):
         signal_div_REFLECT_K = fq(signal_per_bin / REFLECT_K, 50000 / REFLECT_K)
         refl = fq(dist_sq * signal_div_REFLECT_K, 3)
         refl = fq(torch.clamp(refl, max=3.0), 3)
-        mask = fq(torch.relu(torch.sign(fq(refl - REFLECT_THRESH, 30))), _MASK)
+        mask = fq(torch.relu(torch.sign(fq(refl - REFLECT_THRESH, 3))), _MASK)
         return refl, mask
 
     def _alias_mask(self, hist, one_hot_mask):
