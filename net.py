@@ -120,14 +120,6 @@ def fdiv(a: torch.Tensor, b: torch.Tensor, inv_max: float, out_max: float) -> to
 class Network(nn.Module):
     def __init__(self):
         super().__init__()
-
-        # ---- 距离重心: split 出三邻域, 替代 62x62 稠密 1x1 conv ----
-        # 输出通道 i 表示"假设 peak 在 bin i"时的三邻域重心距离:
-        #   side_diff[i]  =  x[i+1] - x[i-1]                 (右邻 - 左邻)
-        #   window_sum[i] =  x[i-1] + x[i] + x[i+1]          (三邻域和)
-        #   centroid_bin  =  side_diff / (window_sum + 1) + i  (+1 防除零)
-        # 等价于原先的 clip(argmax, 1, 60): bin0 复用 bin1, bin61 复用 bin60
-        # 三邻域中心 bin, 对应 hist 的 1..60; bin0/bin61 在输出端复用两端
         bin_index = torch.arange(1, 61, dtype=torch.float32).view(1, 60, 1, 1)
         bin_arange = torch.arange(62, dtype=torch.float32).view(1, 62, 1, 1)
         self.register_buffer("bin_index", bin_index)
@@ -153,10 +145,15 @@ class Network(nn.Module):
     def _dist_per_bin(self, hist):
         """用三邻域重心算 62 路候选距离, 输出 (B, 62, H, W).
 
+        假设 peak 在 bin i 时:
+          side_diff    = x[i+1] - x[i-1]                 (右邻 - 左邻)
+          window_sum   = x[i-1] + x[i] + x[i+1]          (三邻域和)
+          centroid_bin = side_diff / (window_sum + 1) + i  (+1 防除零)
+        先算 anchor 1..60, 再扩成 62 路 (bin0 复用 bin1, bin61 复用 bin60).
+
         小于 MIN_DIST_M 的距离统一钳到 MIN_DIST_M, 避免近距离场景下重心偏移
         造成的负值或异常小值污染下游 reflectance (dist^2) 等计算.
         """
-        # 三邻域窗口: hist_left=bin0..59, hist_center=bin1..60, hist_right=bin2..61
         hist_left, _ = torch.split(hist, [60, 2], dim=1)
         _, hist_center, _ = torch.split(hist, [1, 60, 1], dim=1)
         _, hist_right = torch.split(hist, [2, 60], dim=1)
@@ -166,7 +163,6 @@ class Network(nn.Module):
         centroid_bin = fq(bin_offset + fq(self.bin_index, 61), 61)
         dist_m = fq(fq(centroid_bin * DIST_SCALE_M, 36.6) + DIST_BIAS, 34.46)
         dist_m = fq(torch.clamp(dist_m, min=MIN_DIST_M), 34.46)
-        # 60 路 (anchor 1..60) 扩成 62 路: bin0 复用 bin1, bin61 复用 bin60
         dist_lo, _, dist_hi = torch.split(dist_m, [1, 58, 1], dim=1)
         return fq(torch.cat([dist_lo, dist_m, dist_hi], dim=1), 34.46)
 
