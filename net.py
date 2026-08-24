@@ -22,11 +22,13 @@ nn/net.py
                   (SNR 反映的是原始光子统计噪声, 必须用未做饱和补偿的 10bit 直方图)
    - 归一化 hist_k: 用于 crosstalk / reflect 两路, 使阈值在不同脉冲数下一致
 
-2) 用 1x1 conv 在原始 hist 上并行算出 62 路候选距离 (每 bin 都做三邻域重心细化):
-      tilt[i]  =  x[i+1] - x[i-1]                 (右邻 - 左邻)
-      total[i] =  x[i-1] + x[i] + x[i+1]          (三邻域和)
-      centroid =  tilt / (total + 1) + i          (clip 到 [1, 60])
-      dist_per_bin = centroid * DIST_SCALE_M + DIST_BIAS       (B, 62, H, W)
+2) 用 split 在原始 hist 上并行算出 62 路候选距离 (每 bin 都做三邻域重心细化):
+      hist_left, hist_center, hist_right = hist[0:60], hist[1:61], hist[2:62]
+      side_diff  = hist_right - hist_left                     (anchor 1..60)
+      window_sum = hist_left + hist_center + hist_right
+      centroid_bin = side_diff / (window_sum + 1) + i
+      # 算完 60 路再扩成 62: bin0 复用 bin1, bin61 复用 bin60
+      dist_per_bin = centroid_bin * DIST_SCALE_M + DIST_BIAS   (B, 62, H, W)
 
 3) 每 bin 的信号量 (形状都是 (B, 62, H, W)):
       # 背景电平取首 3 个 bin 均值与末 3 个 bin 均值中的较大者
@@ -61,7 +63,6 @@ nn/net.py
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 DIST_SCALE_M = 0.6
 TAIL_BASE = 1024.0
@@ -120,26 +121,14 @@ class Network(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # ---- 距离重心计算: 用 1x1 conv 替代 argmax + gather (BPU 友好) ----
+        # ---- 距离重心: split 出三邻域, 替代 62x62 稠密 1x1 conv ----
         # 输出通道 i 表示"假设 peak 在 bin i"时的三邻域重心距离:
-        #   tilt[i]   =  x[i+1] - x[i-1]           (右邻 - 左邻, 反映峰往哪边倾)
-        #   total[i]  =  x[i-1] + x[i] + x[i+1]    (三邻域总和)
-        #   centroid  =  tilt / (total + 1) + i    (+1 防除零)
-        # 等价于原先的 clip(argmax, 1, 60): i=0 复用 i=1 的 anchor, i=61 复用 i=60
-        tilt_kernel = torch.zeros(62, 62, 1, 1, dtype=torch.float32)
-        total_kernel = torch.zeros(62, 62, 1, 1, dtype=torch.float32)
-        for i in range(62):
-            anchor = min(max(i, 1), 60)  # 实际参与重心计算的中心 bin, clip 到 [1, 60]
-            tilt_kernel[i, anchor - 1, 0, 0] = -1.0
-            tilt_kernel[i, anchor + 1, 0, 0] = 1.0
-            total_kernel[i, anchor - 1, 0, 0] = 1.0
-            total_kernel[i, anchor,     0, 0] = 1.0
-            total_kernel[i, anchor + 1, 0, 0] = 1.0
-        self.register_buffer("tilt_kernel", tilt_kernel)
-        self.register_buffer("total_kernel", total_kernel)
-
-        # 每通道加上自身 bin 索引, 同样 clip 到 [1, 60]
-        bin_index = torch.arange(62, dtype=torch.float32).clamp(1, 60).view(1, 62, 1, 1)
+        #   side_diff[i]  =  x[i+1] - x[i-1]                 (右邻 - 左邻)
+        #   window_sum[i] =  x[i-1] + x[i] + x[i+1]          (三邻域和)
+        #   centroid_bin  =  side_diff / (window_sum + 1) + i  (+1 防除零)
+        # 等价于原先的 clip(argmax, 1, 60): bin0 复用 bin1, bin61 复用 bin60
+        # 三邻域中心 bin, 对应 hist 的 1..60; bin0/bin61 在输出端复用两端
+        bin_index = torch.arange(1, 61, dtype=torch.float32).view(1, 60, 1, 1)
         bin_arange = torch.arange(62, dtype=torch.float32).view(1, 62, 1, 1)
         self.register_buffer("bin_index", bin_index)
         self.register_buffer("bin_arange", bin_arange)
@@ -167,13 +156,19 @@ class Network(nn.Module):
         小于 MIN_DIST_M 的距离统一钳到 MIN_DIST_M, 避免近距离场景下重心偏移
         造成的负值或异常小值污染下游 reflectance (dist^2) 等计算.
         """
-        tilt = fq(F.conv2d(hist, self.tilt_kernel), 1023)
-        total = fq(fq(F.conv2d(hist, self.total_kernel), 3069) + 1.0, 3070)
-        ratio = fdiv(tilt, total, 1.0, 1.0)
-        centroid = fq(ratio + fq(self.bin_index, 61), 61)
-        scaled = fq(centroid * DIST_SCALE_M, 36.6)
-        dist = fq(scaled + DIST_BIAS, 34.46)
-        return fq(torch.clamp(dist, min=MIN_DIST_M), 34.46)
+        # 三邻域窗口: hist_left=bin0..59, hist_center=bin1..60, hist_right=bin2..61
+        hist_left, _ = torch.split(hist, [60, 2], dim=1)
+        _, hist_center, _ = torch.split(hist, [1, 60, 1], dim=1)
+        _, hist_right = torch.split(hist, [2, 60], dim=1)
+        side_diff = fq(hist_right - hist_left, 1023)
+        window_sum = fq(fq(hist_left + hist_center + hist_right, 3069) + 1.0, 3070)
+        bin_offset = fdiv(side_diff, window_sum, 1.0, 1.0)
+        centroid_bin = fq(bin_offset + fq(self.bin_index, 61), 61)
+        dist_m = fq(fq(centroid_bin * DIST_SCALE_M, 36.6) + DIST_BIAS, 34.46)
+        dist_m = fq(torch.clamp(dist_m, min=MIN_DIST_M), 34.46)
+        # 60 路 (anchor 1..60) 扩成 62 路: bin0 复用 bin1, bin61 复用 bin60
+        dist_lo, _, dist_hi = torch.split(dist_m, [1, 58, 1], dim=1)
+        return fq(torch.cat([dist_lo, dist_m, dist_hi], dim=1), 34.46)
 
     def _background_mean(self, hist):
         """背景电平: 取首 MEAN_EDGE_BINS 个 bin 与末 MEAN_EDGE_BINS 个 bin 的均值中较大者.
@@ -243,7 +238,7 @@ class Network(nn.Module):
         # ---- 0) 拆分: 62 个有效 bin + 2 个饱和 bin, 计算脉冲归一化系数 k ----
         # 上板输入已经是 0-1023 的 int16 计数。不要对整包 x 再 fq：那会在 BPU
         # 入口插 Cast(float)+Quantize。外壳 HzDequantize(scale=1) 按码值=计数解释；
-        # hist 仍 fq 一次，给后续 1x1 conv 挂上 scale，避免掉回 CPU float。
+        # hist 仍 fq 一次，给后续三邻域加减挂上 scale，避免掉回 CPU float。
         hist, raw_bin_63, raw_bin_64 = self._split_hist_and_tail(x)
         hist = fq(hist, 1023)
         sat_value = fq(
