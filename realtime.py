@@ -21,6 +21,7 @@ nn/realtime.py
 命令行：
 - `py realtime.py`              ADB 实时模式
 - `py realtime.py xxx.mcap`     BAG 回放
+- `py realtime.py xxx.raw`      单帧 raw 浏览
 - `py realtime.py cali_data`    浏览目录内所有 .raw（进度条可拖动，A/D 切帧，空格播放）
 - `py realtime.py 日志目录`     自动查找 dtof_depth_bag 下的 BAG 并合并回放
 """
@@ -1908,21 +1909,45 @@ def _bag_depth_entry_to_m(entry) -> np.ndarray | None:
     return dist_m
 
 
+def _load_raw_file(path: Path) -> np.ndarray | None:
+    """加载单个 .raw，返回 hist(30,40,64)；失败返回 None。"""
+    try:
+        raw_u16 = np.frombuffer(path.read_bytes(), dtype=np.uint16)
+    except Exception as exc:
+        print(f"[WARN] 读取失败 {path.name}: {exc}")
+        return None
+    if raw_u16.size < TOF_H * TOF_W * TOF_C:
+        print(f"[WARN] 跳过 {path.name}: 数据不足 ({raw_u16.size} u16)")
+        return None
+    return tof_histograms_from_u16(raw_u16)
+
+
 def _load_raw_dir_frames(dir_path: Path) -> list[tuple[str, np.ndarray]]:
     """加载目录下所有 .raw 文件，返回 [(文件名, hist(30,40,64)), ...]。"""
     files = sorted(p for p in dir_path.iterdir() if p.suffix.lower() == ".raw")
     out: list[tuple[str, np.ndarray]] = []
     for p in files:
-        try:
-            raw_u16 = np.frombuffer(p.read_bytes(), dtype=np.uint16)
-        except Exception as exc:
-            print(f"[WARN] 读取失败 {p.name}: {exc}")
-            continue
-        if raw_u16.size < TOF_H * TOF_W * TOF_C:
-            print(f"[WARN] 跳过 {p.name}: 数据不足 ({raw_u16.size} u16)")
-            continue
-        out.append((p.name, tof_histograms_from_u16(raw_u16)))
+        hist = _load_raw_file(p)
+        if hist is not None:
+            out.append((p.name, hist))
     return out
+
+
+def _run_raw_paths_mode(raw_paths: list[Path]) -> int:
+    """浏览一个或多个 .raw 帧（单文件或显式列表）。"""
+    frames: list[tuple[str, np.ndarray]] = []
+    for path in raw_paths:
+        print(f"[INFO] 扫描: {path}")
+        hist = _load_raw_file(path)
+        if hist is None:
+            continue
+        frames.append((path.name, hist))
+        print(f"[OK] {path.name}: hist={hist.shape}")
+    if not frames:
+        print("[ERR] 没有有效的 .raw 帧")
+        return 1
+    print(f"[OK] 有效 raw 帧={len(frames)}")
+    return _browse_frames([f[1] for f in frames], [f[0] for f in frames], None)
 
 
 def _run_dir_mode(dir_path_str: str) -> int:
@@ -2133,14 +2158,17 @@ def _browse_frames(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="realtime.py — ADB 实时 / BAG 回放 / raw 或设备日志目录浏览")
+    parser = argparse.ArgumentParser(description="realtime.py — ADB 实时 / BAG 回放 / 单帧 raw / raw 或设备日志目录浏览")
     parser.add_argument("source", nargs="?", default=None,
-                        help="BAG/MCAP 文件、.raw 目录或含 dtof_depth_bag 的设备日志目录；不指定则 ADB 实时模式")
+                        help="BAG/MCAP、单帧 .raw、.raw 目录或含 dtof_depth_bag 的设备日志目录；不指定则 ADB 实时模式")
     args = parser.parse_args()
 
     if args.source:
-        if Path(args.source).is_dir():
+        src = Path(args.source)
+        if src.is_dir():
             return _run_dir_mode(args.source)
+        if src.suffix.lower() == ".raw":
+            return _run_raw_paths_mode([src.resolve()])
         return _run_bag_mode(args.source)
 
     # ---- ADB 实时模式 ----
