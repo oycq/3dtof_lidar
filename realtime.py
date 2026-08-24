@@ -15,7 +15,7 @@ nn/realtime.py
 交互：
 - 鼠标悬停：显示 dist/snr/peak/reflectance；悬停色条查询该颜色对应距离
 - 右下角输入框：最近距离(m) / 最远距离(m) / 最小亮度 / 最大亮度（点击后键盘输入，Enter 确认）
-- 空格：开始/停止录制 mp4；按 0：保存当前帧 tof.raw 到 r/tmp
+- 空格：开始/停止录制 bag 到 tmp/（`py realtime.py tmp/xxx.bag` 回放）；按 0：保存当前帧 tof.raw 到 tmp
 - ESC 退出（输入框聚焦时 ESC 取消编辑）
 
 命令行：
@@ -78,7 +78,6 @@ PEAK_BIN_LO = 5
 PEAK_BIN_HI = 60  # inclusive
 TARGET_FPS = 25.0
 FPS_STAT_INTERVAL_S = 0.5
-REC_FPS = 20.0
 
 EPS = 1e-6
 TAIL_BASE = 1024.0
@@ -179,10 +178,21 @@ class ToFRealtimeServer:
         self._target_dt = 1.0 / float(max(target_fps, 1.0))
         self._read_retry = int(max(read_retry, 0))
         self._min_peak_count = float(max(min_peak_count, 0.0))
+        self._recorder: object | None = None
         if raw_expected_bytes is None:
             self._raw_expected_bytes = int(TOF_RAW_HEADER_BYTES + TOF_H * TOF_W * TOF_C * 2)
         else:
             self._raw_expected_bytes = int(raw_expected_bytes)
+
+    def attach_recorder(self, rec: object | None) -> None:
+        """挂接/拆除 bag 录制器。挂接时先把队列里已有帧写入，避免漏第一批。"""
+        with self._lock:
+            if rec is not None:
+                write = getattr(rec, "write_frame", None)
+                if write is not None:
+                    for f in self._q:
+                        write(f.raw_bytes, f.ts)
+            self._recorder = rec
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -276,6 +286,11 @@ class ToFRealtimeServer:
             frame = ToFFrame(ts=time.time(), raw_bytes=raw_bytes)
             with self._lock:
                 self._q.append(frame)
+                rec = self._recorder
+                if rec is not None:
+                    write = getattr(rec, "write_frame", None)
+                    if write is not None:
+                        write(frame.raw_bytes, frame.ts)
             dt = time.perf_counter() - t0
             sleep = self._target_dt - dt
             if sleep > 0:
@@ -1493,6 +1508,99 @@ def _compose_dashboard(
 
 # ======================== BAG/MCAP 解析 ========================
 
+def _pack_vp_tof_info_v2(raw_bytes: bytes, ts: float, frame_id: int) -> bytes:
+    """把实时 tof.raw 打成 V2 VpTofInfo payload，供回放解析。
+
+    V2: header(40) + reserved(16) + tof_metadata(5120) + tof_raw(153600)
+    实时 tof.raw 本身就是 metadata + hist，缺的 40+16 字节在这里补上。
+    """
+    timestamp_us = int(max(float(ts), 0.0) * 1e6)
+    header = struct.pack(
+        _VPI_HEADER_FMT_V2,
+        timestamp_us,
+        1,  # is_valid
+        0,  # work_mode
+        0,  # bin_mode
+        int(frame_id) & 0xFFFFFFFF,
+        0,  # light_count
+        0,  # expo_time
+        0.0,  # pulse_width
+        0.0,  # rx_temp
+        0.0,  # tx_temp
+        0.0,  # vspad
+    )
+    reserved = b"\x00" * _BAG_RESERVED_BYTES
+    if len(raw_bytes) >= TOF_RAW_HEADER_BYTES:
+        metadata = raw_bytes[:TOF_RAW_HEADER_BYTES]
+        if len(metadata) < _BAG_METADATA_BYTES:
+            metadata = metadata + b"\x00" * (_BAG_METADATA_BYTES - len(metadata))
+        else:
+            metadata = metadata[:_BAG_METADATA_BYTES]
+    else:
+        metadata = b"\x00" * _BAG_METADATA_BYTES
+    hist = tof_histograms_from_u16(np.frombuffer(raw_bytes, dtype=np.uint16))
+    hist_bytes = np.ascontiguousarray(hist, dtype="<u2").tobytes()
+    return header + reserved + metadata + hist_bytes
+
+
+class BagRecorder:
+    """把实时 ToF 帧写成 MCAP bag（topic=sensor/vp_tof_info），可用现有回放打开。"""
+
+    def __init__(self, path: Path) -> None:
+        from mcap.writer import Writer
+
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fp = self.path.open("wb")
+        self._writer = Writer(self._fp)
+        self._writer.start(profile="", library="realtime.py")
+        self._channel_id = self._writer.register_channel(
+            topic=_BAG_RAW_TOPIC,
+            message_encoding="",
+            schema_id=0,
+        )
+        self._frame_id = 0
+        self._count = 0
+        self._closed = False
+        self.error = ""
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def write_frame(self, raw_bytes: bytes, ts: float) -> None:
+        if self._closed:
+            return
+        try:
+            payload = _pack_vp_tof_info_v2(raw_bytes, ts, self._frame_id)
+            log_time_ns = int(max(float(ts), 0.0) * 1e9)
+            self._writer.add_message(
+                channel_id=self._channel_id,
+                log_time=log_time_ns,
+                data=payload,
+                publish_time=log_time_ns,
+                sequence=self._frame_id,
+            )
+            self._frame_id += 1
+            self._count += 1
+        except Exception as exc:
+            self.error = str(exc)
+
+    def close(self) -> int:
+        if self._closed:
+            return self._count
+        self._closed = True
+        try:
+            self._writer.finish()
+        except Exception as exc:
+            self.error = str(exc)
+        try:
+            self._fp.close()
+        except Exception:
+            pass
+        return self._count
+
+
 def _parse_vp_tof_info(payload: bytes):
     """解析 VpTofInfo 消息，返回 (TofInfoHeader, hist(30,40,64)) 或 None。
 
@@ -2101,11 +2209,39 @@ def main() -> int:
     infer_cnt = 0
     ui_cnt = 0
     fps_tick = time.perf_counter()
-    rec_writer: object | None = None
+    rec_writer: BagRecorder | None = None
     rec_path = ""
     rec_err = ""
     last_rec_on = False
+    last_rec_count = -1
     latest_raw_bytes: bytes | None = None
+
+    def _start_bag_rec() -> None:
+        nonlocal rec_writer, rec_err, rec_path
+        rec_err = ""
+        try:
+            RECORD_DIR.mkdir(parents=True, exist_ok=True)
+            rec_path = str(RECORD_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.bag")
+            writer = BagRecorder(Path(rec_path))
+            tof_srv.attach_recorder(writer)
+            rec_writer = writer
+            print(f"[rec] start {rec_path}")
+        except Exception as e:
+            rec_writer = None
+            rec_err = str(e)
+            print(f"[rec] start failed: {e}")
+
+    def _stop_bag_rec() -> None:
+        nonlocal rec_writer, rec_err
+        if rec_writer is None:
+            return
+        tof_srv.attach_recorder(None)
+        n = rec_writer.close()
+        if rec_writer.error:
+            rec_err = rec_writer.error
+        print(f"[rec] stop  {rec_path}  frames={n}")
+        print(f"[rec] 回放: py realtime.py {rec_path}")
+        rec_writer = None
 
     try:
         while True:
@@ -2129,6 +2265,9 @@ def main() -> int:
                     last_ts = float(frame.ts)
                     got_new_frame = True
 
+            if rec_writer is not None and rec_writer.error:
+                rec_err = rec_writer.error
+
             if (
                 cached_in is None
                 or cached_pred_depth is None
@@ -2138,12 +2277,19 @@ def main() -> int:
                 or cached_conf is None
             ):
                 k = int(cv2.waitKey(5) & 0xFF)
+                if k == 32:
+                    if rec_writer is None:
+                        _start_bag_rec()
+                    else:
+                        _stop_bag_rec()
+                    continue
                 if k == 27:
                     break
                 continue
 
             mouse_xy = (int(mouse.get("x", 0)), int(mouse.get("y", 0)))
             rec_on = rec_writer is not None
+            rec_count = int(rec_writer.count) if rec_writer is not None else 0
             _sync_disp_ctrl(disp_ctrl)
             depth_near_m = float(disp_ctrl["near_m"])
             depth_far_m = float(disp_ctrl["far_m"])
@@ -2155,6 +2301,7 @@ def main() -> int:
                 or (mouse_xy != last_mouse_xy)
                 or (frame_cache is None)
                 or (rec_on != last_rec_on)
+                or (rec_count != last_rec_count)
                 or (color_range != last_color_range)
                 or (disp_ctrl.get("focus") is not None)
             )
@@ -2204,7 +2351,7 @@ def main() -> int:
                     )
                 status = (
                     f"io {io_fps:.1f} | infer {infer_fps:.1f} | ui {ui_fps:.1f} fps"
-                    + ("   * REC" if rec_on else "")
+                    + (f"   * REC bag {rec_count}" if rec_on else "")
                 )
                 frame_cache = _compose_dashboard(
                     view, hist_new, strip_new, status,
@@ -2220,37 +2367,20 @@ def main() -> int:
                 )
                 last_mouse_xy = mouse_xy
                 last_rec_on = rec_on
+                last_rec_count = rec_count
                 last_color_range = color_range
 
             ui_cnt += 1
             cv2.imshow("NN_REALTIME", frame_cache)
-            if rec_writer is not None and frame_cache is not None:
-                rec_writer.write(frame_cache)
 
             k = int(cv2.waitKey(1) & 0xFF)
             if k != 255 and _handle_disp_key(disp_ctrl, k):
                 continue
-            if k == 32:  # Space: toggle recording
+            if k == 32:  # Space: toggle bag recording
                 if rec_writer is None:
-                    rec_err = ""
-                    try:
-                        RECORD_DIR.mkdir(parents=True, exist_ok=True)
-                        rec_path = str(RECORD_DIR / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4")
-                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                        writer = cv2.VideoWriter(rec_path, fourcc, max(float(REC_FPS), 1.0), (frame_cache.shape[1], frame_cache.shape[0]))
-                        if not writer.isOpened():
-                            writer.release()
-                            raise RuntimeError("VideoWriter open failed")
-                        rec_writer = writer
-                        print(f"[rec] start {rec_path}")
-                    except Exception as e:
-                        rec_writer = None
-                        rec_err = str(e)
+                    _start_bag_rec()
                 else:
-                    rec_writer.release()
-                    rec_writer = None
-                    rec_err = ""
-                    print(f"[rec] stop  {rec_path}")
+                    _stop_bag_rec()
             if k == 48:  # '0': save current raw bytes
                 try:
                     if latest_raw_bytes is None:
@@ -2266,7 +2396,7 @@ def main() -> int:
                 break
     finally:
         if rec_writer is not None:
-            rec_writer.release()
+            _stop_bag_rec()
         tof_srv.stop()
         cv2.destroyAllWindows()
 
