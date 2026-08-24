@@ -194,19 +194,10 @@ class Network(nn.Module):
         return snr, mask
 
     def _reflectance_and_mask(self, signal_per_bin, dist_per_bin):
-        """每 bin 的反射率 = dist^2 * signal / K, 以及 reflect mask = (reflect > REFLECT_THRESH).
-
-        量化友好: signal 先 clamp 到 [0, MAX_REFL*K/dist^2], 保证 reflect 落在 [0, MAX_REFL] (物理上限 3000%).
-        低于背景的 bin 会给出负 signal, 必须先 relu 掉, 否则 minimum 直接放行成大负数离群值.
-        """
-        dist_sq = fq(dist_per_bin * dist_per_bin, 1187.5)
-        inv_dist_sq = fq(torch.reciprocal(dist_sq), 6.25)
-        # 超过 signal 上界的 bound 不会改变 minimum 结果，先截断可把 scale 收紧 383 倍。
-        bound = fq(torch.clamp(inv_dist_sq * (MAX_REFL * REFLECT_K), max=51200.0), 51200)
-        clip = fq(torch.minimum(fq(torch.relu(signal_per_bin), 49953), bound), 49953)
-        # 常数除法提前，避免产生 3.136e6 的大量程中间张量。
-        dist_norm = fq(dist_sq * (1.0 / REFLECT_K), 1187.5 / REFLECT_K)
-        refl = fq(dist_norm * clip, 30)
+        dist_sq = fq(dist_per_bin * dist_per_bin, 36*36)
+        signal_div_REFLECT_K = fq(signal_per_bin / REFLECT_K, 50000 / REFLECT_K)
+        refl = fq(dist_sq * signal_div_REFLECT_K, 3)
+        refl = fq(torch.clamp(refl, max=3.0), 3)
         mask = fq(torch.relu(torch.sign(fq(refl - REFLECT_THRESH, 30))), _MASK)
         return refl, mask
 
