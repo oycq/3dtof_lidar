@@ -190,7 +190,8 @@ class Network(nn.Module):
         echo_rate = fq(recip_sat * TAIL_BASE, 1.0)
         miss_rate = fq(1.0 - echo_rate, 1.0)
         miss_rate = fq(torch.clamp(miss_rate, min=MISS_RATE_MIN), 1.0)
-        photons_per_pulse = fq(-torch.log(miss_rate), MAX_PHOTONS_PER_PULSE)
+        log_miss_rate = fq(torch.log(miss_rate), MAX_PHOTONS_PER_PULSE)
+        photons_per_pulse = fq(log_miss_rate * -1.0, MAX_PHOTONS_PER_PULSE)
         pileup_gain = fq(photons_per_pulse * (PULSES / TAIL_BASE), MAX_K)
         return pileup_gain
 
