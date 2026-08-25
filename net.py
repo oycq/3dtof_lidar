@@ -161,6 +161,13 @@ class Network(nn.Module):
             window_sum_kernel[i, anchor - 1, 0, 0] = 1.0
             window_sum_kernel[i, anchor, 0, 0] = 1.0
             window_sum_kernel[i, anchor + 1, 0, 0] = 1.0
+        # 背景电平: 首/尾各 MEAN_EDGE_BINS 个 bin 的均值, 用 62->2 的 1x1 conv 一次算出.
+        # 不用 torch.split 是因为三段切分会留下一路 56 通道的中间张量, 编译后仍会被
+        # 当成子图输出参与量化.
+        edge_mean_kernel = torch.zeros(2, 62, 1, 1, dtype=torch.float32)
+        edge_mean_kernel[0, :MEAN_EDGE_BINS, 0, 0] = 1.0 / MEAN_EDGE_BINS
+        edge_mean_kernel[1, 62 - MEAN_EDGE_BINS :, 0, 0] = 1.0 / MEAN_EDGE_BINS
+        self.register_buffer("edge_mean_kernel", edge_mean_kernel)
         bin_index = torch.arange(62, dtype=torch.float32).clamp(1, 60).view(1, 62, 1, 1)
         bin_arange = torch.arange(62, dtype=torch.float32).view(1, 62, 1, 1)
         self.register_buffer("side_diff_kernel", side_diff_kernel)
@@ -237,12 +244,8 @@ class Network(nn.Module):
 
         输出 (B, 1, H, W).
         """
-        head, _, tail = torch.split(
-            hist, [MEAN_EDGE_BINS, 62 - 2 * MEAN_EDGE_BINS, MEAN_EDGE_BINS], dim=1
-        )
-        mean_head = fq(torch.mean(head, dim=1, keepdim=True), 1023)
-        mean_tail = fq(torch.mean(tail, dim=1, keepdim=True), 1023)
-        return fq(torch.maximum(mean_head, mean_tail), 1023)
+        edge_means = fq(F.conv2d(hist, self.edge_mean_kernel), 1023)
+        return fq(torch.amax(edge_means, dim=1, keepdim=True), 1023)
 
     def _snr_and_mask(self, signal_per_bin, noise):
         """每 bin 的 SNR = signal / noise, 以及 SNR mask = (snr > SNR_THRESH)."""
