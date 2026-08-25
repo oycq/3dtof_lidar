@@ -10,17 +10,18 @@ nn/net.py
 - snr: 信噪比
 - reflectance: 反射率
 - conf: 置信度(0/1)
-- peak: 峰值信号 (归一化 hist_k 的 bin 维最大值)
+- peak: 峰值信号 (bin 维最大计数 * pile-up 系数 k)
 
 流程:
 1) 拆分前 62 个有效 bin 与最后两个饱和 bin:
-      sat_value = bin63 * 1024 + bin64
-   得到归一化系数 k = PULSES / sat_value, 并构造归一化后的 hist_k = hist * k.
+      sat_value = bin63 * 1024 + bin64      # 某个 bin 打满 1024 时的总打光次数
+   得到 pile-up 系数 k (见 _pileup_gain, 取值 [1.01, 191]).
 
-   两份直方图各司其职:
-   - 原始 hist  : 用于距离重心 (dist_per_bin)、argmax 选峰 bin, 以及 SNR 计算
-                  (SNR 反映的是原始光子统计噪声, 必须用未做饱和补偿的 10bit 直方图)
-   - 归一化 hist_k: 用于 crosstalk / reflect 两路, 使阈值在不同脉冲数下一致
+   全程 62 通道的中间量都留在 10bit 量程上算, k 只在两处最后一步乘进去:
+   - reflectance = (dist^2 * signal / REFLECT_K) * k
+   - peak        = max(hist) * k
+   dist / argmax / SNR / crosstalk 都直接用原始 hist, 不做聚堆补偿
+   (SNR 反映的是原始光子统计噪声, crosstalk 是同帧同曝光下的横向比较)
 
 2) 用 split 在原始 hist 上并行算出 62 路候选距离 (每 bin 都做三邻域重心细化):
       hist_left, hist_center, hist_right = hist[0:60], hist[1:61], hist[2:62]
@@ -36,12 +37,11 @@ nn/net.py
       # SNR 用原始 hist 算 (保留真实光子噪声统计)
       signal_raw_per_bin  = hist   - mean_bg
       snr_per_bin         = signal_raw_per_bin / (sqrt(mean_bg)      + NOISE_BIAS)
-      # reflect 用归一化 hist_k 算 (脉冲数无关)
-      signal_k_per_bin    = hist_k - mean(hist_k, dim=1)
-      reflectance_per_bin = dist_per_bin^2 * signal_k_per_bin / REFLECT_K
+      # reflect 先在 10bit 量程上算完, 最后一步才乘 pile-up 系数 k
+      reflectance_per_bin = dist_per_bin^2 * signal_raw_per_bin / REFLECT_K * k
 
 4) 三路 per-bin mask (都是 (B, 62, H, W), 0/1):
-      crosstalk_mask : hist_k > mean(hist_k) * CROSSTALK_MEAN_COEF
+      crosstalk_mask : hist                > mean(hist) * CROSSTALK_MEAN_COEF
       snr_mask       : snr_per_bin         > SNR_THRESH         (基于原始 hist)
       reflect_mask   : reflectance_per_bin > REFLECT_THRESH
    三者相乘得到 per-bin 的 valid_mask.
@@ -53,8 +53,8 @@ nn/net.py
       dist        = Σ one_hot_mask * dist_per_bin
       reflectance = Σ one_hot_mask * reflectance_per_bin
       snr         = Σ one_hot_mask * snr_per_bin
-   peak 则不走 one-hot, 直接取归一化直方图的最大值:
-      peak        = amax(hist_k, dim=1)
+   peak 则不走 one-hot, 直接取 10bit 直方图的最大值再乘 k:
+      peak        = amax(hist, dim=1) * k
 
 7) conf = amax(valid_mask, dim=1), 再乘 _alias_mask(hist, one_hot_mask):
       反解底噪电平 m 使 m + 4*sqrt(m) = 选中 bin 的计数, 高于 m 的 bin
@@ -67,7 +67,26 @@ import torch.nn as nn
 DIST_SCALE_M = 0.6
 TAIL_BASE = 1024.0
 PULSES = 50000.0
-SAT_MIN = 1024.0  # 防止坏帧除零，并把 k 严格限制在 <= 48.83
+SAT_MIN = 1024.0  # 防止坏帧除零, 并保证回波率 u = TAIL_BASE / sat_value <= 1
+
+# ---- 聚堆(pile-up)修正 ----
+# 某个 bin 计数打满 10bit(TAIL_BASE) 时停止累积, sat_value 记录此刻的总打光次数,
+# 所以峰值 bin 的单次打光回波率 u = TAIL_BASE / sat_value.
+# SPAD 每次打光最多记一个光子, u 越接近 1 丢掉的光子越多, 真实光子数要用 Coates 反解:
+#     n_true = -N * ln(1 - u)
+# 于是 "10bit 计数 -> PULSES 次打光下的真实光子数" 的总系数为
+#     k = PULSES * (-ln(1 - u)) / TAIL_BASE = (PULSES / TAIL_BASE) * (-ln(1 - u))
+# 旧的线性系数 PULSES / sat_value 只是 u -> 0 时的一阶近似: 例如峰值 bin 归一化后
+# 相当于打光 50000 次回波 49000 次(u = 0.98), 线性算法认为只有 49000 个光子, 而
+# Coates 反解是 -50000 * ln(0.02) = 195600, 即真实强度还要再大 3.99 倍.
+# u -> 1 时 ln 发散, 把未回波率 (1 - u) 钳到 MISS_RATE_MIN, 对应最大额外放大 3.99 倍.
+MISS_RATE_MIN = 0.02
+# -ln(MISS_RATE_MIN) = 3.912，取 4.0 作为 log 输出的 int16 量程
+MAX_PHOTONS_PER_PULSE = 4.0
+# k 的取值范围 [48.83 * 0.0207, 48.83 * 3.912] = [1.01, 191]
+MAX_K = 200.0
+# peak = max(hist) * k 的量程: 1023 * 191
+MAX_PHOTON = 200000.0
 
 REFLECT_K = 104533
 DIST_BIAS = -2.14
@@ -130,17 +149,40 @@ class Network(nn.Module):
         return hist, raw_bin_63, raw_bin_64
 
     def _caculate_sat_value(self, raw_bin_63, raw_bin_64):
-        hi = fq(fq(raw_bin_63, 48) * TAIL_BASE, 49152)
+        hi = fq(fq(raw_bin_63, 48) * TAIL_BASE, 50000)
         return fq(hi + fq(raw_bin_64, 1023), 50000)
 
+    def _pileup_gain(self, sat_value):
+        """pile-up 系数 k, 输出 (B, 1, H, W), 取值 [1.01, 191].
+
+        把 10bit 计数换算成 "PULSES 次打光下的真实光子数":
+            u = TAIL_BASE / sat_value                 # 峰值 bin 的单次打光回波率
+            k = (PULSES / TAIL_BASE) * (-ln(1 - u))   # Coates 反解
+
+        全程只有一次 log: 先在 [0, 1] 量程上算未回波率 (1 - u), 再取对数,
+        最后乘一个常数, 每一步的动态范围都很窄, int16 相对误差 < 0.4%.
+        """
+        recip_sat = fq(torch.reciprocal(sat_value), 1.0 / SAT_MIN)
+        echo_rate = fq(recip_sat * TAIL_BASE, 1.0)
+        miss_rate = fq(1.0 - echo_rate, 1.0)
+        miss_rate = fq(torch.clamp(miss_rate, min=MISS_RATE_MIN), 1.0)
+        photons_per_pulse = fq(-torch.log(miss_rate), MAX_PHOTONS_PER_PULSE)
+        pileup_gain = fq(photons_per_pulse * (PULSES / TAIL_BASE), MAX_K)
+        return pileup_gain
+
     def _crosstalk_mask(self, hist):
-        """窜光抑制: 只输出 (B,62,H,W) 的 0/1 mask, 不改变 hist 本身."""
+        """窜光抑制: 只输出 (B,62,H,W) 的 0/1 mask, 不改变 hist 本身.
+
+        阈值是同一个 bin 的全图均值, 直接用 10bit 原始计数比:
+        窜光看的是"这一 bin 相对全图是不是普遍偏亮", 属于同帧同曝光下的横向比较,
+        不需要 pile-up 补偿; 而且留在 1023 量程上, 台阶 0.03 计数.
+        """
         # 全图均值 mean(H,W): 拆成两次单轴 ReduceMean, 避免被 horizon 优化器折叠成
         # GlobalAveragePool(只支持 int8 输入), 保证整条路径留在 int16 精度上.
-        mean_h = fq(torch.mean(hist,   dim=2, keepdim=True), 50000)
-        mean_hw = fq(torch.mean(mean_h, dim=3, keepdim=True), 50000)
-        thr = fq(mean_hw * CROSSTALK_MEAN_COEF, 33000)
-        return fq(torch.relu(torch.sign(fq(hist - thr, 50000))), _MASK)
+        mean_h = fq(torch.mean(hist,   dim=2, keepdim=True), 1023)
+        mean_hw = fq(torch.mean(mean_h, dim=3, keepdim=True), 1023)
+        thr = fq(mean_hw * CROSSTALK_MEAN_COEF, 1023 * CROSSTALK_MEAN_COEF)
+        return fq(torch.relu(torch.sign(fq(hist - thr, 1023))), _MASK)
 
     def _dist_per_bin(self, hist):
         """用三邻域重心算 62 路候选距离, 输出 (B, 62, H, W).
@@ -184,10 +226,18 @@ class Network(nn.Module):
         mask = fq(torch.relu(torch.sign(fq(snr - SNR_THRESH, 1023))), _MASK)
         return snr, mask
 
-    def _reflectance_and_mask(self, signal_per_bin, dist_per_bin):
+    def _reflectance_and_mask(self, signal_per_bin, dist_per_bin, k):
+        """反射率 = dist^2 * signal / REFLECT_K * k.
+
+        signal_per_bin 是未乘系数的 10bit 信号: 先在 10bit 量程上把
+        dist^2 * signal / REFLECT_K 算完, 最后一步才乘 pile-up 系数 k,
+        避免弱信号一开始就被 [0, 200000] 的大量程压掉精度.
+        k >= 1, 所以 refl_10bit 提前在 3.0 饱和不影响结果 (乘完 k 一样要被钳掉).
+        """
         dist_sq = fq(dist_per_bin * dist_per_bin, 36*36)
-        signal_div_REFLECT_K = fq(signal_per_bin / REFLECT_K, 50000 / REFLECT_K)
-        refl = fq(dist_sq * signal_div_REFLECT_K, 3)
+        signal_div_REFLECT_K = fq(signal_per_bin / REFLECT_K, 1023 / REFLECT_K)
+        refl_10bit = fq(dist_sq * signal_div_REFLECT_K, 3)
+        refl = fq(refl_10bit * k, 3)
         refl = fq(torch.clamp(refl, max=3.0), 3)
         mask = fq(torch.relu(torch.sign(fq(refl - REFLECT_THRESH, 3))), _MASK)
         return refl, mask
@@ -237,30 +287,27 @@ class Network(nn.Module):
         # hist 仍 fq 一次，给后续三邻域加减挂上 scale，避免掉回 CPU float。
         hist, raw_bin_63, raw_bin_64 = self._split_hist_and_tail(x)
         hist = fq(hist, 1023)
-        sat_value = fq(
-            torch.clamp(self._caculate_sat_value(raw_bin_63, raw_bin_64), min=SAT_MIN),
-            50000,
-        )
-        k = fq(fq(torch.reciprocal(sat_value), 1.0 / SAT_MIN) * PULSES, 48.83)
-        hist_k = fq(hist * k, 50000)
+        sat_value = self._caculate_sat_value(raw_bin_63, raw_bin_64)
+        k = self._pileup_gain(sat_value)
 
         # ---- 1) 距离重心 & argmax 门控, 都用原始 hist ----
         dist_per_bin = self._dist_per_bin(hist)  # (B, 62, H, W)
 
         # ---- 2a) SNR 用原始 hist (10bit, 未做饱和补偿) 计算 ----
-        # SNR 描述的是真实光子统计噪声, 必须基于原始计数, 否则 hist_k 放大后
+        # SNR 描述的是真实光子统计噪声, 必须基于原始计数, 否则被 k 放大后
         # 信号和 sqrt(噪声) 都被同一个 k 拉伸, 比值会被夸大, 失去物理意义.
         mean_raw = self._background_mean(hist)                       # (B, 1, H, W)
         signal_raw_per_bin = fq(hist - mean_raw, 1023)               # (B, 62, H, W)
         noise_raw = fq(fq(torch.sqrt(mean_raw), 31.98) + NOISE_BIAS, 32.98)
         snr_per_bin, snr_mask = self._snr_and_mask(signal_raw_per_bin, noise_raw)
 
-        # ---- 2b) 反射率用归一化 hist_k 算 (脉冲数无关, 阈值统一) ----
-        signal_k_per_bin = fq(signal_raw_per_bin * k, 49953)
-        reflectance_per_bin, reflect_mask = self._reflectance_and_mask(signal_k_per_bin, dist_per_bin)
+        # ---- 2b) 反射率: 10bit 信号先算完, 最后再乘 pile-up 系数 k (打光次数无关, 阈值统一) ----
+        reflectance_per_bin, reflect_mask = self._reflectance_and_mask(
+            signal_raw_per_bin, dist_per_bin, k
+        )
 
         # ---- 3) 三路 per-bin mask ----
-        crosstalk_mask = self._crosstalk_mask(hist_k)
+        crosstalk_mask = self._crosstalk_mask(hist)
         valid_mask = fq(fq(crosstalk_mask * snr_mask, _MASK) * reflect_mask, _MASK)
 
         # ---- 4) 在原始 hist 上做 argmax 选峰 bin ----
@@ -271,7 +318,10 @@ class Network(nn.Module):
         dist = fq(torch.sum(fq(one_hot_mask * dist_per_bin, 34.46), dim=1, keepdim=True), 34.46)
         reflectance = fq(torch.sum(fq(one_hot_mask * reflectance_per_bin, 30), dim=1, keepdim=True), 30)
         snr = fq(torch.sum(fq(one_hot_mask * snr_per_bin, 1023), dim=1, keepdim=True), 1023)
-        peak = fq(torch.amax(hist_k, dim=1, keepdim=True), 50000)
+        # peak: k 是每像素一个正数, 先在 10bit 上取 max 再乘 k, 结果和 max(hist*k)
+        # 完全一样, 但 max 留在 1023 量程上, 避免整条 62 通道都跑在 20 万量程里
+        peak_raw = fq(torch.amax(hist, dim=1, keepdim=True), 1023)
+        peak = fq(peak_raw * k, MAX_PHOTON)
 
         # ---- 6) conf: 该像素任一 bin 通过 3 路 mask 即为有效, 再乘混叠 mask ----
         conf = fq(torch.amax(valid_mask, dim=1, keepdim=True), _MASK)
