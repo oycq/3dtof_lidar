@@ -30,6 +30,10 @@ COST_RE = re.compile(
     r"frame_id:\s*(\d+).*?inference cost:\s*([0-9.]+)\s*ms",
     re.IGNORECASE,
 )
+ANSI_ESCAPE_RE = re.compile(
+    r"(?:\x1B[@-_][0-?]*[ -/]*[@-~])|(?:\x9B[0-?]*[ -/]*[@-~])"
+)
+TERMINAL_PROGRESS_RE = re.compile(r"^\s*\[[=\s>.-]+\]\s*\d{1,3}%\s*$")
 STEP_RE = re.compile(r"^\[\[STEP\]\]\s+(\S+)\s*$")
 REMOTE_LOG = "/userdata/log/current/sense/dtof_depth/0/log0.txt"
 ARMED_ENV = "export LD_LIBRARY_PATH=/app/lib:/sense/lib:/usr/hobot/lib:$LD_LIBRARY_PATH"
@@ -719,7 +723,9 @@ class LineTee:
             self.orig.flush()
         except Exception:
             pass
-        self.buf += s.replace("\r", "\n")
+        # 终端颜色码在 Tk 文本框中会显示成 “[92m” 一类乱码。
+        # 同时把只有回车的终端进度输出转换为普通行。
+        self.buf += ANSI_ESCAPE_RE.sub("", s).replace("\r", "\n")
         while "\n" in self.buf:
             line, self.buf = self.buf.split("\n", 1)
             if line:
@@ -738,12 +744,143 @@ def _tk_font(root, size: int = 10, bold: bool = False):
     from tkinter import font as tkfont
 
     weight = "bold" if bold else "normal"
-    for family in ("Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "TkDefaultFont"):
+    available = set(tkfont.families(root))
+    for family in ("SF Pro Display", "Segoe UI Variable", "Segoe UI", "Microsoft YaHei UI"):
+        if family not in available:
+            continue
         try:
             return tkfont.Font(root=root, family=family, size=size, weight=weight)
         except tk.TclError:
             continue
     return tkfont.nametofont("TkDefaultFont")
+
+
+def _enable_windows_hidpi() -> None:
+    """让 Tk 在 Windows 高分屏上由系统按真实 DPI 清晰渲染。"""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+def _open_source_image(path: Path):
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    try:
+        with Image.open(path) as im:
+            src = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+            return src.copy()
+    except Exception:
+        return None
+
+
+def _resample_filter():
+    try:
+        from PIL import Image
+
+        return getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+    except Exception:
+        return None
+
+
+def _fit_photo(src, max_w: int, max_h: int):
+    try:
+        from PIL import ImageTk
+    except ImportError:
+        return None
+    w = max(int(max_w), 1)
+    h = max(int(max_h), 1)
+    ow, oh = src.size
+    scale = min(w / ow, h / oh)
+    if scale <= 0:
+        return None
+    nw = max(1, int(ow * scale))
+    nh = max(1, int(oh * scale))
+    im = src if (nw, nh) == (ow, oh) else src.resize((nw, nh), _resample_filter())
+    return ImageTk.PhotoImage(im)
+
+
+class FitImagePane:
+    """把图片等比铺满当前区域，窗口或分割条变化时重新适配。"""
+
+    def __init__(self, parent, placeholder: str, font) -> None:
+        import tkinter as tk
+
+        self.canvas = tk.Canvas(parent, background="#FFFFFF", highlightthickness=0, cursor="arrow")
+        self.placeholder = placeholder
+        self.font = font
+        self.path: Path | None = None
+        self._src = None
+        self._photo = None
+        self._job = None
+        self._last = (0, 0)
+        self.canvas.bind("<Configure>", self._on_configure)
+        self._draw_placeholder()
+
+    def set_path(self, path: Path) -> None:
+        self.path = path
+        self._src = _open_source_image(path)
+        self._last = (0, 0)
+        self._render()
+
+    def refit(self) -> None:
+        self._last = (0, 0)
+        self._render()
+
+    def _on_configure(self, _event) -> None:
+        if self._job is not None:
+            try:
+                self.canvas.after_cancel(self._job)
+            except Exception:
+                pass
+        self._job = self.canvas.after(40, self._render)
+
+    def _draw_placeholder(self, text: str | None = None) -> None:
+        self.canvas.delete("all")
+        w = max(self.canvas.winfo_width(), 1)
+        h = max(self.canvas.winfo_height(), 1)
+        self.canvas.create_text(
+            w // 2,
+            h // 2,
+            text=text or self.placeholder,
+            fill="#AEAEB2",
+            font=self.font,
+            justify="center",
+        )
+
+    def _render(self) -> None:
+        self._job = None
+        w = max(self.canvas.winfo_width(), 1)
+        h = max(self.canvas.winfo_height(), 1)
+        if w < 8 or h < 8:
+            self._job = self.canvas.after(50, self._render)
+            return
+        if abs(w - self._last[0]) < 3 and abs(h - self._last[1]) < 3:
+            return
+        self._last = (w, h)
+        if self._src is None:
+            msg = None
+            if self.path is not None:
+                msg = f"无法显示\n{self.path}"
+            self._draw_placeholder(msg)
+            return
+        pad = 18
+        photo = _fit_photo(self._src, w - pad * 2, h - pad * 2)
+        if photo is None:
+            self._draw_placeholder(f"无法显示\n{self.path}")
+            return
+        self._photo = photo
+        self.canvas.delete("all")
+        self.canvas.create_image(w // 2, h // 2, image=photo, anchor="center")
 
 
 class SpeedUI(Reporter):
@@ -754,96 +891,250 @@ class SpeedUI(Reporter):
 
         self.args = args
         self.exit_code = 1
-        self._photos: list = []
         self.steps = pipeline_steps(args)
         self._step_done: set[str] = set()
         self._running = False
+        self._last_log_was_progress = False
 
+        _enable_windows_hidpi()
         self.root = tk.Tk()
-        self.root.title("dToF 测速")
-        self.root.geometry("1480x900")
-        self.root.minsize(1100, 700)
-        title_font = _tk_font(self.root, 13, True)
+        self.root.title("dToF 性能工作台")
+        self.root.geometry("1520x920")
+        self.root.minsize(1120, 720)
+        self.root.configure(background="#F5F5F7")
+        try:
+            dpi = self.root.winfo_fpixels("1i")
+            self.root.tk.call("tk", "scaling", max(1.0, dpi / 72.0))
+        except tk.TclError:
+            pass
+
+        title_font = _tk_font(self.root, 19, True)
+        section_font = _tk_font(self.root, 11, True)
         ui_font = _tk_font(self.root, 10)
-        log_font = _tk_font(self.root, 9)
+        small_font = _tk_font(self.root, 9)
+        log_font = _tk_font(self.root, 10)
 
-        top = ttk.Frame(self.root, padding=(12, 10, 12, 6))
-        top.pack(fill="x")
-        self.step_var = tk.StringVar(value="准备中")
-        tk.Label(top, textvariable=self.step_var, font=title_font, anchor="w").pack(anchor="w")
-        self.prog = ttk.Progressbar(top, mode="determinate", maximum=max(len(self.steps), 1))
-        self.prog.pack(fill="x", pady=(8, 0))
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+        style.configure(".", font=ui_font, background="#F5F5F7", foreground="#1D1D1F")
+        style.configure("App.TFrame", background="#F5F5F7")
+        style.configure("Card.TFrame", background="#FFFFFF")
+        style.configure("Card.TLabel", background="#FFFFFF", foreground="#1D1D1F")
+        style.configure("Muted.TLabel", background="#FFFFFF", foreground="#86868B", font=small_font)
+        style.configure(
+            "Apple.Horizontal.TProgressbar",
+            troughcolor="#E8E8ED",
+            background="#007AFF",
+            bordercolor="#E8E8ED",
+            lightcolor="#007AFF",
+            darkcolor="#007AFF",
+            thickness=7,
+        )
+        style.configure(
+            "Apple.TButton",
+            background="#007AFF",
+            foreground="#FFFFFF",
+            borderwidth=0,
+            focuscolor="#007AFF",
+            padding=(16, 8),
+            font=ui_font,
+        )
+        style.map(
+            "Apple.TButton",
+            background=[("disabled", "#B8D8FA"), ("pressed", "#0062CC"), ("active", "#0A84FF")],
+            foreground=[("disabled", "#F4F8FC")],
+        )
+        style.configure(
+            "Quiet.TButton",
+            background="#F2F2F7",
+            foreground="#3A3A3C",
+            borderwidth=0,
+            focuscolor="#F2F2F7",
+            padding=(11, 6),
+            font=small_font,
+        )
+        style.map("Quiet.TButton", background=[("pressed", "#D9D9DE"), ("active", "#E5E5EA")])
+        style.configure("Apple.TNotebook", background="#FFFFFF", borderwidth=0, tabmargins=0)
+        style.configure(
+            "Apple.TNotebook.Tab",
+            background="#F2F2F7",
+            foreground="#636366",
+            padding=(16, 8),
+            borderwidth=0,
+        )
+        style.map(
+            "Apple.TNotebook.Tab",
+            background=[("selected", "#FFFFFF"), ("active", "#EDEDF2")],
+            foreground=[("selected", "#007AFF")],
+        )
+        style.configure("Apple.TPanedwindow", background="#F5F5F7", sashwidth=8)
+        style.configure(
+            "Apple.Vertical.TScrollbar",
+            background="#C7C7CC",
+            troughcolor="#FFFFFF",
+            bordercolor="#FFFFFF",
+            arrowcolor="#8E8E93",
+        )
+        style.configure(
+            "Apple.Horizontal.TScrollbar",
+            background="#C7C7CC",
+            troughcolor="#FFFFFF",
+            bordercolor="#FFFFFF",
+            arrowcolor="#8E8E93",
+        )
+
+        shell = ttk.Frame(self.root, style="App.TFrame", padding=(18, 16, 18, 14))
+        shell.pack(fill="both", expand=True)
+
+        top = ttk.Frame(shell, style="Card.TFrame", padding=(20, 17))
+        top.pack(fill="x", pady=(0, 12))
+        heading = ttk.Frame(top, style="Card.TFrame")
+        heading.pack(fill="x")
+        ttk.Label(heading, text="dToF 性能工作台", font=title_font, style="Card.TLabel").pack(
+            side="left"
+        )
         self.pct_var = tk.StringVar(value="0%")
-        ttk.Label(top, textvariable=self.pct_var).pack(anchor="e")
+        ttk.Label(
+            heading,
+            textvariable=self.pct_var,
+            foreground="#007AFF",
+            background="#FFFFFF",
+            font=section_font,
+        ).pack(side="right")
+        self.step_var = tk.StringVar(value="准备中")
+        ttk.Label(
+            top, textvariable=self.step_var, style="Muted.TLabel", anchor="w"
+        ).pack(anchor="w", pady=(4, 11))
+        self.prog = ttk.Progressbar(
+            top,
+            mode="determinate",
+            maximum=max(len(self.steps), 1),
+            style="Apple.Horizontal.TProgressbar",
+        )
+        self.prog.pack(fill="x")
 
-        body = ttk.Panedwindow(self.root, orient="horizontal")
-        body.pack(fill="both", expand=True, padx=12, pady=6)
+        body = ttk.Panedwindow(shell, orient="horizontal", style="Apple.TPanedwindow")
+        body.pack(fill="both", expand=True)
 
-        left = ttk.Frame(body, padding=4)
-        ttk.Label(left, text="步骤").pack(anchor="w")
+        left = ttk.Frame(body, style="Card.TFrame", padding=(14, 13))
+        ttk.Label(left, text="运行步骤", font=section_font, style="Card.TLabel").pack(
+            anchor="w", pady=(0, 10)
+        )
         self.step_list = tk.Listbox(
-            left, width=28, activestyle="none", exportselection=False, font=ui_font
+            left,
+            width=28,
+            activestyle="none",
+            exportselection=False,
+            font=ui_font,
+            background="#FFFFFF",
+            foreground="#3A3A3C",
+            selectbackground="#E5F1FF",
+            selectforeground="#0066CC",
+            borderwidth=0,
+            highlightthickness=0,
+            relief="flat",
+            cursor="arrow",
         )
         self.step_list.pack(fill="both", expand=True)
         for i, sid in enumerate(self.steps, 1):
-            self.step_list.insert("end", f"  {i:>2}/{len(self.steps)}  {STEP_LABELS.get(sid, sid)}")
+            self.step_list.insert("end", f"○  {i:>2}   {STEP_LABELS.get(sid, sid)}")
         body.add(left, weight=1)
 
-        mid = ttk.Frame(body, padding=4)
-        ttk.Label(mid, text="全程日志").pack(anchor="w")
+        mid = ttk.Frame(body, style="Card.TFrame", padding=(14, 13))
+        log_heading = ttk.Frame(mid, style="Card.TFrame")
+        log_heading.pack(fill="x", pady=(0, 10))
+        ttk.Label(log_heading, text="实时日志", font=section_font, style="Card.TLabel").pack(
+            side="left"
+        )
+        ttk.Button(
+            log_heading, text="清空", command=self._clear_log, style="Quiet.TButton"
+        ).pack(side="right")
         self.log = ScrolledText(
             mid,
             wrap="none",
             font=log_font,
             state="disabled",
-            background="#0f172a",
-            foreground="#e2e8f0",
+            background="#151517",
+            foreground="#F2F2F7",
+            insertbackground="#FFFFFF",
+            selectbackground="#0A84FF",
+            selectforeground="#FFFFFF",
+            borderwidth=0,
+            highlightthickness=0,
+            relief="flat",
+            padx=14,
+            pady=12,
+            spacing1=1,
+            spacing3=1,
         )
         self.log.pack(fill="both", expand=True)
         body.add(mid, weight=3)
 
-        right = ttk.Frame(body, padding=4)
-        ttk.Label(right, text="图片").pack(anchor="w")
-        self.nb = ttk.Notebook(right)
+        right = ttk.Frame(body, style="Card.TFrame", padding=(14, 13))
+        ttk.Label(right, text="分析结果", font=section_font, style="Card.TLabel").pack(
+            anchor="w", pady=(0, 10)
+        )
+        self.nb = ttk.Notebook(right, style="Apple.TNotebook")
         self.nb.pack(fill="both", expand=True)
-        self.img_labels: dict[str, tk.Label] = {}
+        self.img_panes: dict[str, FitImagePane] = {}
         for title in ("量化对比", "测速分布"):
-            frame = ttk.Frame(self.nb)
+            frame = ttk.Frame(self.nb, style="Card.TFrame")
             self.nb.add(frame, text=title)
-            canvas = tk.Canvas(frame, background="#1e293b", highlightthickness=0)
-            vsb = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-            hsb = ttk.Scrollbar(frame, orient="horizontal", command=canvas.xview)
-            inner = ttk.Frame(canvas)
-            inner.bind("<Configure>", lambda e, c=canvas: c.configure(scrollregion=c.bbox("all")))
-            canvas.create_window((0, 0), window=inner, anchor="nw")
-            canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-            canvas.grid(row=0, column=0, sticky="nsew")
-            vsb.grid(row=0, column=1, sticky="ns")
-            hsb.grid(row=1, column=0, sticky="ew")
-            frame.rowconfigure(0, weight=1)
-            frame.columnconfigure(0, weight=1)
-            lab = tk.Label(inner, text="等待图片", bg="#1e293b", fg="#94a3b8", font=ui_font)
-            lab.pack(anchor="nw")
-            self.img_labels[title] = lab
+            pane = FitImagePane(frame, "图表生成后将在这里显示", ui_font)
+            pane.canvas.pack(fill="both", expand=True)
+            self.img_panes[title] = pane
+        self.nb.bind("<<NotebookTabChanged>>", lambda _e: self.root.after(40, self._refit_images))
         body.add(right, weight=3)
+        body.bind("<ButtonRelease-1>", lambda _e: self.root.after(40, self._refit_images))
 
-        bottom = ttk.Frame(self.root, padding=(12, 4, 12, 10))
+        bottom = ttk.Frame(shell, style="App.TFrame", padding=(2, 12, 2, 0))
         bottom.pack(fill="x")
+        self.status_dot = tk.Canvas(
+            bottom,
+            width=10,
+            height=10,
+            background="#F5F5F7",
+            highlightthickness=0,
+        )
+        self.status_dot.pack(side="left", padx=(2, 7))
+        self.status_dot_id = self.status_dot.create_oval(2, 2, 9, 9, fill="#FF9F0A", outline="")
         self.status_var = tk.StringVar(value="正在启动")
-        ttk.Label(bottom, textvariable=self.status_var).pack(side="left")
-        ttk.Button(bottom, text="重新运行", command=self._rerun).pack(side="right")
+        ttk.Label(
+            bottom,
+            textvariable=self.status_var,
+            background="#F5F5F7",
+            foreground="#636366",
+            font=small_font,
+        ).pack(side="left")
+        self.rerun_button = ttk.Button(
+            bottom, text="重新运行", command=self._rerun, style="Apple.TButton"
+        )
+        self.rerun_button.pack(side="right")
+        self.root.bind("<Control-l>", lambda _event: self._clear_log())
 
         self.root.after(200, self._start)
 
     def _ui(self, fn: Callable[[], None]) -> None:
         self.root.after(0, fn)
 
+    def _clear_log(self) -> None:
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+        self._last_log_was_progress = False
+
     def log_line(self, line: str) -> None:
+        clean_line = ANSI_ESCAPE_RE.sub("", line)
+        is_progress = bool(TERMINAL_PROGRESS_RE.match(clean_line))
+
         def _append() -> None:
             self.log.configure(state="normal")
-            self.log.insert("end", line + "\n")
+            if is_progress and self._last_log_was_progress:
+                self.log.delete("end-2l", "end-1l")
+            self.log.insert("end", clean_line + "\n")
             self.log.see("end")
             self.log.configure(state="disabled")
+            self._last_log_was_progress = is_progress
 
         self._ui(_append)
 
@@ -857,9 +1148,11 @@ class SpeedUI(Reporter):
             if step_id in self.steps:
                 idx = self.steps.index(step_id)
                 for i, sid in enumerate(self.steps):
-                    prefix = "✓" if sid in self._step_done or i < idx else ("►" if i == idx else " ")
+                    prefix = "✓" if sid in self._step_done or i < idx else ("●" if i == idx else "○")
                     self.step_list.delete(i)
-                    self.step_list.insert(i, f"{prefix} {i + 1:>2}/{total}  {STEP_LABELS.get(sid, sid)}")
+                    self.step_list.insert(
+                        i, f"{prefix}  {i + 1:>2}   {STEP_LABELS.get(sid, sid)}"
+                    )
                 self._step_done.add(step_id)
                 self.step_list.selection_clear(0, "end")
                 self.step_list.selection_set(idx)
@@ -867,33 +1160,36 @@ class SpeedUI(Reporter):
 
         self._ui(_set)
 
+    def _refit_images(self) -> None:
+        for pane in self.img_panes.values():
+            pane.refit()
+
     def image(self, title: str, path: Path) -> None:
         def _show() -> None:
-            lab = self.img_labels.get(title)
-            if lab is None:
+            pane = self.img_panes.get(title)
+            if pane is None:
                 return
-            photo = _load_photo(path, max_w=900, max_h=820)
-            if photo is None:
-                lab.configure(text=f"无法显示: {path}")
-                return
-            self._photos.append(photo)
-            lab.configure(image=photo, text="")
+            pane.set_path(path)
             for i in range(self.nb.index("end")):
                 if self.nb.tab(i, "text") == title:
                     self.nb.select(i)
                     break
+            self.root.after(80, self._refit_images)
 
         self._ui(_show)
 
     def done(self, ok: bool, message: str) -> None:
         def _set() -> None:
             self.status_var.set(message)
+            self.rerun_button.configure(state="normal")
             if ok:
                 self.prog["value"] = self.prog["maximum"]
                 self.pct_var.set("100%")
                 self.step_var.set(message)
+                self.status_dot.itemconfigure(self.status_dot_id, fill="#30D158")
             else:
                 self.step_var.set("失败: " + message)
+                self.status_dot.itemconfigure(self.status_dot_id, fill="#FF453A")
 
         self._ui(_set)
 
@@ -902,6 +1198,8 @@ class SpeedUI(Reporter):
             return
         self._running = True
         self.status_var.set("运行中…")
+        self.rerun_button.configure(state="disabled")
+        self.status_dot.itemconfigure(self.status_dot_id, fill="#0A84FF")
         threading.Thread(target=self._worker, daemon=True).start()
 
     def _rerun(self) -> None:
@@ -910,10 +1208,8 @@ class SpeedUI(Reporter):
         self._step_done.clear()
         for i, sid in enumerate(self.steps):
             self.step_list.delete(i)
-            self.step_list.insert(i, f"  {i + 1:>2}/{len(self.steps)}  {STEP_LABELS.get(sid, sid)}")
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
+            self.step_list.insert(i, f"○  {i + 1:>2}   {STEP_LABELS.get(sid, sid)}")
+        self._clear_log()
         self.prog["value"] = 0
         self.pct_var.set("0%")
         self.step_var.set("重新运行…")
@@ -937,7 +1233,7 @@ class SpeedUI(Reporter):
                 self.exit_code = 0
         except Exception:
             traceback.print_exc()
-            self.done(False, "异常退出，见左侧日志")
+            self.done(False, "异常退出，请查看实时日志")
             self.exit_code = 1
         finally:
             sys.stdout, sys.stderr = old_out, old_err
@@ -946,24 +1242,6 @@ class SpeedUI(Reporter):
     def mainloop(self) -> int:
         self.root.mainloop()
         return self.exit_code
-
-
-def _load_photo(path: Path, max_w: int, max_h: int):
-    try:
-        from PIL import Image, ImageTk
-    except ImportError:
-        try:
-            import tkinter as tk
-
-            return tk.PhotoImage(file=str(path))
-        except Exception:
-            return None
-    try:
-        im = Image.open(path)
-        im.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
-        return ImageTk.PhotoImage(im)
-    except Exception:
-        return None
 
 
 def main() -> int:
