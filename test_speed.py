@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """远程编译 dtof.bin → 上板 → Armed → 拉取 log 并画出 inference cost 分布。
 
-默认打开 UI：进度条、步骤列表、远端全程日志、服务器对比图和测速图。
+默认打开 UI：进度条、步骤列表、远端全程日志、BPU 计算图、服务器对比图和测速图。
 无界面模式: py test_speed.py --cli
 
 所有中间产物和图表都落在 tmp/。
@@ -386,6 +386,8 @@ def remote_compile_script(quant_dir: str) -> str:
             "ls -lh \"$BUILD/output/dtof.bin\"",
             "echo \"[[STEP]] hb_perf\"",
             "run hb_perf output/dtof.bin",
+            "test -f \"$BUILD/hb_perf_result/dtof/dtof.png\"",
+            "ls -lh \"$BUILD/hb_perf_result/dtof/dtof.png\"",
             "echo \"[[STEP]] compare_quant\"",
             "run python3.10 \"$ROOT/compare_quant.py\"",
             "test -f \"$BUILD/compare_quant.png\"",
@@ -470,6 +472,7 @@ def compile_remote(
     log_path = out_dir / "compile.log"
     remote_net = f"{quant_dir.rstrip('/')}/net.py"
     remote_bin = f"{quant_dir.rstrip('/')}/build/output/dtof.bin"
+    remote_graph_png = f"{quant_dir.rstrip('/')}/build/hb_perf_result/dtof/dtof.png"
     remote_png = f"{quant_dir.rstrip('/')}/build/compare_quant.png"
 
     stepper("upload_net")
@@ -504,6 +507,15 @@ def compile_remote(
     if bin_path.resolve() != stamped.resolve():
         stamped.write_bytes(bin_path.read_bytes())
     print(f"编译完成: {bin_path}  ({bin_path.stat().st_size} bytes)")
+
+    local_graph_png = out_dir / "dtof.png"
+    print(f"拉取 {host}:{remote_graph_png} -> {local_graph_png}")
+    try:
+        scp_file(f"{host}:{remote_graph_png}", str(local_graph_png), log_path)
+    except SystemExit as e:
+        print(f"BPU 计算图拉取失败: {e}")
+    if local_graph_png.is_file() and local_graph_png.stat().st_size > 0:
+        reporter.image("BPU 计算图", local_graph_png)
 
     local_png = out_dir / "compare_quant.png"
     print(f"拉取 {host}:{remote_png} -> {local_png}")
@@ -1077,7 +1089,7 @@ class SpeedUI(Reporter):
         self.nb = ttk.Notebook(right, style="Apple.TNotebook")
         self.nb.pack(fill="both", expand=True)
         self.img_panes: dict[str, FitImagePane] = {}
-        for title in ("量化对比", "测速分布"):
+        for title in ("BPU 计算图", "量化对比", "测速分布"):
             frame = ttk.Frame(self.nb, style="Card.TFrame")
             self.nb.add(frame, text=title)
             pane = FitImagePane(frame, "图表生成后将在这里显示", ui_font)
