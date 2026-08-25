@@ -20,8 +20,7 @@ nn/net.py
    全程 62 通道的中间量都留在 10bit 量程上算, k 只在两处最后一步乘进去:
    - reflectance = (dist^2 * signal / REFLECT_K) * k
    - peak        = max(hist) * k
-   dist / argmax / SNR / crosstalk 都直接用原始 hist, 不做聚堆补偿
-   (SNR 反映的是原始光子统计噪声, crosstalk 是同帧同曝光下的横向比较)
+   dist / argmax / SNR 直接用原始 hist; crosstalk 使用补偿后的反射率
 
 2) 用 split 在原始 hist 上并行算出 62 路候选距离 (每 bin 都做三邻域重心细化):
       hist_left, hist_center, hist_right = hist[0:60], hist[1:61], hist[2:62]
@@ -41,7 +40,9 @@ nn/net.py
       reflectance_per_bin = dist_per_bin^2 * signal_raw_per_bin / REFLECT_K * k
 
 4) 三路 per-bin mask (都是 (B, 62, H, W), 0/1):
-      crosstalk_mask : hist                > mean(hist) * CROSSTALK_MEAN_COEF
+      crosstalk_mask : 每个 bin 独立统计 1200 个像素:
+                       reflectance_per_bin > min(该 bin 高反射像素数 * 2%, 50%)
+                       高反射像素 = reflectance_per_bin > 250%
       snr_mask       : snr_per_bin         > SNR_THRESH         (基于原始 hist)
       reflect_mask   : reflectance_per_bin > REFLECT_THRESH
    三者相乘得到 per-bin 的 valid_mask.
@@ -96,7 +97,10 @@ REFLECT_THRESH = 0.015
 MAX_REFL = 30.0
 SNR_THRESH = 5.0
 NOISE_BIAS = 1
-CROSSTALK_MEAN_COEF = 0.66
+# 窜光动态反射率阈值: 每个 >250% 的高反射像素使阈值增加 2%, 最高 50%
+CROSSTALK_HIGH_REFL = 2.5
+CROSSTALK_REFL_PER_POINT = 0.02
+CROSSTALK_REFL_MAX_THRESH = 0.5
 # 距离下限(米): 小于该值的候选距离会被钳到该值, 避免近距离重心溢出/负值
 MIN_DIST_M = 0.4
 
@@ -170,19 +174,23 @@ class Network(nn.Module):
         pileup_gain = fq(photons_per_pulse * (PULSES / TAIL_BASE), MAX_K)
         return pileup_gain
 
-    def _crosstalk_mask(self, hist):
-        """窜光抑制: 只输出 (B,62,H,W) 的 0/1 mask, 不改变 hist 本身.
+    def _crosstalk_mask(self, reflectance_per_bin):
+        """用高反射像素数量生成动态反射率门限，输出 (B,62,H,W) 的 0/1 mask.
 
-        阈值是同一个 bin 的全图均值, 直接用 10bit 原始计数比:
-        窜光看的是"这一 bin 相对全图是不是普遍偏亮", 属于同帧同曝光下的横向比较,
-        不需要 pile-up 补偿; 而且留在 1023 量程上, 台阶 0.03 计数.
+        每个 bin 独立统计其 1200 个像素。大于 250% 的像素每增加一个，
+        该 bin 的门限增加 2%（例如 5 个对应 10%），门限最高为 50%。
         """
-        # 全图均值 mean(H,W): 拆成两次单轴 ReduceMean, 避免被 horizon 优化器折叠成
-        # GlobalAveragePool(只支持 int8 输入), 保证整条路径留在 int16 精度上.
-        mean_h = fq(torch.mean(hist,   dim=2, keepdim=True), 1023)
-        mean_hw = fq(torch.mean(mean_h, dim=3, keepdim=True), 1023)
-        thr = fq(mean_hw * CROSSTALK_MEAN_COEF, 1023 * CROSSTALK_MEAN_COEF)
-        return fq(torch.relu(torch.sign(fq(hist - thr, 1023))), _MASK)
+        high_refl = fq(
+            torch.relu(torch.sign(fq(reflectance_per_bin - CROSSTALK_HIGH_REFL, 3))),
+            _MASK,
+        )
+        count_h = fq(torch.sum(high_refl, dim=2, keepdim=True), 30)
+        high_refl_count = fq(torch.sum(count_h, dim=3, keepdim=True), 1200)
+        threshold = fq(high_refl_count * CROSSTALK_REFL_PER_POINT, 0.5)
+        return fq(
+            torch.relu(torch.sign(fq(reflectance_per_bin - threshold, 3))),
+            _MASK,
+        )
 
     def _dist_per_bin(self, hist):
         """用三邻域重心算 62 路候选距离, 输出 (B, 62, H, W).
@@ -307,7 +315,7 @@ class Network(nn.Module):
         )
 
         # ---- 3) 三路 per-bin mask ----
-        crosstalk_mask = self._crosstalk_mask(hist)
+        crosstalk_mask = self._crosstalk_mask(reflectance_per_bin)
         valid_mask = fq(fq(crosstalk_mask * snr_mask, _MASK) * reflect_mask, _MASK)
 
         # ---- 4) 在原始 hist 上做 argmax 选峰 bin ----
