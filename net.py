@@ -18,16 +18,16 @@ nn/net.py
    得到 pile-up 系数 k (见 _pileup_gain, 取值 [1.01, 191]).
 
    全程 62 通道的中间量都留在 10bit 量程上算, k 只在两处最后一步乘进去:
-   - reflectance = (dist^2 * signal / REFLECT_K) * k
+   - reflectance = Σ(左/中/右 bin 的 dist^2 * signal / REFLECT_K * k)
    - peak        = max(hist) * k
    dist / argmax / SNR 直接用原始 hist; crosstalk 使用补偿后的反射率
 
-2) 用 split 在原始 hist 上并行算出 62 路候选距离 (每 bin 都做三邻域重心细化):
-      hist_left, hist_center, hist_right = hist[0:60], hist[1:61], hist[2:62]
-      side_diff  = hist_right - hist_left                     (anchor 1..60)
-      window_sum = hist_left + hist_center + hist_right
-      centroid_bin = side_diff / (window_sum + 1) + i
-      # 算完 60 路再扩成 62: bin0 复用 bin1, bin61 复用 bin60
+2) 用 62x62 稠密 1x1 conv 在原始 hist 上并行算出 62 路候选距离
+   (每 bin 都做三邻域重心细化, anchor = clip(i, 1, 60)):
+      side_diff  = conv(hist, side_diff_kernel)   # x[anchor+1] - x[anchor-1]
+      window_sum = conv(hist, window_sum_kernel)  # x[anchor-1] + x[anchor] + x[anchor+1]
+      centroid_bin = side_diff / (window_sum + 1) + anchor
+      # kernel 里已经对 bin0/bin61 复用邻侧窗口, 卷积直接出 62 路
       dist_per_bin = centroid_bin * DIST_SCALE_M + DIST_BIAS   (B, 62, H, W)
 
 3) 每 bin 的信号量 (形状都是 (B, 62, H, W)):
@@ -36,8 +36,10 @@ nn/net.py
       # SNR 用原始 hist 算 (保留真实光子噪声统计)
       signal_raw_per_bin  = hist   - mean_bg
       snr_per_bin         = signal_raw_per_bin / (sqrt(mean_bg)      + NOISE_BIAS)
-      # reflect 先在 10bit 量程上算完, 最后一步才乘 pile-up 系数 k
-      reflectance_per_bin = dist_per_bin^2 * signal_raw_per_bin / REFLECT_K * k
+      # 每个 bin 的基础反射率先在 10bit 量程上算完, 最后一步才乘 pile-up 系数 k
+      reflectance_base = dist_per_bin^2 * signal_raw_per_bin / REFLECT_K * k
+      # 复用距离重心那组 window_sum_kernel, 累加 anchor 的左/中/右三个 bin
+      reflectance_per_bin = conv(reflectance_base, window_sum_kernel)
 
 4) 三路 per-bin mask (都是 (B, 62, H, W), 0/1):
       crosstalk_mask : 每个 bin 独立统计 1200 个像素:
@@ -64,6 +66,7 @@ nn/net.py
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 DIST_SCALE_M = 0.6
 TAIL_BASE = 1024.0
@@ -143,8 +146,25 @@ def fdiv(a: torch.Tensor, b: torch.Tensor, inv_max: float, out_max: float) -> to
 class Network(nn.Module):
     def __init__(self):
         super().__init__()
-        bin_index = torch.arange(1, 61, dtype=torch.float32).view(1, 60, 1, 1)
+        # ---- 三邻域窗口: 62x62 稠密 1x1 conv, 输出通道 i = "假设 peak 在 bin i" ----
+        # anchor = clip(i, 1, 60), 即 bin0 复用 bin1 的窗口, bin61 复用 bin60 的窗口,
+        # 卷积直接输出 62 路, 不需要 split/cat 做边界拼接:
+        #   side_diff[i]  = x[anchor+1] - x[anchor-1]
+        #   window_sum[i] = x[anchor-1] + x[anchor] + x[anchor+1]
+        # 距离重心和三 bin 反射率求和共用 window_sum 这组权重.
+        side_diff_kernel = torch.zeros(62, 62, 1, 1, dtype=torch.float32)
+        window_sum_kernel = torch.zeros(62, 62, 1, 1, dtype=torch.float32)
+        for i in range(62):
+            anchor = min(max(i, 1), 60)
+            side_diff_kernel[i, anchor - 1, 0, 0] = -1.0
+            side_diff_kernel[i, anchor + 1, 0, 0] = 1.0
+            window_sum_kernel[i, anchor - 1, 0, 0] = 1.0
+            window_sum_kernel[i, anchor, 0, 0] = 1.0
+            window_sum_kernel[i, anchor + 1, 0, 0] = 1.0
+        bin_index = torch.arange(62, dtype=torch.float32).clamp(1, 60).view(1, 62, 1, 1)
         bin_arange = torch.arange(62, dtype=torch.float32).view(1, 62, 1, 1)
+        self.register_buffer("side_diff_kernel", side_diff_kernel)
+        self.register_buffer("window_sum_kernel", window_sum_kernel)
         self.register_buffer("bin_index", bin_index)
         self.register_buffer("bin_arange", bin_arange)
 
@@ -186,7 +206,7 @@ class Network(nn.Module):
         )
         count_h = fq(torch.sum(high_refl, dim=2, keepdim=True), 30)
         high_refl_count = fq(torch.sum(count_h, dim=3, keepdim=True), 1200)
-        threshold = fq(high_refl_count * CROSSTALK_REFL_PER_POINT, 0.5)
+        threshold = fq(high_refl_count * CROSSTALK_REFL_PER_POINT, 2)
         return fq(
             torch.relu(torch.sign(fq(reflectance_per_bin - threshold, 3))),
             _MASK,
@@ -195,26 +215,21 @@ class Network(nn.Module):
     def _dist_per_bin(self, hist):
         """用三邻域重心算 62 路候选距离, 输出 (B, 62, H, W).
 
-        假设 peak 在 bin i 时:
-          side_diff    = x[i+1] - x[i-1]                 (右邻 - 左邻)
-          window_sum   = x[i-1] + x[i] + x[i+1]          (三邻域和)
-          centroid_bin = side_diff / (window_sum + 1) + i  (+1 防除零)
-        先算 anchor 1..60, 再扩成 62 路 (bin0 复用 bin1, bin61 复用 bin60).
+        假设 peak 在 bin i (anchor = clip(i, 1, 60)) 时:
+          side_diff    = x[anchor+1] - x[anchor-1]              (右邻 - 左邻)
+          window_sum   = x[anchor-1] + x[anchor] + x[anchor+1]  (三邻域和)
+          centroid_bin = side_diff / (window_sum + 1) + anchor  (+1 防除零)
+        两个窗口都由 62x62 稠密 1x1 conv 一次算出全部 62 路.
 
         小于 MIN_DIST_M 的距离统一钳到 MIN_DIST_M, 避免近距离场景下重心偏移
         造成的负值或异常小值污染下游 reflectance (dist^2) 等计算.
         """
-        hist_left, _ = torch.split(hist, [60, 2], dim=1)
-        _, hist_center, _ = torch.split(hist, [1, 60, 1], dim=1)
-        _, hist_right = torch.split(hist, [2, 60], dim=1)
-        side_diff = fq(hist_right - hist_left, 1023)
-        window_sum = fq(fq(hist_left + hist_center + hist_right, 3069) + 1.0, 3070)
+        side_diff = fq(F.conv2d(hist, self.side_diff_kernel), 1023)
+        window_sum = fq(fq(F.conv2d(hist, self.window_sum_kernel), 3069) + 1.0, 3070)
         bin_offset = fdiv(side_diff, window_sum, 1.0, 1.0)
         centroid_bin = fq(bin_offset + fq(self.bin_index, 61), 61)
         dist_m = fq(fq(centroid_bin * DIST_SCALE_M, 36.6) + DIST_BIAS, 34.46)
-        dist_m = fq(torch.clamp(dist_m, min=MIN_DIST_M), 34.46)
-        dist_lo, _, dist_hi = torch.split(dist_m, [1, 58, 1], dim=1)
-        return fq(torch.cat([dist_lo, dist_m, dist_hi], dim=1), 34.46)
+        return fq(torch.clamp(dist_m, min=MIN_DIST_M), 34.46)
 
     def _background_mean(self, hist):
         """背景电平: 取首 MEAN_EDGE_BINS 个 bin 与末 MEAN_EDGE_BINS 个 bin 的均值中较大者.
@@ -235,18 +250,20 @@ class Network(nn.Module):
         return snr, mask
 
     def _reflectance_and_mask(self, signal_per_bin, dist_per_bin, k):
-        """反射率 = dist^2 * signal / REFLECT_K * k.
+        """反射率 = 左/中/右三个 bin 的基础反射率总和.
 
         signal_per_bin 是未乘系数的 10bit 信号: 先在 10bit 量程上把
         dist^2 * signal / REFLECT_K 算完, 最后一步才乘 pile-up 系数 k,
         避免弱信号一开始就被 [0, 200000] 的大量程压掉精度.
-        k >= 1, 所以 refl_10bit 提前在 3.0 饱和不影响结果 (乘完 k 一样要被钳掉).
+        然后用和距离重心同一组 window_sum 权重做 62x62 稠密 1x1 conv, 把
+        anchor 的左/中/右三个 bin 的反射率加起来, 边界同样是 bin0 复用 bin1
+        的窗口, bin61 复用 bin60 的窗口. 最终结果钳到 3.0.
         """
         dist_sq = fq(dist_per_bin * dist_per_bin, 36*36)
         signal_div_REFLECT_K = fq(signal_per_bin / REFLECT_K, 1023 / REFLECT_K)
         refl_10bit = fq(dist_sq * signal_div_REFLECT_K, 3)
-        refl = fq(refl_10bit * k, 3)
-        refl = fq(torch.clamp(refl, max=3.0), 3)
+        refl_base = fq(refl_10bit * k, 3)
+        refl = fq(F.conv2d(refl_base, self.window_sum_kernel), 3)
         mask = fq(torch.relu(torch.sign(fq(refl - REFLECT_THRESH, 3))), _MASK)
         return refl, mask
 

@@ -65,10 +65,10 @@ extra_gain   = 195601 / 49000 ≈ 3.99
 
 所以真实强度约为记录强度的 3.99 倍，而不是用线性比例得到的 49000。代码将 `miss_rate` 下限钳为 `0.02`，避免 `u → 1` 时 `log(0)` 发散，因此 `extra_gain` 最大约为 3.99，最终 `pileup_gain` 的范围约为 `[1.01, 191.02]`。
 
-前 62 个 bin 是有效直方图。`net.py` 的距离重心、argmax 选峰 bin 和 SNR 直接用原始 `hist`；反射率在最后一步乘 `pileup_gain`。crosstalk 根据补偿后的反射率动态门控：每个 bin 独立统计其 1200 个像素中反射率大于 250% 的数量，每个像素使该 bin 的反射率门限增加 2%，门限最高为 50%。
+前 62 个 bin 是有效直方图。`net.py` 的距离重心、argmax 选峰 bin 和 SNR 直接用原始 `hist`；每路候选反射率与距离重心共用同一组 62×62 稠密 `1x1 conv` 权重，累加 anchor 左、中、右三个 bin 的基础反射率，并在最后一步乘 `pileup_gain`。边界由 kernel 自身处理：bin0 复用 bin1 的窗口，bin61 复用 bin60 的窗口。crosstalk 根据补偿后的三 bin 反射率总和动态门控：每个 bin 独立统计其 1200 个像素中反射率大于 250% 的数量，每个像素使该 bin 的反射率门限增加 2%，门限最高为 50%。
 
 ```text
-reflectance = (dist^2 * signal / REFLECT_K) * k     # 钳到 [0, 3]
+reflectance = sum_3bins(dist^2 * signal / REFLECT_K * k)  # 钳到 [0, 3]
 peak        = max(hist) * k                         # 量程 [0, 200000]
 ```
 
