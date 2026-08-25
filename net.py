@@ -96,8 +96,6 @@ REFLECT_K = 170000
 DIST_BIAS = -2.14
 REFLECT_THRESH = 0.015
 
-# 反射率上限: 避免反射率太高,导致int16量化精度不够
-MAX_REFL = 30.0
 SNR_THRESH = 5.0
 NOISE_BIAS = 1
 # 窜光动态反射率阈值: 每个 >250% 的高反射像素使阈值增加 2%, 最高 50%
@@ -121,16 +119,16 @@ ALIAS_SIGMA = 4.0
 ALIAS_MAX_BINS = 15
 
 # True: forward 走 int16 对称 fake-quant，realtime.py 能直接看到量化误差。
-# False: 纯 float，和改之前一模一样。
+# False: 纯 float 计算，但仍按各算子的 max_abs 钳位，保证与量化路径量程一致。
 QUANT_INT16 = True
 _QMAX = 32767.0
 _MASK = 1.0  # 0/1 mask 的量程
 
 
 def fq(x: torch.Tensor, max_abs: float) -> torch.Tensor:
-    """int16 对称量化: clamp(round(x / scale), ±32767) * scale, scale = max_abs/32767."""
+    """按 max_abs 对称钳位；量化模式下再执行 int16 fake-quant。"""
     if not QUANT_INT16:
-        return x
+        return torch.clamp(x, min=-max_abs, max=max_abs)
     scale = x.new_tensor(max_abs / _QMAX)
     return torch.fake_quantize_per_tensor_affine(x, scale, 0, -32768, 32767)
 
