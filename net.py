@@ -10,16 +10,18 @@ nn/net.py
 - snr: 信噪比
 - reflectance: 反射率
 - conf: 置信度(0/1)
-- peak: 峰值信号 (bin 维最大计数 * pile-up 系数 k)
+- peak: 峰值信号 (bin 维最大计数 * 打光次数归一化系数 k)
 
 流程:
 1) 拆分前 62 个有效 bin 与最后两个饱和 bin:
       sat_value = bin63 * 1024 + bin64      # 某个 bin 打满 1024 时的总打光次数
-   得到 pile-up 系数 k (见 _pileup_gain, 取值 [1.01, 191]).
+   得到打光次数归一化系数 k = PULSES / sat_value (见 _pulse_gain, 取值 [1, 48.83]).
 
-   全程 62 通道的中间量都留在 10bit 量程上算, k 只在两处最后一步乘进去:
-   - reflectance = Σ(左/中/右 bin 的 dist^2 * signal / REFLECT_K * k)
-   - peak        = max(hist) * k
+   全程 62 通道的中间量都留在 10bit 量程上算, k 只在最后一步乘进去:
+   - peak        = max(hist) * k                 # 只做线性的饱和比例折算
+   - reflectance = dist^2 * Σ(左/中/右 bin 的 signal) / REFLECT_K * photon_gain
+     反射率还要补上 pile-up 的非线性部分, 且未回波概率按三个 bin 合起来统计,
+     所以用逐 bin 的 photon_gain = k * g (见 _reflectance_and_mask)
    dist / argmax / SNR 直接用原始 hist; crosstalk 使用补偿后的反射率
 
 2) 用 62x62 稠密 1x1 conv 在原始 hist 上并行算出 62 路候选距离
@@ -36,10 +38,13 @@ nn/net.py
       # SNR 用原始 hist 算 (保留真实光子噪声统计)
       signal_raw_per_bin  = hist   - mean_bg
       snr_per_bin         = signal_raw_per_bin / (sqrt(mean_bg)      + NOISE_BIAS)
-      # 每个 bin 的基础反射率先在 10bit 量程上算完, 最后一步才乘 pile-up 系数 k
-      reflectance_base = dist_per_bin^2 * signal_raw_per_bin / REFLECT_K * k
-      # 复用距离重心那组 window_sum_kernel, 累加 anchor 的左/中/右三个 bin
-      reflectance_per_bin = conv(reflectance_base, window_sum_kernel)
+      # 复用距离重心那组 window_sum_kernel, 先累加 anchor 的左/中/右三个 bin 的信号
+      signal_sum_per_bin   = conv(signal_raw_per_bin, window_sum_kernel)
+      # 三 bin 合起来的单次打光回波率, 以及对应的 Coates 非线性放大倍数
+      echo_rate3           = signal_sum_per_bin / sat_value
+      photon_gain          = k * (-ln(1 - echo_rate3) / echo_rate3)
+      # 再用三 bin 信号和算反射率: 先在 10bit 量程上算完, 最后一步才乘 photon_gain
+      reflectance_per_bin  = dist_per_bin^2 * signal_sum_per_bin / REFLECT_K * photon_gain
 
 4) 三路 per-bin mask (都是 (B, 62, H, W), 0/1):
       crosstalk_mask : 每个 bin 独立统计 1200 个像素:
@@ -73,24 +78,35 @@ TAIL_BASE = 1024.0
 PULSES = 50000.0
 SAT_MIN = 1024.0  # 防止坏帧除零, 并保证回波率 u = TAIL_BASE / sat_value <= 1
 
-# ---- 聚堆(pile-up)修正 ----
+# ---- 打光次数归一化系数 k = PULSES / sat_value ----
 # 某个 bin 计数打满 10bit(TAIL_BASE) 时停止累积, sat_value 记录此刻的总打光次数,
-# 所以峰值 bin 的单次打光回波率 u = TAIL_BASE / sat_value.
-# SPAD 每次打光最多记一个光子, u 越接近 1 丢掉的光子越多, 真实光子数要用 Coates 反解:
-#     n_true = -N * ln(1 - u)
-# 于是 "10bit 计数 -> PULSES 次打光下的真实光子数" 的总系数为
-#     k = PULSES * (-ln(1 - u)) / TAIL_BASE = (PULSES / TAIL_BASE) * (-ln(1 - u))
-# 旧的线性系数 PULSES / sat_value 只是 u -> 0 时的一阶近似: 例如峰值 bin 归一化后
-# 相当于打光 50000 次回波 49000 次(u = 0.98), 线性算法认为只有 49000 个光子, 而
-# Coates 反解是 -50000 * ln(0.02) = 195600, 即真实强度还要再大 3.99 倍.
-# u -> 1 时 ln 发散, 把未回波率 (1 - u) 钳到 MISS_RATE_MIN, 对应最大额外放大 3.99 倍.
+# k 把 10bit 计数线性折算回 "PULSES 次打光下的计数", 取值 [1, 48.83].
+# 这是 pile-up 的一阶近似(单次打光回波率 u -> 0): peak 只需要量级正确的峰值强度,
+# 用 k 就够; 反射率要的精度更高, 在 _reflectance_and_mask 里另外补上非线性部分.
+MAX_K = 200.0  # 反射率用的 photon_gain = k * g 的量程, 见下
+# peak = max(hist) * k 的量程: 1023 * 48.83 = 49952
+MAX_PHOTON = 50000.0
+
+# ---- 反射率的 pile-up 修正: Coates 非线性放大倍数 g = -ln(1 - u) / u ----
+# SPAD 每次打光最多记一个光子, u 越接近 1 丢掉的光子越多, 真实光子数要用 Coates
+# 反解 n_true = -N * ln(1 - u). 线性系数 k 只是 u -> 0 时的一阶近似: 例如打光
+# 50000 次回波 49000 次(u = 0.98), 线性算法认为只有 49000 个光子, 而 Coates 反解
+# 是 -50000 * ln(0.02) = 195600, 即真实强度还要再大 3.99 倍.
+# u -> 1 时 ln 发散, 把未回波率 (1 - u) 钳到 MISS_RATE_MIN, 对应最大放大 3.99 倍.
 MISS_RATE_MIN = 0.02
 # -ln(MISS_RATE_MIN) = 3.912，取 4.0 作为 log 输出的 int16 量程
 MAX_PHOTONS_PER_PULSE = 4.0
-# k 的取值范围 [48.83 * 0.0207, 48.83 * 3.912] = [1.01, 191]
-MAX_K = 200.0
-# peak = max(hist) * k 的量程: 1023 * 191
-MAX_PHOTON = 200000.0
+# 未回波概率要按 "左/中/右三个 bin 合起来" 算: u3 = Σsignal / sat_value.
+# 但直接输出 -ln(1 - u3) 会把量程钉在 [0, 4], int16 步长 1.2e-4, 远距离弱回波
+# (30m 处 REFLECT_THRESH 只对应 2.8 个光子) 只剩几个码值。所以拆成
+#     photons = signal_sum * k * g,   g = -ln(1 - u3) / u3
+# 线性主项仍跑在紧凑量程上, g 只是一个 [1, 3.99] 的相对系数。
+# u3 -> 0 时 g -> 1 (无 pile-up), u3 = 0.98 时 g = 3.912 / 0.98 = 3.99.
+# photon_gain = k * g 的取值范围 [1, 48.83 * 3.99] = [1, 195], 量程取 MAX_K.
+MAX_COATES_GAIN = 4.0
+# g 的除法在 u3 -> 0 处不稳; u3 < COATES_ECHO_MIN 时真值也只有 1.005,
+# 统一靠 clamp(g, min=1) 兜住, 同时把 1/u3 的量程压到 100 保证精度
+COATES_ECHO_MIN = 0.01
 
 REFLECT_K = 170000
 DIST_BIAS = -2.14
@@ -181,24 +197,33 @@ class Network(nn.Module):
         hi = fq(fq(raw_bin_63, 48) * TAIL_BASE, 50000)
         return fq(hi + fq(raw_bin_64, 1023), 50000)
 
-    def _pileup_gain(self, sat_value):
-        """pile-up 系数 k, 输出 (B, 1, H, W), 取值 [1.01, 191].
+    def _pulse_gain(self, sat_value):
+        """打光次数归一化系数 k = PULSES / sat_value, 输出 (B, 1, H, W), 取值 [1, 48.83].
 
-        把 10bit 计数换算成 "PULSES 次打光下的真实光子数":
-            u = TAIL_BASE / sat_value                 # 峰值 bin 的单次打光回波率
-            k = (PULSES / TAIL_BASE) * (-ln(1 - u))   # Coates 反解
-
-        全程只有一次 log: 先在 [0, 1] 量程上算未回波率 (1 - u), 再取对数,
-        最后乘一个常数, 每一步的动态范围都很窄, int16 相对误差 < 0.4%.
+        1/sat_value 靠 fq 钳到 1/SAT_MIN, 坏帧(sat_value -> 0) 不会除爆.
         """
-        recip_sat = fq(torch.reciprocal(sat_value), 1.0 / SAT_MIN)
-        echo_rate = fq(recip_sat * TAIL_BASE, 1.0)
+        inv_sat = fq(torch.reciprocal(sat_value), 1.0 / SAT_MIN)
+        return fq(inv_sat * PULSES, PULSES / SAT_MIN)
+
+    def _coates_gain(self, echo_rate):
+        """Coates 非线性放大倍数 g = -ln(1 - u) / u, 输出量程 [1, 3.99].
+
+        u -> 0 (无 pile-up) 时 g -> 1; u = 0.98 时 g = 3.99.
+        u -> 1 时 ln 发散, 把未回波率 (1 - u) 钳到 MISS_RATE_MIN; u <= 0
+        (背景减多了) 时 miss_rate 被 fq 钳回 1.0, log 出 0, 相当于不修正.
+        1/u 的量程压到 1 / COATES_ECHO_MIN, 更小的 u 落到 clamp 下界后
+        算出的 g < 1, 再由 clamp(g, min=1) 兜回 1 —— 正好是该区间的真值.
+        """
         miss_rate = fq(1.0 - echo_rate, 1.0)
         miss_rate = fq(torch.clamp(miss_rate, min=MISS_RATE_MIN), 1.0)
         log_miss_rate = fq(torch.log(miss_rate), MAX_PHOTONS_PER_PULSE)
         photons_per_pulse = fq(log_miss_rate * -1.0, MAX_PHOTONS_PER_PULSE)
-        pileup_gain = fq(photons_per_pulse * (PULSES / TAIL_BASE), MAX_K)
-        return pileup_gain
+        recip_echo = fq(
+            torch.reciprocal(torch.clamp(echo_rate, min=COATES_ECHO_MIN)),
+            1.0 / COATES_ECHO_MIN,
+        )
+        gain = fq(photons_per_pulse * recip_echo, MAX_COATES_GAIN)
+        return fq(torch.clamp(gain, min=1.0), MAX_COATES_GAIN)
 
     def _crosstalk_mask(self, reflectance_per_bin):
         """用高反射像素数量生成动态反射率门限，输出 (B,62,H,W) 的 0/1 mask.
@@ -252,20 +277,34 @@ class Network(nn.Module):
         return snr, mask
 
     def _reflectance_and_mask(self, signal_per_bin, dist_per_bin, k):
-        """反射率 = 左/中/右三个 bin 的基础反射率总和.
+        """反射率 = 用左/中/右三个 bin 的信号总和算出的单个反射率.
 
-        signal_per_bin 是未乘系数的 10bit 信号: 先在 10bit 量程上把
-        dist^2 * signal / REFLECT_K 算完, 最后一步才乘 pile-up 系数 k,
-        避免弱信号一开始就被 [0, 200000] 的大量程压掉精度.
-        然后用和距离重心同一组 window_sum 权重做 62x62 稠密 1x1 conv, 把
-        anchor 的左/中/右三个 bin 的反射率加起来, 边界同样是 bin0 复用 bin1
-        的窗口, bin61 复用 bin60 的窗口. 最终结果钳到 3.0.
+        先用和距离重心同一组 window_sum 权重做 62x62 稠密 1x1 conv, 把 anchor 的
+        左/中/右三个 bin 的 10bit 信号加起来 (边界同样是 bin0 复用 bin1 的窗口,
+        bin61 复用 bin60 的窗口), 三 bin 和的量程是 3 * 1023 = 3069.
+
+        peak 只用线性系数 k, 反射率还要补上 pile-up 的非线性部分, 且未回波概率
+        按三个 bin 合起来统计: u3 = signal_sum / sat_value,
+            photons = signal_sum * k * g,   g = -ln(1 - u3) / u3
+        于是 photon_gain = k * g, 量程 MAX_K. u3 逐 bin, 所以 photon_gain 也是
+        (B, 62, H, W). u3 不用 1/sat_value 另算一遍, 而是从 k 反推:
+            u3 = signal_sum / sat_value = (signal_sum / PULSES) * k
+        signal_sum / PULSES 的量程只有 0.061, 弱信号也不掉码值.
+
+        dist^2 * signal_sum / REFLECT_K 先在 10bit 量程上算完, 最后一步才乘
+        photon_gain, 避免弱信号一开始就被 [0, 200000] 的大量程压掉精度.
+        最终结果钳到 3.0.
         """
+        signal_sum = fq(F.conv2d(signal_per_bin, self.window_sum_kernel), 3069)
+        signal_per_pulse = fq(signal_sum * (1.0 / PULSES), 3069 / PULSES)
+        echo_rate = fq(signal_per_pulse * k, 1.0)
+        coates_gain = self._coates_gain(echo_rate)
+        photon_gain = fq(k * coates_gain, MAX_K)
+
         dist_sq = fq(dist_per_bin * dist_per_bin, 36*36)
-        signal_div_REFLECT_K = fq(signal_per_bin / REFLECT_K, 1023 / REFLECT_K)
+        signal_div_REFLECT_K = fq(signal_sum / REFLECT_K, 3069 / REFLECT_K)
         refl_10bit = fq(dist_sq * signal_div_REFLECT_K, 3)
-        refl_base = fq(refl_10bit * k, 3)
-        refl = fq(F.conv2d(refl_base, self.window_sum_kernel), 3)
+        refl = fq(refl_10bit * photon_gain, 3)
         mask = fq(torch.relu(torch.sign(fq(refl - REFLECT_THRESH, 3))), _MASK)
         return refl, mask
 
@@ -315,7 +354,7 @@ class Network(nn.Module):
         hist, raw_bin_63, raw_bin_64 = self._split_hist_and_tail(x)
         hist = fq(hist, 1023)
         sat_value = self._caculate_sat_value(raw_bin_63, raw_bin_64)
-        k = self._pileup_gain(sat_value)
+        k = self._pulse_gain(sat_value)
 
         # ---- 1) 距离重心 & argmax 门控, 都用原始 hist ----
         dist_per_bin = self._dist_per_bin(hist)  # (B, 62, H, W)
@@ -328,7 +367,8 @@ class Network(nn.Module):
         noise_raw = fq(fq(torch.sqrt(mean_raw), 31.98) + NOISE_BIAS, 32.98)
         snr_per_bin, snr_mask = self._snr_and_mask(signal_raw_per_bin, noise_raw)
 
-        # ---- 2b) 反射率: 10bit 信号先算完, 最后再乘 pile-up 系数 k (打光次数无关, 阈值统一) ----
+        # ---- 2b) 反射率: 10bit 信号先算完, 最后再乘 k 和 pile-up 非线性修正 ----
+        # 未回波概率按三 bin 合起来算, peak 那边只用线性的 k, 见方法内注释
         reflectance_per_bin, reflect_mask = self._reflectance_and_mask(
             signal_raw_per_bin, dist_per_bin, k
         )
